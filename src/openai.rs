@@ -146,6 +146,7 @@ fn run_request(
             acc: acc.clone(),
             cancel: cancel.clone(),
             tx: tx.cloned(),
+            stream,
         };
         let mut transfer = easy.transfer();
         transfer.write_function(write_cb, &mut state as *mut ReqState as *mut c_void);
@@ -314,8 +315,16 @@ struct OaStreamChoice {
 const MAX_STREAM_TOOL_CALLS: usize = 64;
 
 impl StreamAcc {
-    fn feed(&mut self, data: &[u8], tx: Option<&std::sync::mpsc::Sender<StreamEvent>>) {
-        self.raw.extend_from_slice(data);
+    fn feed(
+        &mut self,
+        data: &[u8],
+        tx: Option<&std::sync::mpsc::Sender<StreamEvent>>,
+        stream: bool,
+    ) {
+        let raw_limit = if stream { 200 } else { usize::MAX };
+        let remaining = raw_limit.saturating_sub(self.raw.len());
+        self.raw
+            .extend_from_slice(&data[..data.len().min(remaining)]);
         if data.contains(&b'\r') || self.buf.last() == Some(&b'\r') {
             // Normalize CRLF to LF so event splitting works even when a
             // chunk boundary lands between "\r" and "\n".
@@ -472,6 +481,7 @@ struct ReqState {
     acc: Rc<RefCell<StreamAcc>>,
     cancel: Arc<AtomicBool>,
     tx: Option<Sender<StreamEvent>>,
+    stream: bool,
 }
 
 unsafe extern "C" fn write_cb(
@@ -482,7 +492,7 @@ unsafe extern "C" fn write_cb(
 ) -> usize {
     let st = unsafe { &mut *(userdata as *mut ReqState) };
     let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, size * nmemb) };
-    st.acc.borrow_mut().feed(data, st.tx.as_ref());
+    st.acc.borrow_mut().feed(data, st.tx.as_ref(), st.stream);
     size * nmemb
 }
 
@@ -602,7 +612,7 @@ mod tests {
     fn feed_all(acc: &mut StreamAcc, chunks: &[&[u8]]) -> Vec<StreamEvent> {
         let (tx, rx) = std::sync::mpsc::channel();
         for c in chunks {
-            acc.feed(c, Some(&tx));
+            acc.feed(c, Some(&tx), true);
         }
         drop(tx);
         rx.try_iter().collect()
@@ -614,6 +624,13 @@ mod tests {
         feed_all(&mut acc, &[b"<html>502 Bad Gateway</html>"]);
         assert_eq!(acc.events, 0);
         assert_eq!(acc.raw, b"<html>502 Bad Gateway</html>");
+    }
+
+    #[test]
+    fn streaming_raw_body_is_bounded() {
+        let mut acc = StreamAcc::default();
+        feed_all(&mut acc, &[&[b'x'; 300]]);
+        assert_eq!(acc.raw.len(), 200);
     }
 
     #[test]

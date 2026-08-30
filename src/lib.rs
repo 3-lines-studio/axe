@@ -63,9 +63,10 @@ pub(crate) fn atomic_write_with(
             if let Some(permissions) = permissions {
                 file.set_permissions(permissions)?;
             }
-            Ok(())
+            file.sync_all()
         })
-        .and_then(|()| std::fs::rename(&tmp, path));
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .and_then(|()| std::fs::File::open(parent)?.sync_all());
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
