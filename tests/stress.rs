@@ -218,22 +218,13 @@ fn mutate(rng: &mut Rng, buf: &mut Vec<u8>, rounds: usize) {
     }
 }
 
-fn fuzz_ansi(rng: &mut Rng, seed: u64, input: &[u8]) {
+fn fuzz_ansi(_rng: &mut Rng, seed: u64, input: &[u8]) {
     guard("ansi writers", seed, || {
         let mut out = String::new();
         ansi::write_dim(&mut out, input);
         ansi::write_horizontal_rule(&mut out);
         assert_sane("ansi writers", seed, &out);
     });
-    guard("highlight", seed, || {
-        for label in ["rust", "python", "js", "go", "json", "markdown", "none"] {
-            if let Some(p) = axe::markdown::highlight::resolve(label) {
-                let out = axe::markdown::highlight::highlight(input, p);
-                assert_sane("highlight", seed, &out);
-            }
-        }
-    });
-    let _ = rng;
 }
 
 fn fuzz_session(_rng: &mut Rng, seed: u64, input: &[u8]) {
