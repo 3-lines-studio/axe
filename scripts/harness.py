@@ -576,47 +576,8 @@ def oneshot_help(h, axe):
     check("Usage: axe" in p.stderr, "stderr: %s" % p.stderr[-500:])
 
 
-@case
-def search_cli(h, axe):
-    h.seed_session("1700000000000", "my needle title", "the needle is here and a needle in the haystack")
-    p = h.oneshot(axe, ["--search", "needle"])
-    check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
-    check("my needle title" in p.stdout and "needle" in p.stdout, "stdout: %s" % p.stdout[-500:])
 
 
-@case
-def search_cli_derived_title(h, axe):
-    # No .title file: search must derive the title from the first user message,
-    # the same way the resume picker does (session.rs title_from_entries).
-    h.seed_session_msgs(
-        "1700000000000",
-        None,
-        [
-            {"Role": "user", "Content": "refactor the auth module"},
-            {"Role": "assistant", "Content": "the needle is here"},
-        ],
-    )
-    p = h.oneshot(axe, ["--search", "needle"])
-    check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
-    check(
-        "refactor the auth module (1700000000000)" in p.stdout,
-        "derived title missing: %s" % p.stdout[-500:],
-    )
-
-
-@case
-def search_cli_empty(h, axe):
-    h.seed_session("1700000000000", "t", "no matches here")
-    p = h.oneshot(axe, ["--search", "zzz"])
-    check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
-    check(p.stdout == "", "expected empty stdout: %s" % p.stdout[:500])
-
-
-@case
-def search_no_text(h, axe):
-    p = h.oneshot(axe, ["--search"])
-    check(p.returncode == 1, "expected exit 1, got %s" % p.returncode)
-    check("usage: axe --search <text>" in p.stderr, "stderr: %s" % p.stderr[-500:])
 
 
 @case

@@ -27,28 +27,6 @@ struct FileConfig {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(pos) = args.iter().position(|a| a == "--search") {
-        let text = args.get(pos + 1).map(String::as_str).unwrap_or("");
-        if text.is_empty() {
-            eprintln!("usage: axe --search <text>");
-            std::process::exit(1);
-        }
-        let session_dir =
-            axe::session::scope_dir(&ax_root(), &std::env::current_dir().unwrap_or_default());
-        for h in axe::session::search(&session_dir, text) {
-            let id = if h.id == "live" {
-                "live".to_string()
-            } else {
-                h.id.clone()
-            };
-            if h.title.is_empty() {
-                println!("({id}) — {}", h.text);
-            } else {
-                println!("{} ({id}) — {}", h.title, h.text);
-            }
-        }
-        std::process::exit(0);
-    }
     let fc = load_config();
     let (cfg, prompt) = match parse_args(&args, &fc) {
         Ok(x) => x,
