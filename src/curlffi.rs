@@ -334,20 +334,3 @@ impl<'a> Transfer<'a> {
         Ok(())
     }
 }
-
-pub fn perform_with_sink(easy: &mut Easy, sink: &mut Vec<u8>) -> Result<(), String> {
-    unsafe extern "C" fn write_vec(
-        ptr: *mut c_char,
-        size: usize,
-        nmemb: usize,
-        userdata: *mut c_void,
-    ) -> usize {
-        let sink = unsafe { &mut *(userdata as *mut Vec<u8>) };
-        let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, size * nmemb) };
-        sink.extend_from_slice(data);
-        size * nmemb
-    }
-    let mut t = easy.transfer();
-    t.write_function(write_vec, sink as *mut Vec<u8> as *mut c_void);
-    t.perform()
-}

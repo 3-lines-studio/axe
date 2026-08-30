@@ -314,17 +314,6 @@ pub fn set_live_title(dir: &str, title: &str) {
 }
 
 /// Rough token estimate for context budgeting: chars/4.
-pub fn estimate_tokens(msgs: &[Message]) -> usize {
-    let mut chars = 0usize;
-    for m in msgs {
-        chars += m.content.len();
-        for c in &m.tool_calls {
-            chars += c.name.len() + c.arguments.len();
-        }
-    }
-    chars / 4
-}
-
 /// Ensure the transcript does not end with an unanswered tool-call exchange:
 /// providers reject an assistant message whose tool_calls lack matching tool
 /// results. Drops such an exchange (e.g. from a crash mid-batch in an older

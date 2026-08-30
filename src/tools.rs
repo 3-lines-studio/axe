@@ -7,10 +7,6 @@ use std::os::unix::process::CommandExt;
 
 const MAX_OUTPUT: usize = 16 * 1024;
 
-pub fn defaults(dir: &str) -> Vec<Tool> {
-    vec![read(), write(), edit(), bash(dir)]
-}
-
 /// Strip control characters (except tab/newline/CR) and Unicode format
 /// interlinear annotation marks from tool output before it reaches the model.
 fn sanitize(s: &str) -> String {
