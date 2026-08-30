@@ -137,13 +137,6 @@ struct SlashItem {
     category: String,
 }
 
-#[derive(Clone)]
-pub struct UserCommand {
-    pub name: String,
-    pub description: String,
-    pub content: String,
-}
-
 #[derive(PartialEq, Clone, Copy)]
 enum LoginStep {
     ApiKey,
@@ -165,15 +158,6 @@ impl SlashItem {
             help: spec.help.to_string(),
             description: spec.description.to_string(),
             category: spec.category.to_string(),
-        }
-    }
-
-    fn user(uc: &UserCommand) -> SlashItem {
-        SlashItem {
-            command: format!("/{}", uc.name),
-            help: format!("/{} <args>", uc.name),
-            description: uc.description.clone(),
-            category: "User".to_string(),
         }
     }
 }
@@ -390,7 +374,6 @@ struct Tui {
     models_rx: Option<Receiver<Result<Vec<String>, String>>>,
     picker: Option<Picker>,
     picker_dismissed: Option<PickerKind>,
-    user_commands: Vec<UserCommand>,
     login: Option<LoginWizard>,
     rewind_items: Vec<RewindItem>,
     /// Archive id being continued; None = a fresh session that forks on exit.
@@ -400,7 +383,6 @@ struct Tui {
 impl Tui {
     fn new(cfg: TuiConfig) -> Tui {
         let model_display = compact_model_label(&cfg.model);
-        let user_commands = load_user_commands(&cfg.ax_root);
         Tui {
             cfg,
             entries: Vec::new(),
@@ -456,7 +438,6 @@ impl Tui {
             models_rx: None,
             picker: None,
             picker_dismissed: None,
-            user_commands,
             login: None,
             rewind_items: Vec::new(),
             resume_id: None,
@@ -1463,14 +1444,9 @@ impl Tui {
                 self.want_quit = true;
             }
             _ => {
-                if let Some(idx) = self.user_commands.iter().position(|c| c.name == name) {
-                    let uc = self.user_commands[idx].clone();
-                    self.run_user_command(&uc, rest);
-                } else {
-                    self.entries.push(Entry::Notice(format!(
-                        "{DIM}unknown command: /{name}{RESET}"
-                    )));
-                }
+                self.entries.push(Entry::Notice(format!(
+                    "{DIM}unknown command: /{name}{RESET}"
+                )));
             }
         }
     }
@@ -1595,25 +1571,6 @@ impl Tui {
                 self.entries.push(Entry::Notice(format!("{DIM}{e}{RESET}")));
             }
         }
-    }
-
-    fn run_user_command(&mut self, uc: &UserCommand, rest: &str) {
-        if self.running {
-            self.entries.push(Entry::Notice(format!(
-                "{DIM}busy: finish the current turn first{RESET}"
-            )));
-            return;
-        }
-        let prompt = expand_user_command(uc, rest);
-        self.entries.push(Entry::User(prompt.clone()));
-        self.input.history.push(prompt.clone());
-        self.msgs.push(Message {
-            role: "user".into(),
-            content: prompt,
-            tool_calls: Vec::new(),
-            tool_call_id: String::new(),
-        });
-        self.start_turn();
     }
 
     fn fresh_session(&mut self, archive: bool) {
@@ -1879,27 +1836,17 @@ impl Tui {
     }
 
     fn help_items(&self) -> Vec<SlashItem> {
-        let q = self.input.buf().trim().to_lowercase();
-        let mut out: Vec<SlashItem> = SLASH
+        let query = self.input.buf().trim().to_lowercase();
+        SLASH
             .iter()
-            .filter(|s| {
-                q.is_empty()
-                    || s.command.to_lowercase().contains(&q)
-                    || s.description.to_lowercase().contains(&q)
-                    || s.category.to_lowercase().contains(&q)
+            .filter(|spec| {
+                query.is_empty()
+                    || spec.command.to_lowercase().contains(&query)
+                    || spec.description.to_lowercase().contains(&query)
+                    || spec.category.to_lowercase().contains(&query)
             })
             .map(SlashItem::builtin)
-            .collect();
-        for uc in &self.user_commands {
-            let item = SlashItem::user(uc);
-            if q.is_empty()
-                || item.command.to_lowercase().contains(&q)
-                || item.description.to_lowercase().contains(&q)
-            {
-                out.push(item);
-            }
-        }
-        out
+            .collect()
     }
 
     fn filtered_sessions(&self) -> Vec<&SessionMeta> {
@@ -2688,9 +2635,7 @@ impl Tui {
                     file_matches: Vec::new(),
                 };
                 match p.kind {
-                    PickerKind::Slash => {
-                        p.slash_matches = slash_matches(&p.query, &self.user_commands)
-                    }
+                    PickerKind::Slash => p.slash_matches = slash_matches(&p.query),
                     PickerKind::Files => p.file_matches = file_matches(&p.query, &self.cfg.dir),
                 }
                 self.picker = Some(p);
@@ -3134,238 +3079,13 @@ fn write_login_config(ax_root: &str, api_key: &str, base: &str, model: &str) -> 
     std::fs::write(&path, out).map_err(|e| format!("login: write config: {e}"))
 }
 
-fn parse_frontmatter(text: &str) -> (String, String) {
-    if let Some(rest) = text.strip_prefix("---")
-        && let Some(end) = rest.find("\n---")
-    {
-        let frontmatter = &rest[..end];
-        let body = rest[end + 4..].trim_start_matches('\n').trim_start();
-        let description = frontmatter
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .find(|(key, _)| key.trim() == "description")
-            .map(|(_, value)| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| first_line(body));
-        return (description, body.to_string());
-    }
-    (first_line(text), text.to_string())
-}
-
-fn first_line(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("")
-        .to_string()
-}
-
-pub fn load_user_commands(ax_root: &str) -> Vec<UserCommand> {
-    let dir = std::path::Path::new(ax_root).join("commands");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for e in entries.flatten() {
-        let path = e.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("md") {
-            continue;
-        }
-        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let (description, content) = parse_frontmatter(&content);
-        out.push(UserCommand {
-            name: name.to_string(),
-            description,
-            content,
-        });
-    }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
-}
-
-pub fn expand_user_command(uc: &UserCommand, rest: &str) -> String {
-    let content = uc.content.clone();
-    if rest.is_empty() {
-        return content;
-    }
-    let args = parse_command_args(rest);
-    let substituted = substitute_args(&content, &args);
-    if substituted == content && !content.contains("$ARGUMENTS") {
-        return format!("{content}\n\n{rest}");
-    }
-    substituted
-}
-
-/// Split command arguments respecting quoted strings (bash-style).
-pub fn parse_command_args(s: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut in_quote: Option<char> = None;
-    for c in s.chars() {
-        match in_quote {
-            Some(q) => {
-                if c == q {
-                    in_quote = None;
-                } else {
-                    current.push(c);
-                }
-            }
-            None => {
-                if c == '"' || c == '\'' {
-                    in_quote = Some(c);
-                } else if c.is_whitespace() {
-                    if !current.is_empty() {
-                        args.push(std::mem::take(&mut current));
-                    }
-                } else {
-                    current.push(c);
-                }
-            }
-        }
-    }
-    if !current.is_empty() {
-        args.push(current);
-    }
-    args
-}
-
-/// Substitute argument placeholders in a prompt template:
-/// `$1`..`$9`, `$@`/`$ARGUMENTS` for all args, `${2:-default}`, `${@:N}` and
-/// `${@:N:L}` slices.
-pub fn substitute_args(content: &str, args: &[String]) -> String {
-    let all = args.join(" ");
-    let mut out = String::with_capacity(content.len());
-    let mut rest = content;
-    while let Some(start) = rest.find('$') {
-        out.push_str(&rest[..start]);
-        let tail = &rest[start..];
-        let (token, len) = parse_placeholder(tail, args, &all);
-        out.push_str(&token);
-        rest = &tail[len..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn parse_placeholder(tail: &str, args: &[String], all: &str) -> (String, usize) {
-    let chars: Vec<char> = tail.chars().collect();
-    if chars.first() != Some(&'$') {
-        return (String::new(), 0);
-    }
-    if chars.get(1) == Some(&'{') {
-        // ${...}
-        let mut depth = 0usize;
-        let mut end = 0usize;
-        for (i, c) in chars.iter().enumerate() {
-            if *c == '{' {
-                depth += 1;
-            } else if *c == '}' {
-                depth -= 1;
-                if depth == 0 {
-                    end = i;
-                    break;
-                }
-            }
-        }
-        if end == 0 {
-            return (String::new(), 1);
-        }
-        let inner = &chars[2..end].iter().collect::<String>();
-        let (replacement, _) = expand_braced(inner, args, all);
-        return (replacement, end + 1);
-    }
-    if chars.get(1) == Some(&'@') {
-        return (all.to_string(), 2);
-    }
-    if let Some(c) = chars.get(1)
-        && c.is_ascii_digit()
-    {
-        let idx = c.to_digit(10).unwrap() as usize - 1;
-        let value = args.get(idx).cloned().unwrap_or_default();
-        return (value, 2);
-    }
-    let mut id_len = 0usize;
-    while id_len + 1 < chars.len()
-        && (chars[id_len + 1].is_ascii_alphanumeric() || chars[id_len + 1] == '_')
-    {
-        id_len += 1;
-    }
-    if id_len > 0 {
-        let ident: String = chars[1..=id_len].iter().collect();
-        if ident == "ARGUMENTS" {
-            return (all.to_string(), id_len + 1);
-        }
-    }
-    (String::new(), 1)
-}
-
-fn expand_braced(inner: &str, args: &[String], all: &str) -> (String, usize) {
-    // ${N:-default}, ${@:-default}, ${ARGUMENTS:-default}
-    if let Some((target, default)) = inner.split_once(":-") {
-        let value = if target == "@" || target == "ARGUMENTS" {
-            all
-        } else {
-            target
-                .parse::<usize>()
-                .ok()
-                .and_then(|n| args.get(n - 1))
-                .map(String::as_str)
-                .unwrap_or("")
-        };
-        return if value.is_empty() {
-            (default.to_string(), inner.len())
-        } else {
-            (value.to_string(), inner.len())
-        };
-    }
-    // ${@:N} and ${@:N:L}
-    if let Some(slice) = inner.strip_prefix("@:") {
-        let parts: Vec<&str> = slice.split(':').collect();
-        if let Ok(n) = parts[0].parse::<usize>() {
-            let start = n.saturating_sub(1);
-            let sliced: Vec<&str> = args[start..].iter().map(String::as_str).collect();
-            let chosen: Vec<&str> = if parts.len() > 1 {
-                if let Ok(len) = parts[1].parse::<usize>() {
-                    sliced.iter().take(len).copied().collect()
-                } else {
-                    sliced
-                }
-            } else {
-                sliced
-            };
-            return (chosen.join(" "), inner.len());
-        }
-    }
-    (String::new(), inner.len())
-}
-
-fn slash_matches(query: &str, users: &[UserCommand]) -> Vec<SlashItem> {
-    let q = query.to_lowercase();
-    let mut out: Vec<SlashItem> = if q.is_empty() {
-        SLASH.iter().map(SlashItem::builtin).collect()
-    } else {
-        SLASH
-            .iter()
-            .filter(|s| {
-                let cmd = s.command[1..].to_lowercase();
-                cmd.starts_with(&q) || cmd.contains(&q)
-            })
-            .map(SlashItem::builtin)
-            .collect()
-    };
-    for uc in users {
-        let item = SlashItem::user(uc);
-        let cmd = uc.name.to_lowercase();
-        if cmd.starts_with(&q) || cmd.contains(&q) {
-            out.push(item);
-        }
-    }
-    out
+fn slash_matches(query: &str) -> Vec<SlashItem> {
+    let query = query.to_lowercase();
+    SLASH
+        .iter()
+        .filter(|spec| query.is_empty() || spec.command[1..].to_lowercase().contains(&query))
+        .map(SlashItem::builtin)
+        .collect()
 }
 
 fn file_matches(query: &str, dir: &str) -> Vec<String> {

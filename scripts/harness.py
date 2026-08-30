@@ -252,11 +252,6 @@ class Harness:
     def write_config(self, text):
         (self.ax_root() / "config").write_text(text)
 
-    def write_command(self, name, text):
-        d = self.ax_root() / "commands"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / (name + ".md")).write_text(text)
-
     def seed_session(self, sid, title, content):
         self.seed_session_msgs(sid, title, [{"Role": "user", "Content": content}])
 
@@ -590,18 +585,6 @@ def oneshot_help(h, axe):
     p = h.oneshot(axe, ["--help"])
     check(p.returncode == 0, "expected exit 0, got %s" % p.returncode)
     check("Usage: axe" in p.stderr, "stderr: %s" % p.stderr[-500:])
-
-
-@case
-def oneshot_user_command(h, axe):
-    h.write_command("commit", "stage everything now")
-    with h.mock(ANSWER_SCENARIO) as srv:
-        p = h.oneshot(axe, ["/commit"], base=srv.base_url)
-        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
-        check(
-            body_msg(srv, 0, "user")[-1]["content"] == "stage everything now",
-            "user command not expanded",
-        )
 
 
 @case

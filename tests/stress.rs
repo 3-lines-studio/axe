@@ -251,22 +251,6 @@ fn fuzz_session(_rng: &mut Rng, seed: u64, input: &[u8]) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn fuzz_commands(_rng: &mut Rng, seed: u64, input: &[u8]) {
-    let dir = std::env::temp_dir().join(format!("axe-stress-cmd-{seed}-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(dir.join("commands"));
-    let _ = std::fs::write(dir.join("commands").join("fuzz.md"), input);
-    guard("commands load+expand", seed, || {
-        let cmds = axe::tui::load_user_commands(dir.to_str().unwrap());
-        if let Some(uc) = cmds.into_iter().find(|c| c.name == "fuzz") {
-            for rest in ["", "arg one", "a".repeat(64).as_str()] {
-                let out = axe::tui::expand_user_command(&uc, rest);
-                assert_sane("commands expand", seed, &out);
-            }
-        }
-    });
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 fn fuzz_tools(_rng: &mut Rng, seed: u64, input: &[u8]) {
     let dir = std::env::temp_dir().join(format!("axe-stress-tools-{seed}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -470,7 +454,6 @@ fn stress_text_and_session() {
             let mut buf = base.clone();
             mutate(&mut rng, &mut buf, 16);
             fuzz_session(&mut rng, seed, &buf);
-            fuzz_commands(&mut rng, seed, &buf);
             fuzz_tools(&mut rng, seed, &buf);
             fuzz_new_tool(&mut rng, seed, &buf);
             fuzz_tui_text(&mut rng, seed, &buf);
@@ -866,45 +849,6 @@ fn session_search_finds_text() {
     assert!(hits[0].text.contains("overflow"));
     assert!(axe::session::search(d, "zzz").is_empty());
     std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn prompt_template_substitution() {
-    use axe::tui::{UserCommand, expand_user_command, parse_command_args, substitute_args};
-    let uc = |content: &str| UserCommand {
-        name: "x".into(),
-        description: String::new(),
-        content: content.into(),
-    };
-    assert_eq!(parse_command_args("hi there"), vec!["hi", "there"]);
-    assert_eq!(
-        parse_command_args("say \"hi there\" now"),
-        vec!["say", "hi there", "now"]
-    );
-    assert_eq!(parse_command_args("a 'b c'"), vec!["a", "b c"]);
-
-    let args = parse_command_args("one two three");
-    assert_eq!(
-        substitute_args("first=$1 last=$3", &args),
-        "first=one last=three"
-    );
-    assert_eq!(substitute_args("all=$@", &args), "all=one two three");
-    assert_eq!(
-        substitute_args("all=$ARGUMENTS", &args),
-        "all=one two three"
-    );
-    assert_eq!(substitute_args("d=${2:-default}", &args), "d=two");
-    assert_eq!(substitute_args("d=${9:-default}", &args), "d=default");
-    assert_eq!(substitute_args("from=${@:2}", &args), "from=two three");
-    assert_eq!(substitute_args("from=${@:2:1}", &args), "from=two");
-    assert_eq!(substitute_args("d=${1:-fallback}", &[]), "d=fallback");
-
-    assert_eq!(expand_user_command(&uc("say $1"), "hi"), "say hi");
-    assert_eq!(
-        expand_user_command(&uc("say $ARGUMENTS"), "hi there"),
-        "say hi there"
-    );
-    assert_eq!(expand_user_command(&uc("plain"), "hi"), "plain\n\nhi");
 }
 
 #[test]
