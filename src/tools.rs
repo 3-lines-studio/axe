@@ -300,6 +300,34 @@ mod tests {
     }
 
     #[test]
+    fn edit_rejects_invalid_replacements() {
+        let edit = |old: &str, new: &str| super::EditArg {
+            old_text: old.into(),
+            new_text: new.into(),
+        };
+        let error = apply_edits("f", "x x", &[edit("x", "y")]).unwrap_err();
+        assert!(error.contains("2 occurrences"), "{error}");
+        let error = apply_edits("f", "abc", &[edit("abc", "x"), edit("bc", "y")]).unwrap_err();
+        assert!(error.contains("overlap"), "{error}");
+        let error = apply_edits("f", "x", &[edit("", "y")]).unwrap_err();
+        assert!(error.contains("must not be empty"), "{error}");
+        let error = apply_edits("f", "x", &[edit("x", "x")]).unwrap_err();
+        assert!(error.contains("No changes made"), "{error}");
+    }
+
+    #[test]
+    fn edit_preserves_bom() {
+        let edits = [super::EditArg {
+            old_text: "old".into(),
+            new_text: "new".into(),
+        }];
+        assert_eq!(
+            apply_edits("f", "\u{feff}old", &edits).unwrap(),
+            "\u{feff}new"
+        );
+    }
+
+    #[test]
     fn bash_truncation_notice() {
         let bash = crate::tools::bash("");
         let args = serde_json::json!({"command": "yes | head -c 20000"}).to_string();
@@ -441,17 +469,12 @@ pub fn write() -> Tool {
         "write",
         "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
         r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to write (relative or absolute)"},"content":{"type":"string","description":"Content to write to the file"}},"required":["path","content"]}"#,
-        |a: WriteArgs| {
-            if let Some(parent) = std::path::Path::new(&a.path).parent()
-                && !parent.as_os_str().is_empty()
-                && let Err(e) = std::fs::create_dir_all(parent)
-            {
-                return format!("error: {e}");
-            }
-            match crate::atomic_write(std::path::Path::new(&a.path), a.content.as_bytes()) {
-                Ok(()) => format!("wrote {} ({} bytes)", a.path, a.content.len()),
-                Err(e) => format!("error: {e}"),
-            }
+        |a: WriteArgs| match crate::atomic_write(
+            std::path::Path::new(&a.path),
+            a.content.as_bytes(),
+        ) {
+            Ok(()) => format!("wrote {} ({} bytes)", a.path, a.content.len()),
+            Err(e) => format!("error: {e}"),
         },
     );
     t.sequential = true;
@@ -628,57 +651,6 @@ fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<String, S
 
 const EDIT_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.","items":{"type":"object","properties":{"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},"newText":{"type":"string","description":"Replacement text for this targeted edit."}},"required":["oldText","newText"]}}},"required":["path","edits"]}"#;
 
-fn is_single_edit(v: &Value) -> bool {
-    v.as_object()
-        .map(|o| o.get("oldText").is_some() || o.get("newText").is_some())
-        .unwrap_or(false)
-}
-
-/// Parse edit arguments, normalizing shapes some models send instead of the
-/// documented one: `edits` as a JSON string, a single edit object, or legacy
-/// top-level `oldText`/`newText`.
-fn parse_edit_args(raw: &str) -> Result<EditArgs, String> {
-    let raw = if raw.trim().is_empty() { "{}" } else { raw };
-    let mut v: Value = serde_json::from_str(raw).map_err(|e| format!("invalid arguments: {e}"))?;
-    if let Some(edits) = v.get_mut("edits") {
-        if let Value::String(s) = edits {
-            let parsed: Value = serde_json::from_str(s)
-                .map_err(|e| format!("invalid arguments: edits string: {e}"))?;
-            *edits = match parsed {
-                Value::Array(_) => parsed,
-                p if is_single_edit(&p) => Value::Array(vec![p]),
-                _ => {
-                    return Err(
-                        "invalid arguments: edits string is not an array or edit object".into(),
-                    );
-                }
-            };
-        } else if is_single_edit(edits) {
-            let single = std::mem::replace(edits, Value::Null);
-            *edits = Value::Array(vec![single]);
-        }
-    } else if let Some(obj) = v.as_object_mut()
-        && (obj.contains_key("oldText") || obj.contains_key("newText"))
-    {
-        let mut single = serde_json::Map::new();
-        single.insert(
-            "oldText".into(),
-            obj.remove("oldText").unwrap_or(Value::Null),
-        );
-        single.insert(
-            "newText".into(),
-            obj.remove("newText").unwrap_or(Value::Null),
-        );
-        obj.insert("edits".into(), Value::Array(vec![Value::Object(single)]));
-    }
-    let args: EditArgs =
-        serde_json::from_value(v).map_err(|e| format!("invalid arguments: {e}"))?;
-    if args.edits.is_empty() {
-        return Err("invalid arguments: edits must contain at least one replacement".into());
-    }
-    Ok(args)
-}
-
 /// Line-based diff with line numbers, one hunk per changed region.
 fn diff_lines(old: &str, new: &str) -> String {
     let a: Vec<&str> = old.split('\n').collect();
@@ -726,10 +698,13 @@ pub fn edit() -> Tool {
         snippet: "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
         sequential: true,
         run: Box::new(|raw, _progress| {
-            let a = match parse_edit_args(raw) {
-                Ok(a) => a,
-                Err(e) => return format!("error: {e}"),
+            let a: EditArgs = match serde_json::from_str(raw) {
+                Ok(args) => args,
+                Err(e) => return format!("error: invalid arguments: {e}"),
             };
+            if a.edits.is_empty() {
+                return "error: edits must contain at least one replacement".into();
+            }
             match std::fs::read_to_string(&a.path) {
                 Err(e) => format!("error: {e}"),
                 Ok(s) => match apply_edits(&a.path, &s, &a.edits) {

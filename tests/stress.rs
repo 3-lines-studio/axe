@@ -735,37 +735,6 @@ fn bash_captures_output_and_status() {
 }
 
 #[test]
-fn edit_normalizes_malformed_args() {
-    let dir = std::env::temp_dir().join(format!("axe-edit-malformed-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("f.txt");
-    let edit = axe::tools::edit();
-    let p = path.to_str().unwrap();
-
-    std::fs::write(&path, "alpha\nbeta\n").unwrap();
-    let edits_str = r#"[{"oldText":"alpha","newText":"ALPHA"}]"#;
-    let args = serde_json::json!({"path": p, "edits": edits_str}).to_string();
-    let out = (edit.run)(&args, &mut |_| {});
-    assert!(out.starts_with("Successfully"), "{out}");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "ALPHA\nbeta\n");
-
-    std::fs::write(&path, "alpha\nbeta\n").unwrap();
-    let args =
-        serde_json::json!({"path": p, "edits": {"oldText": "beta", "newText": "BETA"}}).to_string();
-    let out = (edit.run)(&args, &mut |_| {});
-    assert!(out.starts_with("Successfully"), "{out}");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nBETA\n");
-
-    std::fs::write(&path, "alpha\nbeta\n").unwrap();
-    let args = serde_json::json!({"path": p, "oldText": "alpha", "newText": "A"}).to_string();
-    let out = (edit.run)(&args, &mut |_| {});
-    assert!(out.starts_with("Successfully"), "{out}");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "A\nbeta\n");
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
 fn session_old_format_and_compaction_roundtrip() {
     let dir = std::env::temp_dir().join(format!("axe-session-entries-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

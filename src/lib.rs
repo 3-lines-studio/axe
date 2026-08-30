@@ -459,6 +459,19 @@ mod tests {
             0o751
         );
         assert!(dir.join("f.txt").is_file());
+        let target = dir.join("target.txt");
+        let link = dir.join("link.txt");
+        std::fs::write(&target, "target").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        atomic_write(&link, b"replacement").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "target");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "replacement");
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
