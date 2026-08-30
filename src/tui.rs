@@ -168,12 +168,6 @@ const SLASH: &[SlashSpec] = &[
         category: "General",
     },
     SlashSpec {
-        command: "/clear",
-        help: "/clear",
-        description: "start a fresh session",
-        category: "General",
-    },
-    SlashSpec {
         command: "/new",
         help: "/new",
         description: "start a fresh session",
@@ -222,14 +216,8 @@ const SLASH: &[SlashSpec] = &[
         category: "Session",
     },
     SlashSpec {
-        command: "/version",
-        help: "/version",
-        description: "show the axe version",
-        category: "General",
-    },
-    SlashSpec {
         command: "/quit",
-        help: "/quit (/exit)",
+        help: "/quit",
         description: "exit the interactive shell",
         category: "General",
     },
@@ -1150,12 +1138,7 @@ impl Tui {
         };
         // These replace session state; running them mid-turn would clobber
         // the transcript the worker is still producing.
-        if self.running
-            && matches!(
-                name,
-                "clear" | "new" | "reset" | "resume" | "rewind" | "compact"
-            )
-        {
+        if self.running && matches!(name, "new" | "reset" | "resume" | "rewind" | "compact") {
             self.entries.push(Entry::Notice(
                 "agent is running; ctrl+c interrupts it first".into(),
             ));
@@ -1163,7 +1146,7 @@ impl Tui {
         }
         match name {
             "help" => self.open_screen(Screen::Help),
-            "clear" | "new" => self.fresh_session(true),
+            "new" => self.fresh_session(true),
             "reset" => self.fresh_session(false),
             "resume" => self.open_screen(Screen::Resume),
             "rewind" => self.open_screen(Screen::Rewind),
@@ -1202,11 +1185,7 @@ impl Tui {
                 }
             }
             "copy" => self.copy_last(),
-            "version" => {
-                self.entries
-                    .push(Entry::Notice(format!("{DIM}v{VERSION}{RESET}")));
-            }
-            "quit" | "exit" => {
+            "quit" => {
                 self.want_quit = true;
             }
             _ => {
