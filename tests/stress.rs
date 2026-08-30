@@ -540,7 +540,7 @@ fn session_load_by_id_sanitizes_paths() {
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(
         store.join("123.jsonl"),
-        "{\"Role\":\"user\",\"Content\":\"hi\"}\n",
+        "{\"type\":\"message\",\"message\":{\"Role\":\"user\",\"Content\":\"hi\"}}\n",
     )
     .unwrap();
     std::fs::write(dir.join("secret.jsonl"), "not a session").unwrap();
@@ -709,20 +709,10 @@ fn bash_captures_output_and_status() {
 }
 
 #[test]
-fn session_old_format_and_compaction_roundtrip() {
+fn session_compaction_roundtrip() {
     let dir = std::env::temp_dir().join(format!("axe-session-entries-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let d = dir.to_str().unwrap();
-
-    std::fs::write(
-        dir.join("session.jsonl"),
-        "{\"Role\":\"user\",\"Content\":\"hi\"}\n",
-    )
-    .unwrap();
-    let entries = axe::session::load_live(d);
-    assert_eq!(entries.len(), 1);
-    let msgs = axe::session::context_messages(&entries);
-    assert_eq!(msgs[0].content, "hi");
 
     let entry = axe::session::Entry::Compaction {
         summary: "done stuff".into(),

@@ -99,12 +99,7 @@ pub fn context_messages(entries: &[Entry]) -> Vec<Message> {
 }
 
 fn parse_entry_line(line: &str) -> Option<Entry> {
-    if let Ok(e) = serde_json::from_str::<Entry>(line) {
-        return Some(e);
-    }
-    serde_json::from_str::<Message>(line)
-        .ok()
-        .map(|message| Entry::Message { message })
+    serde_json::from_str(line).ok()
 }
 
 fn read_entries(path: &Path) -> Vec<Entry> {
