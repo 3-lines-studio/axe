@@ -120,13 +120,6 @@ fn read_entries(path: &Path) -> Vec<Entry> {
         .collect()
 }
 
-fn parse_entries(data: &str) -> Vec<Entry> {
-    data.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(parse_entry_line)
-        .collect()
-}
-
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && !id.contains('/') && !id.contains('\\')
 }
@@ -584,91 +577,6 @@ pub fn is_overflow_error(err: &str) -> bool {
         return false;
     }
     OVERFLOW_PATTERNS.iter().any(|p| e.contains(p))
-}
-
-#[derive(Debug)]
-pub struct SearchHit {
-    pub id: String,
-    pub title: String,
-    pub updated: i64,
-    pub text: String,
-}
-
-fn clip(s: &str, n: usize) -> String {
-    let count = s.chars().count();
-    let mut out: String = s.chars().take(n).collect();
-    if count > n {
-        out.push('…');
-    }
-    out
-}
-
-/// Case-insensitive substring search over the live session and archived
-/// sessions. JSONL is one entry per line, so line matches map to entries.
-pub fn search(dir: &str, text: &str) -> Vec<SearchHit> {
-    let needle = text.to_lowercase();
-    let mut out = Vec::new();
-    let mut scan = |path: &Path, id: &str| {
-        let Ok(data) = std::fs::read_to_string(path) else {
-            return;
-        };
-        let entries = parse_entries(&data);
-        let title = std::fs::read_to_string(title_path(dir, id))
-            .ok()
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| title_from_entries(&entries));
-        let updated = std::fs::metadata(path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        for line in data.lines() {
-            let parsed = parse_entry_line(line);
-            if matches!(parsed, Some(Entry::Usage { .. })) {
-                continue;
-            }
-            if !line.to_lowercase().contains(&needle) {
-                continue;
-            }
-            let text = parsed
-                .map(|e| match e {
-                    Entry::Message { message } => message.content,
-                    Entry::Compaction { summary, .. } => summary,
-                    Entry::Usage { .. } => unreachable!(),
-                })
-                .unwrap_or_else(|| line.to_string());
-            out.push(SearchHit {
-                id: id.into(),
-                title: title.clone(),
-                updated,
-                text: clip(&text, 200),
-            });
-            if out.len() >= 50 {
-                return;
-            }
-        }
-    };
-    let live = live_path(dir);
-    if live.exists() {
-        scan(&live, "live");
-    }
-    if let Ok(entries) = std::fs::read_dir(store_dir(dir)) {
-        for e in entries.flatten() {
-            let path = e.path();
-            if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let id = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            scan(&path, &id);
-        }
-    }
-    out.sort_by_key(|h| std::cmp::Reverse(h.updated));
-    out
 }
 
 #[cfg(test)]

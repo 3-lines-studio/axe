@@ -805,10 +805,6 @@ fn session_compaction_is_append_only() {
     assert_eq!(msgs[1].content, "recent");
     assert_eq!(msgs[2].content, "new question");
 
-    // Pre-compaction history remains searchable.
-    let hits = axe::session::search(d, "ZEBRA");
-    assert_eq!(hits.len(), 1, "old history must stay searchable");
-
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -826,29 +822,6 @@ fn session_overflow_patterns() {
     assert!(!axe::session::is_overflow_error(
         "openai: 529: Throttling error"
     ));
-}
-
-#[test]
-fn session_search_finds_text() {
-    let dir = std::env::temp_dir().join(format!("axe-search-{}", std::process::id()));
-    let store = dir.join("sessions");
-    std::fs::create_dir_all(&store).unwrap();
-    std::fs::write(
-        store.join("123.jsonl"),
-        "{\"Role\":\"user\",\"Content\":\"fix the overflow bug\"}\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.join("session.jsonl"),
-        "{\"Role\":\"user\",\"Content\":\"unrelated thing\"}\n",
-    )
-    .unwrap();
-    let d = dir.to_str().unwrap();
-    let hits = axe::session::search(d, "overflow");
-    assert_eq!(hits.len(), 1, "hits: {hits:?}");
-    assert!(hits[0].text.contains("overflow"));
-    assert!(axe::session::search(d, "zzz").is_empty());
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

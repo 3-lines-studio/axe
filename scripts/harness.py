@@ -588,7 +588,6 @@ def tui_help_screen(h, axe):
             t.expect("Run /help")
             t.type("/help\r")
             t.expect("/resume")
-            t.expect("/search <text>")
             t.key("esc")
             t.type("/quit\r")
             check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
@@ -656,30 +655,6 @@ def tui_resume_last(h, axe):
         finally:
             t2.close()
 
-
-@case
-def tui_search_command(h, axe):
-    with h.mock(TOOL_SCENARIO) as srv:
-        t = h.tui(axe, base=srv.base_url)
-        try:
-            t.expect("Run /help")
-            t.type("check the tool\r")
-            t.expect("Ran echo hello")
-            t.expect("Done")
-            t.type("/quit\r")
-            check(t.wait_exit() == 0, "seed session exit")
-        finally:
-            t.close()
-        t2 = h.tui(axe, base=srv.base_url)
-        try:
-            t2.expect("Run /help")
-            t2.type("/search check\r")
-            t2.expect("match(es) for: check")
-            t2.expect(": check the tool")
-            t2.type("/quit\r")
-            check(t2.wait_exit() == 0, "search session exit")
-        finally:
-            t2.close()
 
 
 @case

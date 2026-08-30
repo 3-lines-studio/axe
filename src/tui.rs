@@ -204,12 +204,6 @@ const SLASH: &[SlashSpec] = &[
         category: "Session",
     },
     SlashSpec {
-        command: "/search",
-        help: "/search <text>",
-        description: "search sessions for text",
-        category: "Session",
-    },
-    SlashSpec {
         command: "/rename",
         help: "/rename <title>",
         description: "rename the current session",
@@ -1207,37 +1201,6 @@ impl Tui {
                         )));
                     } else {
                         self.start_compaction(entries);
-                    }
-                }
-            }
-            "search" => {
-                if rest.is_empty() {
-                    self.entries
-                        .push(Entry::Notice(format!("{DIM}usage: /search <text>{RESET}")));
-                } else {
-                    let hits = session::search(&self.cfg.session_dir, rest);
-                    if hits.is_empty() {
-                        self.entries
-                            .push(Entry::Notice(format!("{DIM}no matches for: {rest}{RESET}")));
-                    } else {
-                        self.entries.push(Entry::Notice(format!(
-                            "{BOLD}{} match(es) for: {rest}{RESET}",
-                            hits.len()
-                        )));
-                        for h in hits.iter().take(20) {
-                            let id = if h.id == "live" {
-                                "live session".to_string()
-                            } else {
-                                format!("session {}", h.id)
-                            };
-                            let head = if h.title.is_empty() {
-                                id
-                            } else {
-                                format!("{} ({id})", h.title)
-                            };
-                            self.entries
-                                .push(Entry::Notice(format!("{DIM}{head}:{RESET} {}", h.text)));
-                        }
                     }
                 }
             }
