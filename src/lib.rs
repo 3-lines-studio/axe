@@ -43,13 +43,21 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
             .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
             .unwrap_or(0)
     ));
+    let permissions = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+        .map(|metadata| metadata.permissions());
     let res = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp)
-        .and_then(|mut f| {
+        .and_then(|mut file| {
             use std::io::Write;
-            f.write_all(data)
+            file.write_all(data)?;
+            if let Some(permissions) = permissions {
+                file.set_permissions(permissions)?;
+            }
+            Ok(())
         })
         .and_then(|()| std::fs::rename(&tmp, path));
     if res.is_err() {
@@ -442,8 +450,14 @@ mod tests {
         let path = dir.join("f.txt");
         atomic_write(&path, b"hello").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o751)).unwrap();
         atomic_write(&path, b"world!").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"world!");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
         assert!(dir.join("f.txt").is_file());
         std::fs::remove_dir_all(&dir).ok();
     }

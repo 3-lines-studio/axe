@@ -345,77 +345,85 @@ pub fn read() -> Tool {
         "read",
         "Read the contents of a file. Output is truncated to 16KB. Use offset/limit for large files. When you need the full file, continue with the suggested offset.",
         r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"number","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"number","description":"Maximum number of lines to read"}},"required":["path"]}"#,
-        |a: ReadArgs| match std::fs::read(&a.path) {
-            Err(e) => format!("error: {e}"),
-            Ok(b) => {
-                let text = String::from_utf8_lossy(&b);
-                let text = sanitize(&text);
-                let mut lines: Vec<&str> = text.split('\n').collect();
-                // A trailing newline does not start a new line; an empty
-                // file has no lines at all.
-                if text.ends_with('\n') || text.is_empty() {
-                    lines.pop();
-                }
-                let total = lines.len();
-                let start = a.offset.unwrap_or(1).saturating_sub(1);
-                if a.offset.is_some() && start >= total {
-                    return format!(
-                        "error: offset {} is beyond end of file ({} lines total)",
-                        a.offset.unwrap_or(1),
-                        total
-                    );
-                }
-                let end = match a.limit {
-                    Some(l) => (start + l).min(total),
-                    None => total,
+        |a: ReadArgs| {
+            use std::io::BufRead;
+            let file = match std::fs::File::open(&a.path) {
+                Ok(file) => file,
+                Err(e) => return format!("error: {e}"),
+            };
+            let start = a.offset.unwrap_or(1).saturating_sub(1);
+            let limit = a.limit.unwrap_or(usize::MAX);
+            let mut reader = std::io::BufReader::new(file);
+            let mut line = Vec::new();
+            let mut output = String::new();
+            let mut total = 0usize;
+            let mut shown = 0usize;
+            let mut overflow = false;
+            let mut oversized = None;
+            loop {
+                line.clear();
+                let read = match reader.read_until(b'\n', &mut line) {
+                    Ok(read) => read,
+                    Err(e) => return format!("error: {e}"),
                 };
-                let selected = lines[start..end].join("\n");
-                let remaining = total.saturating_sub(end);
-                if selected.len() <= MAX_OUTPUT {
-                    let mut out = selected;
-                    if remaining > 0 {
-                        out.push_str(&format!(
-                            "\n\n[{} more lines in file. Use offset={} to continue.]",
-                            remaining,
-                            end + 1
-                        ));
-                    }
-                    return out;
+                if read == 0 {
+                    break;
                 }
-                let first = lines[start];
-                if first.len() > MAX_OUTPUT {
-                    return format!(
-                        "[Line {} is {} bytes, exceeds the {} limit. Use bash: sed -n '{}p' {} | head -c {}]",
-                        start + 1,
-                        first.len(),
-                        MAX_OUTPUT,
-                        start + 1,
-                        a.path,
-                        MAX_OUTPUT
-                    );
+                if line.last() == Some(&b'\n') {
+                    line.pop();
                 }
-                let mut shown = 1usize;
-                let mut acc = first.to_string();
-                while shown < end - start {
-                    let next = lines[start + shown];
-                    if acc.len() + 1 + next.len() > MAX_OUTPUT {
-                        break;
-                    }
-                    acc.push('\n');
-                    acc.push_str(next);
-                    shown += 1;
+                let index = total;
+                total += 1;
+                if index < start || index >= start.saturating_add(limit) || overflow {
+                    continue;
                 }
-                let last = start + shown;
-                format!(
+                let text = sanitize(&String::from_utf8_lossy(&line));
+                if shown == 0 && text.len() > MAX_OUTPUT {
+                    oversized = Some((index + 1, text.len()));
+                    overflow = true;
+                    continue;
+                }
+                let separator = usize::from(!output.is_empty());
+                if output.len() + separator + text.len() > MAX_OUTPUT {
+                    overflow = true;
+                    continue;
+                }
+                if separator == 1 {
+                    output.push('\n');
+                }
+                output.push_str(&text);
+                shown += 1;
+            }
+            if a.offset.is_some() && start >= total {
+                return format!(
+                    "error: offset {} is beyond end of file ({} lines total)",
+                    a.offset.unwrap_or(1),
+                    total
+                );
+            }
+            if let Some((line, bytes)) = oversized {
+                return format!("[Line {line} is {bytes} bytes, exceeds the {MAX_OUTPUT} limit.]");
+            }
+            let end = start.saturating_add(shown).min(total);
+            if overflow {
+                return format!(
                     "{}\n\n[Showing lines {}-{} of {} ({} limit). Use offset={} to continue.]",
-                    acc,
+                    output,
                     start + 1,
-                    last,
+                    end,
                     total,
                     MAX_OUTPUT,
-                    last + 1
-                )
+                    end + 1
+                );
             }
+            let remaining = total.saturating_sub(start.saturating_add(limit).min(total));
+            if remaining > 0 {
+                output.push_str(&format!(
+                    "\n\n[{remaining} more lines in file. Use offset={} to continue.]",
+                    start.saturating_add(limit) + 1
+                ));
+            }
+            output
         },
     );
     t.snippet = "Read file contents (truncated, use offset to continue)";
