@@ -2,10 +2,11 @@
 
 #![forbid(unsafe_code)]
 
-use axe::{Agent, Error, Event, Message, OpenAI, Tool, ToolCall};
-use std::cell::RefCell;
+use axe::run::{self, Outcome, RunOptions, Sink};
+use axe::{Message, OpenAI, Tool, ToolCall, Usage};
 use std::io::{IsTerminal, Read};
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 struct Config {
@@ -260,28 +261,36 @@ fn compact_messages(cfg: &Config, fc: &FileConfig, path: &str) {
     }
 }
 
-fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
-    let stats = Rc::new(RefCell::new((0usize, 0usize)));
-    let s2 = stats.clone();
-    let on = move |e: Event| {
-        let mut st = s2.borrow_mut();
-        st.0 += e.usage.input;
-        st.1 += e.usage.output;
-        drop(st);
-        let m = &e.message;
-        if m.role == "assistant" {
-            if !m.content.is_empty() && !m.tool_calls.is_empty() {
-                eprintln!("{}", m.content);
-            }
-            for c in &m.tool_calls {
-                eprintln!("[{}] {} {}", e.turn, c.name, render_args(c));
-            }
-        } else if m.role == "tool" {
-            eprintln!("[{}] -> {}", e.turn, render_result(&m.content));
+struct CliSink {
+    input: usize,
+    output: usize,
+    compaction_threshold: Option<usize>,
+}
+
+impl Sink for CliSink {
+    fn assistant(&mut self, turn: usize, message: &Message, usage: Usage) {
+        self.input += usage.input;
+        self.output += usage.output;
+        if !message.content.is_empty() && !message.tool_calls.is_empty() {
+            eprintln!("{}", message.content);
         }
-    };
+        for call in &message.tool_calls {
+            eprintln!("[{turn}] {} {}", call.name, render_args(call));
+        }
+    }
+
+    fn tool(&mut self, turn: usize, message: &Message) {
+        eprintln!("[{turn}] -> {}", render_result(&message.content));
+    }
+
+    fn should_compact(&mut self, input: usize, output: usize) -> bool {
+        self.compaction_threshold
+            .is_some_and(|threshold| input.saturating_add(output) > threshold)
+    }
+}
+
+fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     let start = Instant::now();
-    let mut agent = build_agent(cfg, fc, on);
     let mut history = match cfg.session.as_deref() {
         Some(path) => match axe::session::load_path(std::path::Path::new(path)) {
             Ok(entries) => axe::session::context_messages(&entries),
@@ -299,29 +308,44 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
         tool_call_id: String::new(),
     });
     let old_len = history.len().saturating_sub(1);
-    let msgs = match agent.run(&history) {
-        Ok(msgs) => msgs,
-        Err(Error::MaxTurns(h)) => {
-            eprintln!("stopped: axe: max turns reached");
-            h
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
+    let tools = axe::tui::build_tools(&cfg.dir);
+    let system = resolve_system(cfg, &tools);
+    let provider = OpenAI::new(cfg.base.clone(), api_key(fc));
+    let mut sink = CliSink {
+        input: 0,
+        output: 0,
+        compaction_threshold: fc
+            .compaction_threshold
+            .or_else(|| fc.context_window.map(|window| window.saturating_sub(16384))),
     };
+    let end = run::run_stream(
+        &provider,
+        &RunOptions {
+            model: &cfg.model,
+            system: &system,
+            tools: &tools,
+            max_turns: usize::MAX,
+        },
+        &history,
+        &Arc::new(AtomicBool::new(false)),
+        &mut sink,
+    );
+    if let Outcome::Failed(error) = &end.outcome {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+    let msgs = end.messages;
     if let Some(path) = cfg.session.as_deref()
         && let Err(e) = axe::session::append_messages(std::path::Path::new(path), &msgs[old_len..])
     {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
-    let (i, o) = *stats.borrow();
-    if i + o > 0 {
+    if sink.input + sink.output > 0 {
         eprintln!(
             "tokens: {} in / {} out · {}",
-            tok(i),
-            tok(o),
+            tok(sink.input),
+            tok(sink.output),
             fmt_dur(start.elapsed())
         );
     }
@@ -353,16 +377,6 @@ fn expand_user_command(prompt: &str, ax_root: &str) -> String {
         return prompt.to_string();
     };
     axe::tui::expand_user_command(&uc, rest)
-}
-
-fn build_agent(cfg: &Config, fc: &FileConfig, on: impl FnMut(Event) + 'static) -> Agent<OpenAI> {
-    let tools = axe::tui::build_tools(&cfg.dir);
-    let system = resolve_system(cfg, &tools);
-    Agent::new(OpenAI::new(cfg.base.clone(), api_key(fc)))
-        .model(cfg.model.clone())
-        .system(system)
-        .tools(tools)
-        .on(on)
 }
 
 fn api_key(fc: &FileConfig) -> String {
