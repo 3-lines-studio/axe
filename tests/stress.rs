@@ -731,7 +731,7 @@ fn bash_captures_output_and_status() {
     assert_eq!(out, "error: exit status 3");
     let args = serde_json::json!({"command": "printf 'o' ; printf 'e' >&2"}).to_string();
     let out = (bash.run)(&args, &mut |_| {});
-    assert_eq!(out, "o\ne");
+    assert_eq!(out, "oe");
 }
 
 #[test]

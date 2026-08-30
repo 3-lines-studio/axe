@@ -25,30 +25,6 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-/// Tail of `s` within the output limit, never splitting a UTF-8 codepoint
-/// or a line, so line counts on the tail stay exact.
-fn tail(s: &str) -> &str {
-    if s.len() <= MAX_OUTPUT {
-        return s;
-    }
-    let mut start = s.len() - MAX_OUTPUT;
-    while !s.is_char_boundary(start) {
-        start += 1;
-    }
-    match s[start..].find('\n') {
-        Some(i) => &s[start + i + 1..],
-        None => &s[start..],
-    }
-}
-
-fn count_lines(s: &str) -> usize {
-    if s.is_empty() {
-        return 0;
-    }
-    let n = s.bytes().filter(|&b| b == b'\n').count();
-    if s.ends_with('\n') { n } else { n + 1 }
-}
-
 fn read_file_tail(path: &std::path::Path) -> String {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -127,23 +103,22 @@ pub fn bash(dir: &str) -> Tool {
             }
             let tag = BASH_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             ensure_sigint_handler();
-            let base = std::env::temp_dir().join(format!("axe-bash-{}-{tag}", std::process::id()));
-            let out_path = base.with_extension("out");
-            let err_path = base.with_extension("err");
-            // create_new (O_EXCL) refuses to follow a pre-planted symlink.
-            let open_excl = |p: &std::path::Path| {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(p)
-            };
-            let out_file = match open_excl(&out_path) {
-                Ok(f) => f,
+            let out_path =
+                std::env::temp_dir().join(format!("axe-bash-{}-{tag}.out", std::process::id()));
+            let out_file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out_path)
+            {
+                Ok(file) => file,
                 Err(e) => return format!("error: {e}"),
             };
-            let err_file = match open_excl(&err_path) {
-                Ok(f) => f,
-                Err(e) => return format!("error: {e}"),
+            let err_file = match out_file.try_clone() {
+                Ok(file) => file,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&out_path);
+                    return format!("error: {e}");
+                }
             };
             let mut cmd = std::process::Command::new("bash");
             cmd.arg("-c").arg(&a.command);
@@ -154,8 +129,11 @@ pub fn bash(dir: &str) -> Tool {
             cmd.stderr(std::process::Stdio::from(err_file));
             cmd.process_group(0);
             let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => return format!("error: {e}"),
+                Ok(child) => child,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&out_path);
+                    return format!("error: {e}");
+                }
             };
             // Registered so sigint_reap_children can kill the group if axe
             // dies first; dropped (unregistered) when the child is reaped.
@@ -206,40 +184,34 @@ pub fn bash(dir: &str) -> Tool {
                         }
                         std::thread::sleep(std::time::Duration::from_millis(25));
                     }
-                    Err(e) => return format!("error: {e}"),
+                    Err(e) => {
+                        unsafe {
+                            libc::kill(-(child.id() as i32), libc::SIGKILL);
+                        }
+                        let _ = child.wait();
+                        let _ = std::fs::remove_file(&out_path);
+                        return format!("error: {e}");
+                    }
                 }
             }
-            let stdout = std::fs::read(&out_path)
-                .map(|b| String::from_utf8_lossy(&b).into_owned())
-                .unwrap_or_default();
-            let stderr = std::fs::read(&err_path)
-                .map(|b| String::from_utf8_lossy(&b).into_owned())
-                .unwrap_or_default();
-            let stdout = sanitize(&stdout);
-            let stderr = sanitize(&stderr);
-            let mut s = stdout;
-            if !stderr.is_empty() {
-                if !s.is_empty() && !s.ends_with('\n') {
-                    s.push('\n');
-                }
-                s.push_str(&stderr);
-            }
-            let total_lines = count_lines(&s);
-            let truncated = s.len() > MAX_OUTPUT;
-            if truncated {
-                let _ = std::fs::write(&out_path, &s);
+            let truncated = std::fs::metadata(&out_path)
+                .map(|metadata| metadata.len() > MAX_OUTPUT as u64)
+                .unwrap_or(false);
+            let output = if truncated {
+                read_file_tail(&out_path)
             } else {
-                let _ = std::fs::remove_file(&out_path);
-            }
-            let _ = std::fs::remove_file(&err_path);
-            let mut display = tail(&s).to_string();
+                std::fs::read(&out_path)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default()
+            };
+            let mut display = sanitize(&output);
             if truncated {
-                let shown = count_lines(&display);
-                let start_line = total_lines - shown + 1;
                 display.push_str(&format!(
-                    "\n\n[Showing lines {start_line}-{total_lines} of {total_lines} (16KB limit). Full output: {}]",
+                    "\n\n[Output truncated to the last 16KB. Full output: {}]",
                     out_path.display()
                 ));
+            } else {
+                let _ = std::fs::remove_file(&out_path);
             }
             if timed_out {
                 if !display.is_empty() && !display.ends_with('\n') {
@@ -273,7 +245,7 @@ fn status_str(st: std::process::ExitStatus) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_OUTPUT, apply_edits, count_lines, sanitize, tail};
+    use super::{apply_edits, sanitize};
 
     #[test]
     fn sanitize_strips_control_characters() {
@@ -282,36 +254,6 @@ mod tests {
         assert_eq!(sanitize("keep\tnewline\ncr\r"), "keep\tnewline\ncr\r");
         assert_eq!(sanitize("\u{fff9}fmt\u{fffb}"), "fmt");
         assert_eq!(sanitize("emoji 🙈 ok"), "emoji 🙈 ok");
-    }
-
-    #[test]
-    fn tail_and_line_counts() {
-        assert_eq!(tail("short"), "short");
-        assert_eq!(count_lines(""), 0);
-        assert_eq!(count_lines("a"), 1);
-        assert_eq!(count_lines("a\n"), 1);
-        assert_eq!(count_lines("a\nb"), 2);
-
-        let big = "x".repeat(MAX_OUTPUT + 100);
-        let t = tail(&big);
-        assert_eq!(t.len(), MAX_OUTPUT);
-        assert_eq!(count_lines(&format!("a\nb\n{big}")), 3);
-    }
-
-    #[test]
-    fn tail_never_splits_a_line() {
-        // Start lands mid-run of y's; the partial line is dropped and the
-        // tail begins at the next full line.
-        let s = format!("{}\n{}\nend", "x".repeat(100), "y".repeat(MAX_OUTPUT));
-        let t = tail(&s);
-        assert_eq!(t, "end");
-        assert_eq!(count_lines(t), 1);
-
-        // No later newline: keep from the boundary as-is.
-        let s = format!("line-one-xxxxxxxx\n{}", "y".repeat(MAX_OUTPUT + 50));
-        let t = tail(&s);
-        assert!(!t.contains("line-one"));
-        assert!(t.starts_with("yyy"), "tail starts mid-line: {t:?}");
     }
 
     #[test]
@@ -363,7 +305,7 @@ mod tests {
         let args = serde_json::json!({"command": "yes | head -c 20000"}).to_string();
         let out = (bash.run)(&args, &mut |_| {});
         assert!(
-            out.contains("Showing lines"),
+            out.contains("Output truncated to the last 16KB"),
             "got tail: {}",
             &out[out.len().saturating_sub(200)..]
         );
