@@ -618,98 +618,6 @@ fn no_change_error(path: &str, total: usize) -> String {
     }
 }
 
-fn normalize_for_fuzzy(s: &str) -> String {
-    let mut out = String::new();
-    for line in s.split('\n') {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(line.trim_end());
-    }
-    out.replace(['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'], "'")
-        .replace(['\u{201C}', '\u{201D}', '\u{201E}', '\u{201F}'], "\"")
-        .replace(
-            [
-                '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}',
-            ],
-            "-",
-        )
-        .replace(
-            [
-                '\u{00A0}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}',
-                '\u{2008}', '\u{2009}', '\u{200A}', '\u{202F}', '\u{205F}', '\u{3000}',
-            ],
-            " ",
-        )
-}
-
-fn count_in(content: &str, needle: &str) -> usize {
-    if needle.is_empty() {
-        return 0;
-    }
-    content.matches(needle).count()
-}
-
-fn split_lines_with_endings(s: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut rest = s;
-    while let Some(i) = rest.find('\n') {
-        out.push(&rest[..=i]);
-        rest = &rest[i + 1..];
-    }
-    if !rest.is_empty() {
-        out.push(rest);
-    }
-    out
-}
-
-fn line_spans(content: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut offset = 0;
-    for line in split_lines_with_endings(content) {
-        spans.push((offset, offset + line.len()));
-        offset += line.len();
-    }
-    spans
-}
-
-fn byte_offset_of_nth_char(s: &str, n: usize) -> usize {
-    s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
-}
-
-fn fuzzy_to_original_range(
-    normalized: &str,
-    fuzzy: &str,
-    fstart: usize,
-    flen: usize,
-) -> Option<(usize, usize)> {
-    let fend = fstart + flen;
-    let fspans = line_spans(fuzzy);
-    let mut sl = None;
-    for (i, (ls, le)) in fspans.iter().enumerate() {
-        if fstart >= *ls && fstart < *le {
-            sl = Some(i);
-            break;
-        }
-    }
-    let sl = sl?;
-    let mut el = sl;
-    while el < fspans.len() && fspans[el].1 < fend {
-        el += 1;
-    }
-    if el >= fspans.len() {
-        return None;
-    }
-    let nspans = line_spans(normalized);
-    let k1 = fuzzy[fspans[sl].0..fstart].chars().count();
-    let k2 = fuzzy[fspans[el].0..fend].chars().count();
-    let first = &normalized[nspans[sl].0..nspans[sl].1];
-    let last = &normalized[nspans[el].0..nspans[el].1];
-    let start = nspans[sl].0 + byte_offset_of_nth_char(first, k1);
-    let end = nspans[el].0 + byte_offset_of_nth_char(last, k2);
-    Some((start, end - start))
-}
-
 fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<String, String> {
     if edits.is_empty() {
         return Err("error: edits must contain at least one replacement.".to_string());
@@ -727,35 +635,16 @@ fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<String, S
         olds.push(normalize_lf(&e.old_text));
     }
     let mut found: Vec<(usize, usize, usize)> = Vec::new();
-    let mut fuzzy_content: Option<String> = None;
     for (i, old) in olds.iter().enumerate() {
         let (start, len) = match normalized.find(old) {
             Some(idx) => {
-                let n = count_in(&normalized, old);
+                let n = normalized.matches(old).count();
                 if n > 1 {
                     return Err(duplicate_error(path, i, edits.len(), n));
                 }
                 (idx, old.len())
             }
-            None => {
-                let fuzzy = fuzzy_content.get_or_insert_with(|| normalize_for_fuzzy(&normalized));
-                let fuzzy_old = normalize_for_fuzzy(old);
-                if fuzzy_old.is_empty() {
-                    return Err(not_found_error(path, i, edits.len()));
-                }
-                let idx = match fuzzy.find(&fuzzy_old) {
-                    Some(j) => j,
-                    None => return Err(not_found_error(path, i, edits.len())),
-                };
-                let n = count_in(fuzzy, &fuzzy_old);
-                if n > 1 {
-                    return Err(duplicate_error(path, i, edits.len(), n));
-                }
-                match fuzzy_to_original_range(&normalized, fuzzy, idx, fuzzy_old.len()) {
-                    Some(r) => r,
-                    None => return Err(not_found_error(path, i, edits.len())),
-                }
-            }
+            None => return Err(not_found_error(path, i, edits.len())),
         };
         found.push((i, start, len));
     }

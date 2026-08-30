@@ -107,6 +107,11 @@ WRITE_FILE_SCENARIO = [
     {"stream": [content_chunk("file written.", "stop"), usage_chunk(20, 8)]},
 ]
 
+WRITE_TOOL_SCENARIO = [
+    {"stream": [tool_chunk("write", {"path": "out.txt", "content": "hi"}), usage_chunk(10, 5)]},
+    {"stream": [content_chunk("file written.", "stop"), usage_chunk(20, 8)]},
+]
+
 REWIND_SCENARIO = [
     {"stream": [content_chunk("FIRST ANSWER", "stop"), usage_chunk(5, 3)]},
     {"stream": [content_chunk("SECOND ANSWER", "stop"), usage_chunk(5, 3)]},
@@ -507,11 +512,19 @@ def oneshot_tool_loop(h, axe):
 
 
 @case
-def oneshot_tool_workdir(h, axe):
+def oneshot_bash_workdir(h, axe):
     with h.mock(WRITE_FILE_SCENARIO) as srv:
         p = h.oneshot(axe, ["-C", str(h.work), "write a file"], base=srv.base_url)
         check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
-        check((h.work / "out.txt").read_text() == "hi", "tool ran in wrong dir")
+        check((h.work / "out.txt").read_text() == "hi", "bash ran in wrong dir")
+
+
+@case
+def oneshot_write_workdir(h, axe):
+    with h.mock(WRITE_TOOL_SCENARIO) as srv:
+        p = h.oneshot(axe, ["-C", str(h.work), "write a file"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+        check((h.work / "out.txt").read_text() == "hi", "write ran in wrong dir")
 
 
 @case
