@@ -3,8 +3,6 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-cargo +nightly build --release --config 'build.rustflags=["-Cforce-unwind-tables=no","-Cllvm-args=-enable-machine-outliner=always"]'
-
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 case $os in
     linux | darwin) ;;
@@ -18,8 +16,16 @@ case $arch in
     *) echo "package: unsupported arch: $arch" >&2; exit 1 ;;
 esac
 
+triple="$arch-unknown-$os-gnu"
+[ "$os" = darwin ] && triple="$arch-apple-darwin"
+
+flags='["-Cforce-unwind-tables=no","-Cllvm-args=-enable-machine-outliner=always"]'
+[ "$os" = linux ] && flags='["-Cforce-unwind-tables=no","-Cllvm-args=-enable-machine-outliner=always","-Clink-args=-no-pie"]'
+
+cargo +nightly build --release --target "$triple" --config "build.rustflags=$flags"
+
 out="axe-$os-$arch"
-cp target/release/axe "$out"
+cp "target/$triple/release/axe" "$out"
 
 if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$out" > "$out.sha256"
