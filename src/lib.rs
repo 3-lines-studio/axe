@@ -373,6 +373,53 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn atomic_write_crash_child() {
+        use std::io::Write;
+        let path = std::path::PathBuf::from(std::env::var_os("AXE_CRASH_PATH").unwrap());
+        let marker = std::path::PathBuf::from(std::env::var_os("AXE_CRASH_MARKER").unwrap());
+        atomic_write_with(&path, |file| {
+            file.write_all(b"new")?;
+            std::fs::write(&marker, b"ready")?;
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn atomic_write_survives_process_kill() {
+        let dir = std::env::temp_dir().join(format!("axe-aw-kill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let marker = dir.join("ready");
+        std::fs::write(&path, b"old").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::atomic_write_crash_child", "--ignored"])
+            .env("AXE_CRASH_PATH", &path)
+            .env("AXE_CRASH_MARKER", &marker)
+            .spawn()
+            .unwrap();
+        for _ in 0..500 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(marker.exists());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".axe-tmp-"))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn coerce_integer_accepts_float_strings() {
         let schema: Value = serde_json::from_str(r#"{"type":"integer"}"#).unwrap();
         let mut v = Value::String("3.5".into());

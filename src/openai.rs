@@ -634,6 +634,23 @@ mod tests {
     }
 
     #[test]
+    fn large_sse_event_is_not_truncated() {
+        let mut acc = StreamAcc::default();
+        let content = "x".repeat(1024 * 1024);
+        let event =
+            format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\n");
+        let split = event.len() - 2;
+        let got = feed_all(
+            &mut acc,
+            &[&event.as_bytes()[..split], &event.as_bytes()[split..]],
+        );
+        assert!(got.iter().any(
+            |event| matches!(event, StreamEvent::Content(value) if value.len() == content.len())
+        ));
+        assert_eq!(acc.raw.len(), 200);
+    }
+
+    #[test]
     fn sse_parses_crlf_events() {
         let mut acc = StreamAcc::default();
         let full = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r\n\r\n";
