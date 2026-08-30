@@ -222,21 +222,17 @@ pub fn list_sessions(dir: &str) -> Vec<SessionMeta> {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        let entries = read_entries(&path);
+        let (derived_title, turns) = session_summary(&path);
         let title = std::fs::read_to_string(title_path(dir, &id))
             .ok()
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| title_from_entries(&entries));
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or(derived_title);
         let meta = std::fs::metadata(&path).ok();
         let updated = meta
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let turns = context_messages(&entries)
-            .iter()
-            .filter(|m| m.role == "user")
-            .count();
         out.push(SessionMeta {
             id,
             title,
@@ -247,6 +243,42 @@ pub fn list_sessions(dir: &str) -> Vec<SessionMeta> {
     }
     out.sort_by_key(|m| std::cmp::Reverse(m.updated));
     out
+}
+
+fn session_summary(path: &Path) -> (String, usize) {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return ("Untitled session".into(), 0);
+    };
+    let mut title = String::new();
+    let mut turns = 0;
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        match parse_entry_line(&line) {
+            Some(Entry::Message { message }) if message.role == "user" => {
+                if title.is_empty() && !message.content.is_empty() {
+                    title = first_words(&message.content, 8);
+                }
+                turns += 1;
+            }
+            Some(Entry::Compaction {
+                summary, retained, ..
+            }) => {
+                title = first_words(
+                    &format!("{COMPACTION_PREFIX}{summary}{COMPACTION_SUFFIX}"),
+                    8,
+                );
+                turns = 1 + retained
+                    .iter()
+                    .filter(|message| message.role == "user")
+                    .count();
+            }
+            _ => {}
+        }
+    }
+    if title.is_empty() {
+        title = "Untitled session".into();
+    }
+    (title, turns)
 }
 
 fn title_from_entries(entries: &[Entry]) -> String {
