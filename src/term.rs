@@ -206,10 +206,6 @@ impl Terminal {
         if bytes == b"201~" {
             return Ok(Key::PasteEnd);
         }
-        // SGR mouse: ESC [ < b ; x ; y M/m
-        if bytes[0] == b'<' {
-            return Ok(self.decode_mouse(&bytes));
-        }
         let final_byte = bytes[bytes.len() - 1];
         let params: Vec<&[u8]> = bytes[..bytes.len() - 1].split(|b| *b == b';').collect();
         let num = |i: usize| -> Option<u32> {
@@ -326,42 +322,6 @@ impl Terminal {
             _ => Ok(Key::Esc),
         }
     }
-
-    fn decode_mouse(&self, bytes: &[u8]) -> Key {
-        // ESC [ < cb ; x ; y M|m
-        let body = &bytes[1..bytes.len() - 1];
-        let mut parts = body.split(|b| *b == b';');
-        let cb = parts
-            .next()
-            .and_then(|p| std::str::from_utf8(p).ok())
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
-        let x = parts
-            .next()
-            .and_then(|p| std::str::from_utf8(p).ok())
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(0);
-        let y = parts
-            .next()
-            .and_then(|p| std::str::from_utf8(p).ok())
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(0);
-        let release = bytes.last() == Some(&b'm');
-        match cb {
-            64 => Key::WheelUp,
-            65 => Key::WheelDown,
-            66 => Key::WheelLeft,
-            67 => Key::WheelRight,
-            0 | 32 | 1 | 33 | 2 | 34 | 3 | 35 => {
-                if release {
-                    Key::MouseRelease
-                } else {
-                    Key::MousePress(x, y)
-                }
-            }
-            _ => Key::MouseOther,
-        }
-    }
 }
 
 /// One byte from `fd`; `None` on EOF. EINTR is retried so a caught signal
@@ -470,13 +430,6 @@ pub enum Key {
     AltDown,
     AltLeft,
     AltRight,
-    WheelUp,
-    WheelDown,
-    WheelLeft,
-    WheelRight,
-    MousePress(u16, u16),
-    MouseRelease,
-    MouseOther,
     Esc,
     CtrlC,
     Eof,
@@ -511,12 +464,4 @@ pub fn enter_alt() -> &'static str {
 
 pub fn leave_alt() -> &'static str {
     "\x1b[?1049l"
-}
-
-pub fn mouse_on() -> &'static str {
-    "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
-}
-
-pub fn mouse_off() -> &'static str {
-    "\x1b[?1000l\x1b[?1002l\x1b[?1006l"
 }

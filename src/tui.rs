@@ -552,8 +552,6 @@ impl Tui {
             Key::AltRight | Key::CtrlRight => self.input.move_word_right(),
             Key::AltUp | Key::AltDown | Key::CtrlUp | Key::CtrlDown => {}
             Key::PageUp | Key::PageDown => {}
-            Key::WheelUp | Key::WheelDown | Key::WheelLeft | Key::WheelRight => {}
-            Key::MousePress(_, _) | Key::MouseRelease | Key::MouseOther => {}
             Key::Alt(c) if c == '\r' || c == '\n' => self.input.insert('\n'),
             Key::Alt(_) => self.input.esc(),
             Key::Esc => {
@@ -674,7 +672,6 @@ impl Tui {
         }
         let out = term.out();
         let _ = out.write_all(term::enter_alt().as_bytes());
-        let _ = out.write_all(term::mouse_on().as_bytes());
         let _ = out.write_all(term::clear_display().as_bytes());
         let _ = out.flush();
         self.alt_active = true;
@@ -685,7 +682,6 @@ impl Tui {
             return;
         }
         let out = term.out();
-        let _ = out.write_all(term::mouse_off().as_bytes());
         let _ = out.write_all(term::leave_alt().as_bytes());
         let _ = out.flush();
         self.alt_active = false;
