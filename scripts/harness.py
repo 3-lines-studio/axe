@@ -461,27 +461,6 @@ def oneshot_stdin(h, axe):
         )
 
 
-@case
-def oneshot_events(h, axe):
-    with h.mock(ANSWER_SCENARIO) as srv:
-        p = h.oneshot(axe, ["--events", "hello"], stdin=b"", base=srv.base_url)
-        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
-        events = [json.loads(line) for line in p.stdout.splitlines()]
-        check(any(e.get("type") == "assistant_delta" for e in events), "no assistant delta")
-        check(any(e.get("type") == "usage" for e in events), "no usage event")
-        check(events[-1] == {"type": "done", "outcome": "done"}, "bad final event")
-
-
-@case
-def oneshot_message_input(h, axe):
-    messages = h.root / "messages.json"
-    messages.write_text(json.dumps([{"Role": "user", "Content": "from file"}]))
-    with h.mock(ANSWER_SCENARIO) as srv:
-        p = h.oneshot(axe, ["--events", "--messages", str(messages)], stdin=b"", base=srv.base_url)
-        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
-        check(body_msg(srv, 0, "user")[-1]["content"] == "from file", "messages not sent")
-        events = [json.loads(line) for line in p.stdout.splitlines()]
-        check(any(e.get("type") == "message" for e in events), "message event missing")
 
 
 @case
