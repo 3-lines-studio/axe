@@ -15,7 +15,6 @@ struct Config {
     system: String,
     dir: String,
     resume: Option<String>,
-    session: Option<String>,
 }
 
 struct FileConfig {
@@ -114,7 +113,6 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
         system: String::new(),
         dir: String::new(),
         resume: None,
-        session: None,
     };
     let mut rest = Vec::new();
     let mut i = 0;
@@ -157,7 +155,7 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
             None => (stripped.to_string(), None),
         };
         match name.as_str() {
-            "base" | "model" | "system" | "C" | "session" => {
+            "base" | "model" | "system" | "C" => {
                 let v = match inline {
                     Some(v) => v,
                     None => {
@@ -172,7 +170,6 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
                     "model" => cfg.model = v,
                     "system" => cfg.system = v,
                     "C" => cfg.dir = v,
-                    "session" => cfg.session = Some(v),
                     _ => unreachable!(),
                 }
             }
@@ -192,7 +189,6 @@ fn usage() {
          \x20 -model NAME  model name (default \"gpt-4.1-mini\")\n\
          \x20 -system TEXT  system prompt (default: built-in)\n\
          \x20 -C DIR       working directory for tools\n\
-         \x20 --session FILE  use an explicit session file\n\
          \x20 -r, --resume  open the session picker\n\
          \x20 --resume last  resume the most recent session\n\
          \x20 --resume ID   resume a saved session by id\n\
@@ -233,23 +229,12 @@ impl Sink for CliSink {
 
 fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     let start = Instant::now();
-    let mut history = match cfg.session.as_deref() {
-        Some(path) => match axe::session::load_path(std::path::Path::new(path)) {
-            Ok(entries) => axe::session::context_messages(&entries),
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        },
-        None => Vec::new(),
-    };
-    history.push(Message {
+    let history = vec![Message {
         role: "user".into(),
         content: prompt.join(" "),
         tool_calls: Vec::new(),
         tool_call_id: String::new(),
-    });
-    let old_len = history.len().saturating_sub(1);
+    }];
     let tools = axe::tui::build_tools(&cfg.dir);
     let system = resolve_system(cfg, &tools);
     let provider = OpenAI::new(cfg.base.clone(), api_key(fc));
@@ -277,12 +262,6 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
         std::process::exit(1);
     }
     let msgs = end.messages;
-    if let Some(path) = cfg.session.as_deref()
-        && let Err(e) = axe::session::append_messages(std::path::Path::new(path), &msgs[old_len..])
-    {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    }
     if sink.input + sink.output > 0 {
         eprintln!(
             "tokens: {} in / {} out · {}",
@@ -292,7 +271,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
         );
     }
     let pretty = std::io::stdout().is_terminal();
-    for m in &msgs[old_len..] {
+    for m in &msgs {
         if m.role == "assistant" && !m.content.is_empty() && m.tool_calls.is_empty() {
             if pretty {
                 let rendered = axe::markdown::Markdown::render(&m.content);

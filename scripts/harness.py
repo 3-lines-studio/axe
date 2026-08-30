@@ -458,17 +458,6 @@ def oneshot_stdin(h, axe):
 
 
 
-@case
-def oneshot_explicit_session(h, axe):
-    session = h.root / "thread.jsonl"
-    with h.mock(ANSWER_SCENARIO) as srv:
-        first = h.oneshot(axe, ["--session", str(session), "first"], base=srv.base_url)
-        second = h.oneshot(axe, ["--session", str(session), "second"], base=srv.base_url)
-        check(first.returncode == 0 and second.returncode == 0, "session call failed")
-        check(session.is_file(), "session was not written")
-        users = body_msg(srv, 1, "user")
-        check([m["content"] for m in users] == ["first", "second"], "session context lost")
-
 
 @case
 def oneshot_tool_loop(h, axe):
