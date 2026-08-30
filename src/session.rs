@@ -120,14 +120,15 @@ fn valid_id(id: &str) -> bool {
 }
 
 fn write_entries(path: &Path, entries: &[Entry]) {
-    let mut out = String::new();
-    for e in entries {
-        if let Ok(line) = serde_json::to_string(e) {
-            out.push_str(&line);
-            out.push('\n');
+    let _ = crate::atomic_write_with(path, |file| {
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(file);
+        for entry in entries {
+            serde_json::to_writer(&mut out, entry)?;
+            out.write_all(b"\n")?;
         }
-    }
-    let _ = crate::atomic_write(path, out.as_bytes());
+        out.flush()
+    });
 }
 
 pub fn save_live(dir: &str, entries: &[Entry]) {

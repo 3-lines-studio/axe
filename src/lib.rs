@@ -27,6 +27,14 @@ pub use openai::OpenAI;
 /// Write via temp file + rename in the destination directory so a crash or
 /// full disk never leaves a truncated file behind.
 pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    atomic_write_with(path, |file| file.write_all(data))
+}
+
+pub(crate) fn atomic_write_with(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TAG: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
@@ -51,8 +59,7 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
         .create_new(true)
         .open(&tmp)
         .and_then(|mut file| {
-            use std::io::Write;
-            file.write_all(data)?;
+            write(&mut file)?;
             if let Some(permissions) = permissions {
                 file.set_permissions(permissions)?;
             }
