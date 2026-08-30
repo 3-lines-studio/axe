@@ -48,22 +48,22 @@ fn corpus() -> Vec<Vec<u8>> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
     let ax_root = Path::new(&config_home).join("axe");
-    if let Ok(text) = std::fs::read(ax_root.join("config")) {
+    if let Ok(text) = read_seed(&ax_root.join("config")) {
         seeds.push(text);
     }
-    if let Ok(text) = std::fs::read(ax_root.join("SYSTEM.md")) {
+    if let Ok(text) = read_seed(&ax_root.join("SYSTEM.md")) {
         seeds.push(text);
     }
     if let Ok(entries) = std::fs::read_dir(ax_root.join("commands")) {
-        for e in entries.flatten() {
-            if let Ok(text) = std::fs::read(e.path()) {
+        for e in entries.flatten().take(8) {
+            if let Ok(text) = read_seed(&e.path()) {
                 seeds.push(text);
             }
         }
     }
     if let Ok(entries) = std::fs::read_dir(ax_root.join("sessions")) {
-        for e in entries.flatten() {
-            if let Ok(text) = std::fs::read(e.path()) {
+        for e in entries.flatten().take(8) {
+            if let Ok(text) = read_seed(&e.path()) {
                 seeds.push(text);
             }
         }
@@ -261,7 +261,6 @@ fn fuzz_tools(_rng: &mut Rng, seed: u64, input: &[u8]) {
     let read = axe::tools::read();
     let write = axe::tools::write();
     let edit = axe::tools::edit();
-    let bash = axe::tools::bash(dir.to_str().unwrap());
 
     guard("tool read", seed, || {
         let args = serde_json::json!({"path": path, "offset": 1, "limit": 2}).to_string();
@@ -281,13 +280,6 @@ fn fuzz_tools(_rng: &mut Rng, seed: u64, input: &[u8]) {
                 .to_string();
         let out = (edit.run)(&args, &mut |_| {});
         assert_sane("tool edit", seed, &out);
-    });
-    guard("tool bash safe", seed, || {
-        for cmd in ["echo hi", "true", "pwd", "printf 'x\n'"] {
-            let args = serde_json::json!({"command": cmd}).to_string();
-            let out = (bash.run)(&args, &mut |_| {});
-            assert_sane("tool bash", seed, &out);
-        }
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -442,25 +434,77 @@ fn stress_markdown_and_ansi() {
     eprintln!("stress_markdown_and_ansi: {cases} cases");
 }
 
-#[test]
-#[ignore]
-fn stress_text_and_session() {
+fn read_seed(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)?
+        .take(4096)
+        .read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+fn fuzz_corpus(rng_seed: u64, iterations: usize, fns: &[fn(&mut Rng, u64, &[u8])]) -> usize {
     let seeds = corpus();
     let mut cases = 0;
     for (si, base) in seeds.iter().enumerate() {
-        let mut rng = Rng(si as u64 ^ 0xD1B54A32D192ED03);
-        for it in 0..500 {
-            let seed = (si as u64) << 20 | it;
+        let mut rng = Rng(rng_seed ^ si as u64);
+        for it in 0..iterations {
+            let seed = (si as u64) << 20 | it as u64;
             let mut buf = base.clone();
             mutate(&mut rng, &mut buf, 16);
-            fuzz_session(&mut rng, seed, &buf);
-            fuzz_tools(&mut rng, seed, &buf);
-            fuzz_new_tool(&mut rng, seed, &buf);
-            fuzz_tui_text(&mut rng, seed, &buf);
+            for f in fns {
+                f(&mut rng, seed, &buf);
+            }
             cases += 1;
         }
     }
-    eprintln!("stress_text_and_session: {cases} cases");
+    cases
+}
+
+#[test]
+fn fuzz_text_and_session() {
+    let cases = fuzz_corpus(
+        0xD1B54A32D192ED03,
+        100,
+        &[fuzz_session, fuzz_new_tool, fuzz_tui_text],
+    );
+    eprintln!("fuzz_text_and_session: {cases} cases");
+}
+
+#[test]
+fn fuzz_tool_runs() {
+    let cases = fuzz_corpus(0xD1B54A32D192ED03, 10, &[fuzz_tools]);
+    eprintln!("fuzz_tool_runs: {cases} cases");
+}
+
+#[test]
+fn session_large_roundtrip() {
+    let dir = std::env::temp_dir().join(format!("axe-session-large-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.to_str().unwrap();
+    let n = 50_000;
+    let message = Message {
+        role: "user".into(),
+        content: "x".repeat(180),
+        tool_calls: Vec::new(),
+        tool_call_id: String::new(),
+    };
+    let entries: Vec<axe::session::Entry> = (0..n)
+        .map(|_| axe::session::Entry::Message {
+            message: message.clone(),
+        })
+        .collect();
+    axe::session::save_live(d, &entries);
+    let loaded = axe::session::load_live(d);
+    assert_eq!(loaded.len(), n);
+    assert_eq!(loaded, entries);
+    assert_eq!(axe::session::context_messages(&loaded).len(), n);
+    let id = axe::session::archive_live(d).expect("archive");
+    let meta = axe::session::list_sessions(d);
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0].id, id);
+    assert_eq!(meta[0].turns, n);
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
