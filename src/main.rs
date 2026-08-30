@@ -16,8 +16,6 @@ struct Config {
     dir: String,
     resume: Option<String>,
     session: Option<String>,
-    list_models: bool,
-    compact: Option<String>,
 }
 
 struct FileConfig {
@@ -66,14 +64,6 @@ fn main() {
     {
         eprintln!("error: change directory: {e}");
         std::process::exit(1);
-    }
-    if cfg.list_models {
-        list_models(&cfg, &fc);
-        return;
-    }
-    if let Some(path) = cfg.compact.as_deref() {
-        compact_messages(&cfg, &fc, path);
-        return;
     }
     let mut prompt = prompt;
     if prompt.is_empty() && std::io::stdin().is_terminal() {
@@ -125,8 +115,6 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
         dir: String::new(),
         resume: None,
         session: None,
-        list_models: false,
-        compact: None,
     };
     let mut rest = Vec::new();
     let mut i = 0;
@@ -135,11 +123,6 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
         if a == "-h" || a == "--help" {
             usage();
             std::process::exit(0);
-        }
-        if a == "--list-models" {
-            cfg.list_models = true;
-            i += 1;
-            continue;
         }
         if a == "-r" {
             cfg.resume = Some(String::new());
@@ -174,7 +157,7 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
             None => (stripped.to_string(), None),
         };
         match name.as_str() {
-            "base" | "model" | "system" | "C" | "session" | "compact" => {
+            "base" | "model" | "system" | "C" | "session" => {
                 let v = match inline {
                     Some(v) => v,
                     None => {
@@ -190,7 +173,6 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
                     "system" => cfg.system = v,
                     "C" => cfg.dir = v,
                     "session" => cfg.session = Some(v),
-                    "compact" => cfg.compact = Some(v),
                     _ => unreachable!(),
                 }
             }
@@ -211,8 +193,6 @@ fn usage() {
          \x20 -system TEXT  system prompt (default: built-in)\n\
          \x20 -C DIR       working directory for tools\n\
          \x20 --session FILE  use an explicit session file\n\
-         \x20 --list-models  print model names as JSON\n\
-         \x20 --compact FILE  compact a JSONL session and print JSON\n\
          \x20 -r, --resume  open the session picker\n\
          \x20 --resume last  resume the most recent session\n\
          \x20 --resume ID   resume a saved session by id\n\
@@ -223,42 +203,6 @@ fn usage() {
          A prompt of the form /name [args] expands a user command from
          ~/.config/axe/commands/<name>.md (same expansion as the TUI)."
     );
-}
-
-fn list_models(cfg: &Config, fc: &FileConfig) {
-    let provider = OpenAI::new(cfg.base.clone(), api_key(fc));
-    match provider.list_models() {
-        Ok(models) => println!("{}", serde_json::to_string(&models).unwrap()),
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn compact_messages(cfg: &Config, fc: &FileConfig, path: &str) {
-    let entries = match axe::session::load_path(std::path::Path::new(path)) {
-        Ok(entries) => entries,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    };
-    let provider = OpenAI::new(cfg.base.clone(), api_key(fc));
-    match axe::session::compact(&provider, &cfg.model, &entries) {
-        Ok((summary, tokens_before, retained)) => println!(
-            "{}",
-            serde_json::json!({
-                "summary": summary,
-                "tokens_before": tokens_before,
-                "retained": retained
-            })
-        ),
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 struct CliSink {
