@@ -72,12 +72,6 @@ enum Activity {
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum Mode {
-    Inline,
-    Full,
-}
-
-#[derive(PartialEq, Clone, Copy)]
 enum Screen {
     None,
     Help,
@@ -328,7 +322,6 @@ struct Tui {
     ctrl_c_armed_ms: Option<Instant>,
     esc_armed_ms: Option<Instant>,
     last_input_row: u16,
-    toggle_full_pending: bool,
     exit_alt_pending: bool,
     tx: Option<Sender<TurnEvent>>,
     rx: Option<Receiver<TurnEvent>>,
@@ -351,10 +344,8 @@ struct Tui {
     sess_in: usize,
     sess_out: usize,
     want_quit: bool,
-    mode: Mode,
     screen: Screen,
     alt_active: bool,
-    full_scroll: usize,
     streamed: Vec<String>,
     painted_once: bool,
     last_capacity: usize,
@@ -392,7 +383,6 @@ impl Tui {
             ctrl_c_armed_ms: None,
             esc_armed_ms: None,
             last_input_row: 1,
-            toggle_full_pending: false,
             exit_alt_pending: false,
             tx: None,
             rx: None,
@@ -415,10 +405,8 @@ impl Tui {
             sess_in: 0,
             sess_out: 0,
             want_quit: false,
-            mode: Mode::Inline,
             screen: Screen::None,
             alt_active: false,
-            full_scroll: 0,
             streamed: Vec::new(),
             painted_once: false,
             last_capacity: 0,
@@ -479,10 +467,6 @@ impl Tui {
             if self.want_quit {
                 break;
             }
-            if self.toggle_full_pending {
-                self.toggle_full_pending = false;
-                self.toggle_full(term);
-            }
             if self.exit_alt_pending {
                 self.exit_alt_pending = false;
                 self.leave_alt(term);
@@ -525,62 +509,6 @@ impl Tui {
         }
         if self.screen != Screen::None {
             return self.handle_screen_key(key);
-        }
-        if self.mode == Mode::Full {
-            match key {
-                Key::PageUp => {
-                    let h = self.full_view_h();
-                    self.full_scroll = (self.full_scroll + h).min(self.full_max_scroll());
-                    return Ok(true);
-                }
-                Key::PageDown => {
-                    let h = self.full_view_h();
-                    self.full_scroll = self.full_scroll.saturating_sub(h);
-                    return Ok(true);
-                }
-                Key::WheelUp => {
-                    self.full_scroll = (self.full_scroll + 3).min(self.full_max_scroll());
-                    return Ok(true);
-                }
-                Key::WheelDown => {
-                    self.full_scroll = self.full_scroll.saturating_sub(3);
-                    return Ok(true);
-                }
-                Key::Ctrl(c) => {
-                    if Self::ctrl_letter(c) == Some('o') {
-                        self.toggle_full_pending = true;
-                        return Ok(true);
-                    }
-                }
-                Key::Esc => {
-                    if self.picker.is_some() {
-                        self.picker_dismiss();
-                        return Ok(true);
-                    }
-                    if self.double_esc() {
-                        if self.busy_for_rewind() {
-                            self.entries.push(Entry::Notice(
-                                "agent is running; ctrl+c interrupts it first".into(),
-                            ));
-                        } else {
-                            self.open_screen(Screen::Rewind);
-                            return Ok(true);
-                        }
-                    } else {
-                        self.esc_armed_ms = Some(Instant::now());
-                    }
-                    self.toggle_full_pending = true;
-                    return Ok(true);
-                }
-                _ => {}
-            }
-        } else {
-            if let Key::Ctrl(c) = key
-                && Self::ctrl_letter(c) == Some('o')
-            {
-                self.toggle_full_pending = true;
-                return Ok(true);
-            }
         }
         match key {
             Key::CtrlC => {
@@ -784,12 +712,8 @@ impl Tui {
     fn close_screen(&mut self) {
         self.screen = Screen::None;
         self.input.take();
-        if self.mode == Mode::Inline {
-            self.exit_alt_pending = true;
-            self.streamed.clear();
-        } else {
-            self.last_frame.clear();
-        }
+        self.exit_alt_pending = true;
+        self.streamed.clear();
     }
 
     fn enter_alt(&mut self, term: &mut Terminal) {
@@ -813,19 +737,6 @@ impl Tui {
         let _ = out.write_all(term::leave_alt().as_bytes());
         let _ = out.flush();
         self.alt_active = false;
-    }
-
-    fn toggle_full(&mut self, term: &mut Terminal) {
-        if self.mode == Mode::Inline {
-            self.enter_alt(term);
-            self.mode = Mode::Full;
-            self.full_scroll = 0;
-            self.last_frame.clear();
-        } else {
-            self.leave_alt(term);
-            self.mode = Mode::Inline;
-            self.streamed.clear();
-        }
     }
 
     /// Consume an Esc press: true when it completes a double-Esc within
@@ -1605,10 +1516,6 @@ impl Tui {
         self.md = None;
         self.md_pending = None;
         self.streamed.clear();
-        if self.mode == Mode::Full {
-            self.full_scroll = 0;
-            self.last_frame.clear();
-        }
     }
 
     fn copy_last(&mut self) {
@@ -1712,15 +1619,7 @@ impl Tui {
         self.pending_tools.clear();
         self.streamed.clear();
         self.overflow_retried = false;
-        if self.mode == Mode::Full {
-            self.full_scroll = 0;
-            self.last_frame.clear();
-        } else {
-            // Inline mode: the transcript was replaced wholesale, so the next
-            // paint must reprint everything into scrollback instead of
-            // diffing against the previous session's lines.
-            self.reprint = true;
-        }
+        self.reprint = true;
         session::save_live(&self.cfg.session_dir, &entries);
     }
 
@@ -2076,10 +1975,7 @@ impl Tui {
             self.paint_catalog(term, resized);
             return;
         }
-        match self.mode {
-            Mode::Inline => self.paint_inline(term, resized),
-            Mode::Full => self.paint_full(term, resized),
-        }
+        self.paint_inline(term, resized);
     }
 
     fn render_transcript(&self) -> Vec<String> {
@@ -2433,64 +2329,6 @@ impl Tui {
         rows.push(String::new());
         rows.push(self.hint_line(scroll_hint));
         (rows, vis_cursor_row, cursor_col)
-    }
-
-    fn full_view_h(&self) -> usize {
-        (self.rows as usize).saturating_sub(2).max(1)
-    }
-
-    fn full_max_scroll(&self) -> usize {
-        let total = self.render_transcript().len();
-        total.saturating_sub(self.full_view_h())
-    }
-
-    fn paint_full(&mut self, term: &mut Terminal, resized: bool) {
-        self.enter_alt(term);
-        if resized {
-            self.last_frame.clear();
-        }
-        let out = term.out();
-        let rows = self.rows as usize;
-        if self.last_frame.is_empty() {
-            let _ = out.write_all(term::clear_display().as_bytes());
-        }
-        let all = self.render_transcript();
-        self.sync_picker();
-        let scroll_hint = if self.full_scroll > 0 {
-            let max_scroll = self.full_max_scroll();
-            let pct = (self.full_scroll * 100)
-                .checked_div(max_scroll)
-                .unwrap_or(0);
-            format!(" · {pct}%")
-        } else {
-            String::new()
-        };
-        let (chrome, cursor_row, cursor_col) = self.chrome_rows_with_hint(Some(&scroll_hint));
-        let chrome_len = chrome.len();
-        let cursor_abs = rows.saturating_sub(chrome_len) + cursor_row;
-        let view_h = rows.saturating_sub(chrome_len).max(1);
-        let total = all.len();
-        let max_scroll = total.saturating_sub(view_h);
-        if self.full_scroll > max_scroll {
-            self.full_scroll = max_scroll;
-        }
-        let start = total.saturating_sub(view_h + self.full_scroll);
-        let mut frame = Vec::new();
-        for item in &all[start..total.min(start + view_h)] {
-            frame.push(item.clone());
-        }
-        while frame.len() < view_h {
-            frame.push(String::new());
-        }
-        frame.extend(chrome);
-        self.emit_diff(out, &frame);
-        let _ = write!(
-            out,
-            "{}",
-            term::move_to(cursor_abs as u16, cursor_col as u16)
-        );
-        let _ = out.write_all(term::cursor_visible().as_bytes());
-        let _ = out.flush();
     }
 
     fn paint_catalog(&mut self, term: &mut Terminal, resized: bool) {
