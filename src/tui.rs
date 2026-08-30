@@ -210,18 +210,6 @@ const SLASH: &[SlashSpec] = &[
         category: "Session",
     },
     SlashSpec {
-        command: "/status",
-        help: "/status",
-        description: "show runtime configuration",
-        category: "General",
-    },
-    SlashSpec {
-        command: "/stats",
-        help: "/stats",
-        description: "show token and turn statistics",
-        category: "Account",
-    },
-    SlashSpec {
         command: "/model",
         help: "/model <id>",
         description: "set the model",
@@ -1203,30 +1191,6 @@ impl Tui {
                         self.start_compaction(entries);
                     }
                 }
-            }
-            "status" => {
-                let key = if self.cfg.api_key.is_empty() {
-                    "missing".to_string()
-                } else {
-                    "set".to_string()
-                };
-                let dir = if self.cfg.dir.is_empty() {
-                    ".".to_string()
-                } else {
-                    self.cfg.dir.clone()
-                };
-                self.entries.push(Entry::Notice(format!(
-                    "{DIM}base: {} · model: {} · dir: {} · key: {}{RESET}",
-                    self.cfg.base, self.cfg.model, dir, key
-                )));
-            }
-            "stats" => {
-                let msg = format!(
-                    "{DIM}session · {} in / {} out{RESET}",
-                    tok(self.sess_in),
-                    tok(self.sess_out)
-                );
-                self.entries.push(Entry::Notice(msg));
             }
             "model" => {
                 if rest.is_empty() {
