@@ -304,11 +304,6 @@ fn title_path(dir: &str, id: &str) -> PathBuf {
     store_dir(dir).join(format!("{id}.title"))
 }
 
-pub fn set_live_title(dir: &str, title: &str) {
-    let path = Path::new(dir).join("session.title");
-    let _ = crate::atomic_write(&path, title.as_bytes());
-}
-
 /// Rough token estimate for context budgeting: chars/4.
 /// Ensure the transcript does not end with an unanswered tool-call exchange:
 /// providers reject an assistant message whose tool_calls lack matching tool

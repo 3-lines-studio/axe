@@ -198,18 +198,6 @@ const SLASH: &[SlashSpec] = &[
         category: "Session",
     },
     SlashSpec {
-        command: "/rename",
-        help: "/rename <title>",
-        description: "rename the current session",
-        category: "Session",
-    },
-    SlashSpec {
-        command: "/model",
-        help: "/model <id>",
-        description: "set the model",
-        category: "Model",
-    },
-    SlashSpec {
         command: "/copy",
         help: "/copy",
         description: "copy the last assistant response",
@@ -1132,9 +1120,9 @@ impl Tui {
     }
 
     fn slash(&mut self, cmd: &str) {
-        let (name, rest) = match cmd.split_once(' ') {
-            Some((n, r)) => (n, r.trim()),
-            None => (cmd, ""),
+        let name = match cmd.split_once(' ') {
+            Some((n, _)) => n,
+            None => cmd,
         };
         // These replace session state; running them mid-turn would clobber
         // the transcript the worker is still producing.
@@ -1150,16 +1138,6 @@ impl Tui {
             "reset" => self.fresh_session(false),
             "resume" => self.open_screen(Screen::Resume),
             "rewind" => self.open_screen(Screen::Rewind),
-            "rename" => {
-                if !rest.is_empty() {
-                    session::set_live_title(&self.cfg.session_dir, rest);
-                    self.entries
-                        .push(Entry::Notice(format!("{DIM}renamed: {rest}{RESET}")));
-                } else {
-                    self.entries
-                        .push(Entry::Notice(format!("{DIM}usage: /rename <title>{RESET}")));
-                }
-            }
             "compact" => {
                 if self.compacting {
                     self.entries
@@ -1173,15 +1151,6 @@ impl Tui {
                     } else {
                         self.start_compaction(entries);
                     }
-                }
-            }
-            "model" => {
-                if rest.is_empty() {
-                    self.entries
-                        .push(Entry::Notice(format!("{DIM}usage: /model <id>{RESET}")));
-                } else {
-                    self.cfg.model = rest.to_string();
-                    self.model_display = compact_model_label(rest);
                 }
             }
             "copy" => self.copy_last(),
