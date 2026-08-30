@@ -76,7 +76,6 @@ enum Screen {
     None,
     Help,
     Resume,
-    Models,
     Rewind,
 }
 
@@ -250,14 +249,8 @@ const SLASH: &[SlashSpec] = &[
     },
     SlashSpec {
         command: "/model",
-        help: "/model <id-or-query>",
-        description: "choose what model and reasoning effort to use",
-        category: "Model",
-    },
-    SlashSpec {
-        command: "/models",
-        help: "/models",
-        description: "browse available models",
+        help: "/model <id>",
+        description: "set the model",
         category: "Model",
     },
     SlashSpec {
@@ -360,9 +353,6 @@ struct Tui {
     sel: usize,
     window_start: usize,
     sessions: Vec<SessionMeta>,
-    models: Vec<String>,
-    models_loading: bool,
-    models_rx: Option<Receiver<Result<Vec<String>, String>>>,
     picker: Option<Picker>,
     picker_dismissed: Option<PickerKind>,
     login: Option<LoginWizard>,
@@ -421,9 +411,6 @@ impl Tui {
             sel: 0,
             window_start: 0,
             sessions: Vec::new(),
-            models: Vec::new(),
-            models_loading: false,
-            models_rx: None,
             picker: None,
             picker_dismissed: None,
             login: None,
@@ -680,16 +667,7 @@ impl Tui {
                 self.sel = (self.sel + 8).min(n.saturating_sub(1));
                 Ok(true)
             }
-            Key::Left | Key::Right => Ok(true),
-            Key::Tab => {
-                if self.screen == Screen::Models {
-                    let n = self.catalog_item_count();
-                    if n > 0 {
-                        self.sel = (self.sel + 1) % n;
-                    }
-                }
-                Ok(true)
-            }
+            Key::Left | Key::Right | Key::Tab => Ok(true),
             Key::Enter => {
                 self.catalog_activate();
                 Ok(true)
@@ -1197,18 +1175,6 @@ impl Tui {
                 Err(_) => self.compact_rx = Some(rx),
             }
         }
-        if let Some(rx) = self.models_rx.take() {
-            match rx.try_recv() {
-                Ok(Ok(m)) => {
-                    self.models = m;
-                    self.models_loading = false;
-                }
-                Ok(Err(_)) => {
-                    self.models_loading = false;
-                }
-                Err(_) => self.models_rx = Some(rx),
-            }
-        }
         any
     }
 
@@ -1339,13 +1305,14 @@ impl Tui {
                 self.entries.push(Entry::Notice(msg));
             }
             "model" => {
-                if !rest.is_empty() {
+                if rest.is_empty() {
+                    self.entries
+                        .push(Entry::Notice(format!("{DIM}usage: /model <id>{RESET}")));
+                } else {
                     self.cfg.model = rest.to_string();
                     self.model_display = compact_model_label(rest);
                 }
-                self.open_screen(Screen::Models);
             }
-            "models" => self.open_screen(Screen::Models),
             "copy" => self.copy_last(),
             "version" => {
                 self.entries
@@ -1628,9 +1595,6 @@ impl Tui {
             Screen::Resume => {
                 self.sessions = session::list_sessions(&self.cfg.session_dir);
             }
-            Screen::Models => {
-                self.start_models_load();
-            }
             Screen::Rewind => {
                 self.rewind_items = self.build_rewind_items();
             }
@@ -1709,26 +1673,10 @@ impl Tui {
         )));
     }
 
-    fn start_models_load(&mut self) {
-        if self.models_loading || !self.models.is_empty() {
-            return;
-        }
-        self.models_loading = true;
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.models_rx = Some(rx);
-        let provider = OpenAI::new(self.cfg.base.clone(), self.cfg.api_key.clone());
-        std::thread::spawn(move || {
-            let _ = tx.send(provider.list_models().map_err(|e| e.to_string()));
-        });
-    }
-
-    // ---------- catalog ----------
-
     fn catalog_item_count(&self) -> usize {
         match self.screen {
             Screen::Help => self.help_items().len(),
             Screen::Resume => self.filtered_sessions().len(),
-            Screen::Models => self.filtered_models().len(),
             Screen::Rewind => self.filtered_rewind_items().len(),
             _ => 0,
         }
@@ -1753,14 +1701,6 @@ impl Tui {
         self.sessions
             .iter()
             .filter(|s| q.is_empty() || s.title.to_lowercase().contains(&q))
-            .collect()
-    }
-
-    fn filtered_models(&self) -> Vec<&String> {
-        let q = self.input.buf().trim().to_lowercase();
-        self.models
-            .iter()
-            .filter(|m| q.is_empty() || m.to_lowercase().contains(&q))
             .collect()
     }
 
@@ -1792,18 +1732,6 @@ impl Tui {
                     self.load_messages(msgs);
                     self.entries
                         .push(Entry::Notice(format!("{DIM}resumed: {title}{RESET}")));
-                }
-            }
-            Screen::Models => {
-                let m = self.filtered_models().get(self.sel).cloned().cloned();
-                if let Some(m) = m {
-                    self.cfg.model = m.clone();
-                    self.model_display = compact_model_label(&m);
-                    self.close_screen();
-                    self.entries.push(Entry::Notice(format!(
-                        "{DIM}model: {}{RESET}",
-                        self.cfg.model
-                    )));
                 }
             }
             Screen::Rewind => {
@@ -1891,34 +1819,6 @@ impl Tui {
                     },
                 );
             }
-            Screen::Models => {
-                if self.models_loading && self.models.is_empty() {
-                    out.push(format!("{DIM}Loading models…{RESET}"));
-                } else {
-                    let items: Vec<String> = self
-                        .models
-                        .iter()
-                        .filter(|m| q.is_empty() || m.to_lowercase().contains(&q))
-                        .cloned()
-                        .collect();
-                    if items.is_empty() && !self.models_loading {
-                        out.push(format!("{DIM}No models found.{RESET}"));
-                    } else {
-                        out.push(format!("{SELECTED}Models {}{RESET}", items.len()));
-                        push_catalog_items(
-                            &mut self.window_start,
-                            sel,
-                            &mut out,
-                            items.len(),
-                            rows,
-                            |i| {
-                                let style = if i == sel { SELECTED } else { DIM };
-                                format!("{style}  {}{RESET}", items[i])
-                            },
-                        );
-                    }
-                }
-            }
             Screen::Rewind => {
                 let items = self.filtered_rewind_items();
                 out.push(format!("{SELECTED}Rewind {}{RESET}", items.len()));
@@ -1955,7 +1855,6 @@ impl Tui {
         let hint = match screen {
             Screen::Help => "↑↓ Navigate     Enter Open     Esc Close",
             Screen::Resume => "↑↓ Navigate     Enter Open     Esc Close",
-            Screen::Models => "↑↓ Navigate     Enter Open     Esc Close",
             Screen::Rewind => "↑↓ Navigate     Enter Rewind     Esc Close",
             Screen::None => "",
         };

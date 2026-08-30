@@ -27,32 +27,6 @@ impl OpenAI {
         }
     }
 
-    pub fn list_models(&self) -> Result<Vec<String>, Error> {
-        let url = format!("{}/models", self.base_url);
-        let headers = vec![(
-            "Authorization".to_string(),
-            format!("Bearer {}", self.api_key),
-        )];
-        let resp = crate::http::get(&url, &headers).map_err(Error::Transport)?;
-        if resp.status != 200 {
-            return Err(Error::Provider(format!(
-                "openai: models: unexpected status {}",
-                resp.status
-            )));
-        }
-        let v: Value = serde_json::from_slice(&resp.body).map_err(err)?;
-        let mut out = Vec::new();
-        if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
-            for item in data {
-                if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
-                    out.push(id.to_string());
-                }
-            }
-        }
-        out.sort();
-        Ok(out)
-    }
-
     pub fn complete_stream(
         &self,
         req: &Request,
