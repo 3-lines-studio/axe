@@ -50,13 +50,13 @@ fn main() {
     if prompt.is_empty() && std::io::stdin().is_terminal() {
         let tools = axe::tui::build_tools(&cfg.dir);
         let session_dir =
-            axe::session::scope_dir(&ax_root(), std::path::Path::new(&work_dir(&cfg)));
+            axe::session::scope_dir(&axe_root(), std::path::Path::new(&work_dir(&cfg)));
         let tui_cfg = axe::tui::TuiConfig {
             base: cfg.base.clone(),
             model: cfg.model.clone(),
             system: resolve_system(&cfg, &tools),
             dir: cfg.dir.clone(),
-            ax_root: ax_root(),
+            axe_root: axe_root(),
             session_dir,
             api_key: api_key(&fc),
             resume: cfg.resume.clone(),
@@ -340,7 +340,7 @@ fn config_dir() -> Option<std::path::PathBuf> {
         .map(|h| std::path::PathBuf::from(h).join(".config"))
 }
 
-fn ax_root() -> String {
+fn axe_root() -> String {
     match config_dir() {
         Some(d) => d.join("axe").display().to_string(),
         None => work_dir_abs(),

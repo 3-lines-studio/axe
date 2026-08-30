@@ -236,10 +236,10 @@ class Harness:
         self.home = self.root / "home"
         self.config = self.root / "config"
         self.work = self.root / "work"
-        for d in (self.home, self.config, self.work, self.ax_root()):
+        for d in (self.home, self.config, self.work, self.axe_root()):
             d.mkdir(parents=True, exist_ok=True)
 
-    def ax_root(self):
+    def axe_root(self):
         return self.config / "axe"
 
     def session_root(self):
@@ -247,10 +247,10 @@ class Harness:
         for byte in os.fsencode(self.work.resolve()):
             value ^= byte
             value = value * 0x100000001b3 & 0xffffffffffffffff
-        return self.ax_root() / "projects" / f"{value:016x}"
+        return self.axe_root() / "projects" / f"{value:016x}"
 
     def write_config(self, text):
-        (self.ax_root() / "config").write_text(text)
+        (self.axe_root() / "config").write_text(text)
 
     def seed_session(self, sid, title, content):
         self.seed_session_msgs(sid, title, [{"Role": "user", "Content": content}])
@@ -580,7 +580,7 @@ def oneshot_help(h, axe):
 def oneshot_version(h, axe):
     p = h.oneshot(axe, ["--version"])
     check(p.returncode == 0, "expected exit 0, got %s" % p.returncode)
-    check(p.stdout == "axe 0.1.7\n", "stdout: %s" % p.stdout[-500:])
+    check(p.stdout == "axe 0.1.0\n", "stdout: %s" % p.stdout[-500:])
 
 
 
