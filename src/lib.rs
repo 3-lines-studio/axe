@@ -1,8 +1,7 @@
 //! Minimal LLM coding agent harness.
 //!
 //! The loop is the only logic: messages -> LLM -> tool calls -> results ->
-//! repeat. It lives in `run`, is shared by the SDK and the TUI, and never
-//! mutates its input.
+//! repeat. It lives in `run` and never mutates its input.
 //!
 //! Message/ToolCall serialize with PascalCase field names (session
 //! storage); the OpenAI provider maps them to the wire format.
@@ -135,16 +134,8 @@ impl StreamHandle {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Event {
-    pub turn: usize,
-    pub message: Message,
-    pub usage: Usage,
-}
-
 #[derive(Debug)]
 pub enum Error {
-    MaxTurns(Vec<Message>),
     /// Connection-level failure (DNS, TLS, refused, timeout): retryable.
     Transport(String),
     Provider(String),
@@ -157,7 +148,6 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::MaxTurns(_) => write!(f, "axe: max turns reached"),
             Error::Transport(s) => write!(f, "{s}"),
             Error::Provider(s) => write!(f, "{s}"),
             Error::Http { message, .. } => write!(f, "{message}"),
@@ -336,107 +326,6 @@ pub struct Response {
     pub message: Message,
     pub usage: Usage,
     pub stop_reason: String,
-}
-
-pub struct Agent<P: Provider> {
-    provider: P,
-    model: String,
-    system: String,
-    tools: Vec<Tool>,
-    max_turns: usize,
-    on: Option<Box<dyn FnMut(Event)>>,
-}
-
-impl<P: Provider> Agent<P> {
-    pub fn new(provider: P) -> Self {
-        Agent {
-            provider,
-            model: String::new(),
-            system: String::new(),
-            tools: Vec::new(),
-            max_turns: usize::MAX,
-            on: None,
-        }
-    }
-
-    pub fn model(mut self, m: impl Into<String>) -> Self {
-        self.model = m.into();
-        self
-    }
-
-    pub fn system(mut self, s: impl Into<String>) -> Self {
-        self.system = s.into();
-        self
-    }
-
-    pub fn tools(mut self, ts: Vec<Tool>) -> Self {
-        self.tools = ts;
-        self
-    }
-
-    pub fn max_turns(mut self, n: usize) -> Self {
-        self.max_turns = n;
-        self
-    }
-
-    pub fn on(mut self, f: impl FnMut(Event) + 'static) -> Self {
-        self.on = Some(Box::new(f));
-        self
-    }
-
-    pub fn provider(&self) -> &P {
-        &self.provider
-    }
-
-    pub fn run(&mut self, msgs: &[Message]) -> Result<Vec<Message>, Error> {
-        let mut sink = AgentSink { on: self.on.take() };
-        let end = run::run_stream(
-            &self.provider,
-            &run::RunOptions {
-                model: &self.model,
-                system: &self.system,
-                tools: &self.tools,
-                max_turns: self.max_turns,
-            },
-            msgs,
-            &Arc::new(AtomicBool::new(false)),
-            &mut sink,
-        );
-        self.on = sink.on;
-        match end.outcome {
-            run::Outcome::Done | run::Outcome::Cancelled | run::Outcome::Compact => {
-                Ok(end.messages)
-            }
-            run::Outcome::MaxTurns => Err(Error::MaxTurns(end.messages)),
-            run::Outcome::Failed(e) => Err(Error::Provider(e)),
-        }
-    }
-}
-
-struct AgentSink {
-    on: Option<Box<dyn FnMut(Event)>>,
-}
-
-impl run::Sink for AgentSink {
-    fn assistant(&mut self, turn: usize, msg: &Message, usage: Usage) {
-        if let Some(f) = &mut self.on {
-            f(Event {
-                turn,
-                message: msg.clone(),
-                usage,
-            });
-        }
-    }
-
-    fn tool(&mut self, turn: usize, msg: &Message) {
-        if let Some(f) = &mut self.on {
-            f(Event {
-                turn,
-                message: msg.clone(),
-                usage: Usage::default(),
-            });
-        }
-    }
 }
 
 #[cfg(test)]

@@ -1,8 +1,6 @@
-//! Agent loop against a fake provider.
-
 use axe::{
-    Agent, Error, Message, Provider, Request, Response, StreamEvent, StreamHandle, ToolCall, Usage,
-    new_tool,
+    Error, Message, Provider, Request, Response, StreamEvent, StreamHandle, Tool, ToolCall, Usage,
+    new_tool, run,
 };
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -11,6 +9,106 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
+
+#[derive(Debug)]
+enum TestError {
+    MaxTurns(Vec<Message>),
+    Failed(String),
+}
+
+impl std::fmt::Display for TestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MaxTurns(_) => write!(f, "max turns reached"),
+            Self::Failed(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+struct TestEvent {
+    usage: Usage,
+}
+
+struct TestAgent<P> {
+    provider: P,
+    tools: Vec<Tool>,
+    max_turns: usize,
+    on: Option<Box<dyn FnMut(TestEvent)>>,
+}
+
+impl<P: Provider> TestAgent<P> {
+    fn new(provider: P) -> Self {
+        Self {
+            provider,
+            tools: Vec::new(),
+            max_turns: usize::MAX,
+            on: None,
+        }
+    }
+
+    fn tools(mut self, tools: Vec<Tool>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    fn max_turns(mut self, max_turns: usize) -> Self {
+        self.max_turns = max_turns;
+        self
+    }
+
+    fn on(mut self, on: impl FnMut(TestEvent) + 'static) -> Self {
+        self.on = Some(Box::new(on));
+        self
+    }
+
+    fn provider(&self) -> &P {
+        &self.provider
+    }
+
+    fn run(&mut self, messages: &[Message]) -> Result<Vec<Message>, TestError> {
+        let mut sink = TestSink { on: self.on.take() };
+        let end = run::run_stream(
+            &self.provider,
+            &run::RunOptions {
+                model: "",
+                system: "",
+                tools: &self.tools,
+                max_turns: self.max_turns,
+            },
+            messages,
+            &Arc::new(AtomicBool::new(false)),
+            &mut sink,
+        );
+        self.on = sink.on;
+        match end.outcome {
+            run::Outcome::Done | run::Outcome::Cancelled | run::Outcome::Compact => {
+                Ok(end.messages)
+            }
+            run::Outcome::MaxTurns => Err(TestError::MaxTurns(end.messages)),
+            run::Outcome::Failed(error) => Err(TestError::Failed(error)),
+        }
+    }
+}
+
+struct TestSink {
+    on: Option<Box<dyn FnMut(TestEvent)>>,
+}
+
+impl run::Sink for TestSink {
+    fn assistant(&mut self, _turn: usize, _message: &Message, usage: Usage) {
+        if let Some(on) = &mut self.on {
+            on(TestEvent { usage });
+        }
+    }
+
+    fn tool(&mut self, _turn: usize, _message: &Message) {
+        if let Some(on) = &mut self.on {
+            on(TestEvent {
+                usage: Usage::default(),
+            });
+        }
+    }
+}
 
 #[derive(Default)]
 struct Fake {
@@ -133,7 +231,7 @@ fn run_retries_429_then_succeeds() {
         fail_status: 429,
         fail_times: 2,
     };
-    let mut a = Agent::new(p);
+    let mut a = TestAgent::new(p);
     let out = a.run(&[user("go")]).expect("run");
     assert_eq!(out.len(), 2);
     assert_eq!(out[1].content, "ok");
@@ -147,7 +245,7 @@ fn run_does_not_retry_400() {
         fail_status: 400,
         fail_times: 10,
     };
-    let mut a = Agent::new(p);
+    let mut a = TestAgent::new(p);
     let err = a.run(&[user("go")]).unwrap_err();
     assert!(err.to_string().contains("flaky"), "got: {err}");
     assert_eq!(*a.provider().attempts.borrow(), 1);
@@ -181,7 +279,7 @@ fn run_executes_tools_and_returns_transcript() {
         ])),
         ..Default::default()
     };
-    let mut a = Agent::new(p)
+    let mut a = TestAgent::new(p)
         .tools(vec![upper])
         .max_turns(5)
         .on(move |e| ev.borrow_mut().push(e));
@@ -232,7 +330,7 @@ fn run_continues_on_tool_error() {
         ])),
         ..Default::default()
     };
-    let mut a = Agent::new(p).tools(vec![boom]);
+    let mut a = TestAgent::new(p).tools(vec![boom]);
     let out = a.run(&[user("go")]).expect("run");
     assert_eq!(out[2].content, "error: boom");
     assert_eq!(out[3].content, "recovered");
@@ -255,7 +353,7 @@ fn run_unknown_tool() {
         ])),
         ..Default::default()
     };
-    let mut a = Agent::new(p);
+    let mut a = TestAgent::new(p);
     let out = a.run(&[user("go")]).expect("run");
     assert!(out[2].content.contains("unknown tool"));
 }
@@ -273,10 +371,10 @@ fn run_max_turns() {
         responses: RefCell::new(responses),
         ..Default::default()
     };
-    let mut a = Agent::new(p).max_turns(3);
+    let mut a = TestAgent::new(p).max_turns(3);
     let err = a.run(&[user("go")]).unwrap_err();
     match err {
-        Error::MaxTurns(h) => assert_eq!(h.len(), 1 + 3 * 2),
+        TestError::MaxTurns(h) => assert_eq!(h.len(), 1 + 3 * 2),
         e => panic!("want MaxTurns, got {e:?}"),
     }
 }
@@ -351,7 +449,7 @@ fn run_length_stop_does_not_execute_tool_calls() {
         ])),
         ..Default::default()
     };
-    let mut a = Agent::new(p).tools(vec![boom]);
+    let mut a = TestAgent::new(p).tools(vec![boom]);
     let out = a.run(&[user("go")]).expect("run");
     assert!(
         !ran.load(std::sync::atomic::Ordering::Relaxed),
@@ -411,7 +509,7 @@ fn run_parallel_tools_ordered() {
     let t1 = new_tool("t1", "", "{}", |_: Empty| "R1".into());
     let t2 = new_tool("t2", "", "{}", |_: Empty| "R2".into());
     let t3 = new_tool("t3", "", "{}", |_: Empty| "R3".into());
-    let mut a = Agent::new(p).tools(vec![t1, t2, t3]);
+    let mut a = TestAgent::new(p).tools(vec![t1, t2, t3]);
     let out = a.run(&[user("go")]).expect("run");
     assert_eq!(out[2].tool_call_id, "c1");
     assert_eq!(out[2].content, "R1");
@@ -552,7 +650,7 @@ fn run_does_not_retry_after_events_were_emitted() {
     let p = MidStreamFlaky {
         attempts: RefCell::new(0),
     };
-    let mut a = Agent::new(p);
+    let mut a = TestAgent::new(p);
     let err = a.run(&[user("go")]).unwrap_err();
     assert!(err.to_string().contains("flaky mid-stream"), "got: {err}");
     assert_eq!(*a.provider().attempts.borrow(), 1);

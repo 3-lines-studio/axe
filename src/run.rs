@@ -1,5 +1,3 @@
-//! Streaming agent loop shared by the SDK and the TUI.
-//!
 //! The loop is the only logic: messages -> LLM -> tool calls -> results ->
 //! repeat. It never mutates its input; the transcript it builds is
 //! append-only. Compaction and steering live outside this module.
