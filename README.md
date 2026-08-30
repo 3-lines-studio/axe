@@ -35,7 +35,7 @@ Use another OpenAI-compatible endpoint:
 axe --base http://localhost:11434/v1 --model qwen3
 ```
 
-The TUI supports streamed Markdown, tool status, file completion, session resume, rewind, search, compaction, model selection, and login. Run `/help` for its commands.
+The TUI supports streamed Markdown, tool status, file completion, session resume, rewind, search, compaction, and model selection. Run `/help` for its commands.
 
 Axe stores config and project-scoped sessions under `~/.config/axe` or `$XDG_CONFIG_HOME/axe`.
 

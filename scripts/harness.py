@@ -753,37 +753,6 @@ def tui_rewind(h, axe):
         check("second question" not in text, "rewound turn not truncated: %s" % text)
 
 
-@case
-def tui_login_writes_config(h, axe):
-    with h.mock(ANSWER_SCENARIO) as srv:
-        t = h.tui(axe, base=srv.base_url, api_key=None)
-        try:
-            t.expect("Run /help")
-            t.expect("no api key: /login or OPENAI_API_KEY")
-            t.type("/login\r")
-            t.expect("login · api key")
-            t.type("sk-from-login\r")
-            t.expect("login · base url")
-            t.type(srv.base_url + "\r")
-            t.expect("login · model")
-            t.type("login-model\r")
-            t.expect("login saved")
-            t.type("/quit\r")
-            check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
-        finally:
-            t.close()
-        cfg = (h.ax_root() / "config").read_text()
-        check("sk-from-login" in cfg, "config: %s" % cfg)
-        check(srv.base_url in cfg, "config: %s" % cfg)
-        check("login-model" in cfg, "config: %s" % cfg)
-
-
-# --- runner ---------------------------------------------------------------
-
-def usage():
-    print("usage: harness.py [--bin path/to/axe] [--filter name] [--list]")
-    sys.exit(2)
-
 
 def main(argv):
     axe = "target/release/axe"
