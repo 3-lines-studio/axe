@@ -576,7 +576,11 @@ def oneshot_help(h, axe):
     check("Usage: axe" in p.stderr, "stderr: %s" % p.stderr[-500:])
 
 
-
+@case
+def oneshot_version(h, axe):
+    p = h.oneshot(axe, ["--version"])
+    check(p.returncode == 0, "expected exit 0, got %s" % p.returncode)
+    check(p.stdout == "axe 0.1.7\n", "stdout: %s" % p.stdout[-500:])
 
 
 

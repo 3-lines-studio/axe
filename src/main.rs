@@ -27,6 +27,10 @@ struct FileConfig {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.as_slice(), [arg] if arg == "-V" || arg == "--version") {
+        println!("axe {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let fc = load_config();
     let (cfg, prompt) = match parse_args(&args, &fc) {
         Ok(x) => x,
@@ -163,6 +167,7 @@ fn usage() {
         "Usage: axe [flags] [prompt]\n\
          \n\
          Flags:\n\
+         \x20 -V, --version  show the axe version\n\
          \x20 -base URL    OpenAI-compatible API base URL (default \"https://api.openai.com/v1\")\n\
          \x20 -model NAME  model name (default \"gpt-4.1-mini\")\n\
          \x20 -system TEXT  system prompt (default: built-in)\n\
