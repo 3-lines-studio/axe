@@ -108,10 +108,16 @@ fn parse_entry_line(line: &str) -> Option<Entry> {
 }
 
 fn read_entries(path: &Path) -> Vec<Entry> {
-    let Ok(data) = std::fs::read_to_string(path) else {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
-    parse_entries(&data)
+    std::io::BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| parse_entry_line(&line))
+        .collect()
 }
 
 fn parse_entries(data: &str) -> Vec<Entry> {
@@ -137,15 +143,21 @@ fn write_entries(path: &Path, entries: &[Entry]) {
 }
 
 pub fn load_path(path: &Path) -> Result<Vec<Entry>, String> {
-    let data = match std::fs::read_to_string(path) {
-        Ok(data) => data,
+    use std::io::BufRead;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("read session {}: {e}", path.display())),
     };
-    data.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            parse_entry_line(line).ok_or_else(|| format!("invalid session {}", path.display()))
+    std::io::BufReader::new(file)
+        .lines()
+        .filter_map(|line| match line {
+            Ok(line) if line.trim().is_empty() => None,
+            Ok(line) => Some(
+                parse_entry_line(&line)
+                    .ok_or_else(|| format!("invalid session {}", path.display())),
+            ),
+            Err(e) => Some(Err(format!("read session {}: {e}", path.display()))),
         })
         .collect()
 }
