@@ -14,7 +14,7 @@ It has no plugins, external tools, skills, web fetcher, sidecar, or TUI framewor
 ## Build
 
 ```sh
-cargo +nightly build --release --config 'build.rustflags="-C force-unwind-tables=no"'
+cargo +nightly build --release --config 'build.rustflags=["-Cforce-unwind-tables=no","-Cllvm-args=-enable-machine-outliner=always"]'
 ```
 
 Nightly Rust and the `rust-src` component are required. Axe loads system libcurl at runtime.
