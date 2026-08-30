@@ -1598,7 +1598,7 @@ impl Tui {
             match entry {
                 Entry::Welcome => {
                     rows.push(format!(
-                        "{WELCOME_APP}𝒂x{RESET}{DIM} v{VERSION} · Run /help for commands{RESET}"
+                        "{WELCOME_APP}axe{RESET}{DIM} v{VERSION} · Run /help for commands{RESET}"
                     ));
                 }
                 Entry::User(text) => {
