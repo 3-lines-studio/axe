@@ -565,18 +565,18 @@ fn split_retained(entries: &[Entry]) -> (Vec<Message>, Vec<Message>) {
     if retained_start == msgs.len() {
         return split_last_turn(msgs);
     }
-    (
-        msgs[retained_start..].to_vec(),
-        msgs[..retained_start].to_vec(),
-    )
+    let mut summarized = msgs;
+    let retained = summarized.split_off(retained_start);
+    (retained, summarized)
 }
 
-fn split_last_turn(msgs: Vec<Message>) -> (Vec<Message>, Vec<Message>) {
+fn split_last_turn(mut msgs: Vec<Message>) -> (Vec<Message>, Vec<Message>) {
     let start = msgs
         .iter()
         .rposition(|message| message.role == "user")
         .unwrap_or(msgs.len());
-    (msgs[start..].to_vec(), msgs[..start].to_vec())
+    let retained = msgs.split_off(start);
+    (retained, msgs)
 }
 
 fn serialize_conversation(msgs: &[Message]) -> String {
