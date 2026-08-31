@@ -263,6 +263,7 @@ struct Tui {
     md: Option<Markdown>,
     md_pending: Option<PendingBlocks>,
     msgs: Vec<Message>,
+    session_context_len: usize,
     activity: Activity,
     tool_running: Option<String>,
     tool_live: Option<String>,
@@ -324,6 +325,7 @@ impl Tui {
             md: None,
             md_pending: None,
             msgs: Vec::new(),
+            session_context_len: 0,
             activity: Activity::Idle,
             tool_running: None,
             tool_live: None,
@@ -362,11 +364,11 @@ impl Tui {
     }
 
     fn on_exit(&mut self) {
-        let entries = session::load_live(&self.cfg.session_dir);
-        let projected = session::context_messages(&entries).len();
-        let mut entries = entries;
-        for m in &self.msgs[projected.min(self.msgs.len())..] {
-            entries.push(session::Entry::Message { message: m.clone() });
+        let mut entries = session::load_live(&self.cfg.session_dir);
+        for message in &self.msgs[self.session_context_len.min(self.msgs.len())..] {
+            entries.push(session::Entry::Message {
+                message: message.clone(),
+            });
         }
         match self.resume_id.take() {
             Some(id) => {
@@ -798,19 +800,15 @@ impl Tui {
         err: Option<&str>,
         resume_after_compaction: bool,
     ) {
-        let mut entries = session::load_live(&self.cfg.session_dir);
-        let append_start = entries.len();
-        let projected_len = session::context_messages(&entries).len();
-        let new_msgs: Vec<Message> = if messages.len() > projected_len {
-            messages[projected_len..].to_vec()
-        } else {
-            Vec::new()
-        };
-        for m in &new_msgs {
-            entries.push(session::Entry::Message { message: m.clone() });
+        let new_msgs = messages.get(self.session_context_len..).unwrap_or_default();
+        let mut appended = Vec::with_capacity(new_msgs.len() + 1);
+        for message in new_msgs {
+            appended.push(session::Entry::Message {
+                message: message.clone(),
+            });
         }
         if usage.input > 0 || usage.output > 0 {
-            entries.push(session::Entry::Usage {
+            appended.push(session::Entry::Usage {
                 input: usage.input,
                 output: usage.output,
                 cached_input: self.live_cached_in,
@@ -818,22 +816,23 @@ impl Tui {
                 context_output: self.live_out,
             });
         }
-        if let Err(e) = session::append_live(&self.cfg.session_dir, &entries[append_start..]) {
+        if let Err(e) = session::append_live(&self.cfg.session_dir, &appended) {
             self.entries
                 .push(Entry::Notice(format!("error: save session: {e}")));
             return;
         }
+        self.session_context_len += new_msgs.len();
 
         if resume_after_compaction && !self.compacting {
             self.retry_after_compact = true;
-            self.start_compaction(entries);
+            self.start_compaction();
             return;
         }
         let overflow = err.map(session::is_overflow_error).unwrap_or(false);
         if overflow && !self.overflow_retried && !self.compacting {
             self.overflow_retried = true;
             self.retry_after_compact = true;
-            self.start_compaction(entries);
+            self.start_compaction();
             return;
         }
         if overflow || self.compacting {
@@ -844,13 +843,15 @@ impl Tui {
             .context_window
             .map(|window| window.saturating_sub(16384));
         if let Some(threshold) = threshold
-            && session::latest_context_tokens(&entries).is_some_and(|tokens| tokens > threshold)
+            && self.live_in > 0
+            && self.live_in.saturating_add(self.live_out) > threshold
         {
-            self.start_compaction(entries);
+            self.start_compaction();
         }
     }
 
-    fn start_compaction(&mut self, entries: Vec<session::Entry>) {
+    fn start_compaction(&mut self) {
+        let entries = session::load_live(&self.cfg.session_dir);
         self.compacting = true;
         self.entries.push(Entry::Notice("compacting…".into()));
         let provider = OpenAI::new(self.cfg.base.clone(), self.cfg.api_key.clone());
@@ -873,14 +874,14 @@ impl Tui {
         };
         // Append-only: the summary entry joins the existing entries; the
         // context projection drops what it supersedes.
-        let mut entries = session::load_live(&self.cfg.session_dir);
         if let Err(e) = session::append_live(&self.cfg.session_dir, std::slice::from_ref(&entry)) {
             self.entries
                 .push(Entry::Notice(format!("error: save session: {e}")));
             return;
         }
-        entries.push(entry);
+        let entries = session::load_live(&self.cfg.session_dir);
         self.msgs = session::context_messages(&entries);
+        self.session_context_len = self.msgs.len();
         self.live_in = 0;
         self.live_out = 0;
         self.live_cached_in = 0;
@@ -1199,13 +1200,12 @@ impl Tui {
                     self.entries
                         .push(Entry::Notice("already compacting…".into()));
                 } else {
-                    let entries = session::load_live(&self.cfg.session_dir);
-                    if session::context_messages(&entries).len() < 4 {
+                    if self.session_context_len < 4 {
                         self.entries.push(Entry::Notice(format!(
                             "{DIM}session too small to compact{RESET}"
                         )));
                     } else {
-                        self.start_compaction(entries);
+                        self.start_compaction();
                     }
                 }
             }
@@ -1241,6 +1241,7 @@ impl Tui {
         self.transcript_cache_entries = 0;
         self.entries.push(Entry::Welcome);
         self.msgs.clear();
+        self.session_context_len = 0;
         self.pending_tools.clear();
         self.sess_in = 0;
         self.sess_out = 0;
@@ -1367,6 +1368,7 @@ impl Tui {
                 .push(Entry::Notice(format!("error: save session: {e}")));
             return false;
         }
+        self.session_context_len = self.msgs.len();
         true
     }
 
@@ -1502,8 +1504,8 @@ impl Tui {
                     // Flush the session being continued so switching targets
                     // does not drop its transcript.
                     if let Some(prev) = self.resume_id.take() {
-                        let cur = session::load_live(&self.cfg.session_dir);
-                        let _ = session::continue_archived(&self.cfg.session_dir, &prev, &cur);
+                        let entries = session::load_live(&self.cfg.session_dir);
+                        let _ = session::continue_archived(&self.cfg.session_dir, &prev, &entries);
                     }
                     let msgs = session::load_session(&s.path);
                     let title = s.title.clone();
@@ -3186,6 +3188,39 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Entry::Notice(n) if n.contains("too small")))
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_session_appends_only_new_messages() {
+        let dir = std::env::temp_dir().join(format!("axe-persist-tui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        let cfg = TuiConfig {
+            base: "http://127.0.0.1:1/v1".into(),
+            model: "m".into(),
+            system: String::new(),
+            dir: String::new(),
+            axe_root: d.to_string(),
+            session_dir: d.to_string(),
+            api_key: "k".into(),
+            resume: None,
+            context_window: None,
+        };
+        let message = |role: &str, content: &str| Message {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: String::new(),
+        };
+        let mut tui = Tui::new(cfg);
+        let mut messages = vec![message("user", "one"), message("assistant", "first")];
+        tui.persist_session(&messages, Usage::default(), None, false);
+        messages.push(message("user", "two"));
+        messages.push(message("assistant", "second"));
+        tui.persist_session(&messages, Usage::default(), None, false);
+        assert_eq!(session::context_messages(&session::load_live(d)), messages);
+        assert_eq!(tui.session_context_len, 4);
         std::fs::remove_dir_all(&dir).ok();
     }
 
