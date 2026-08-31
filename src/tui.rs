@@ -364,18 +364,21 @@ impl Tui {
     }
 
     fn on_exit(&mut self) {
-        let mut entries = session::load_live(&self.cfg.session_dir);
-        for message in &self.msgs[self.session_context_len.min(self.msgs.len())..] {
-            entries.push(session::Entry::Message {
+        let pending: Vec<session::Entry> = self.msgs
+            [self.session_context_len.min(self.msgs.len())..]
+            .iter()
+            .map(|message| session::Entry::Message {
                 message: message.clone(),
-            });
-        }
+            })
+            .collect();
         match self.resume_id.take() {
             Some(id) => {
+                let mut entries = session::load_live(&self.cfg.session_dir);
+                entries.extend(pending);
                 let _ = session::continue_archived(&self.cfg.session_dir, &id, &entries);
             }
             None => {
-                let _ = session::save_live(&self.cfg.session_dir, &entries);
+                let _ = session::append_live(&self.cfg.session_dir, &pending);
                 session::archive_live(&self.cfg.session_dir);
             }
         }
@@ -3187,6 +3190,54 @@ mod tests {
             tui.entries
                 .iter()
                 .any(|e| matches!(e, Entry::Notice(n) if n.contains("too small")))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exit_appends_pending_messages_before_archive() {
+        let dir = std::env::temp_dir().join(format!("axe-exit-tui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        let cfg = TuiConfig {
+            base: "http://127.0.0.1:1/v1".into(),
+            model: "m".into(),
+            system: String::new(),
+            dir: String::new(),
+            axe_root: d.to_string(),
+            session_dir: d.to_string(),
+            api_key: "k".into(),
+            resume: None,
+            context_window: None,
+        };
+        let first = Message {
+            role: "user".into(),
+            content: "one".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: String::new(),
+        };
+        let second = Message {
+            role: "assistant".into(),
+            content: "two".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: String::new(),
+        };
+        session::save_live(
+            d,
+            &[session::Entry::Message {
+                message: first.clone(),
+            }],
+        )
+        .unwrap();
+        let mut tui = Tui::new(cfg);
+        tui.msgs = vec![first, second];
+        tui.session_context_len = 1;
+        tui.on_exit();
+        let archived = session::list_sessions(d);
+        assert_eq!(archived.len(), 1);
+        assert_eq!(
+            session::context_messages(&session::load_session(&archived[0].path)),
+            tui.msgs
         );
         std::fs::remove_dir_all(&dir).ok();
     }
