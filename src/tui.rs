@@ -240,7 +240,7 @@ pub fn run(cfg: TuiConfig) -> Result<(), String> {
 type PendingBlocks = Rc<RefCell<Vec<(String, Block)>>>;
 
 #[allow(clippy::type_complexity)]
-type CompactResult = Result<(String, usize, Vec<Message>), String>;
+type CompactResult = Result<(String, usize, Vec<Message>, Vec<session::Entry>), String>;
 
 struct Tui {
     cfg: TuiConfig,
@@ -870,12 +870,20 @@ impl Tui {
         let (ctx_tx, ctx_rx) = std::sync::mpsc::channel();
         self.compact_rx = Some(ctx_rx);
         std::thread::spawn(move || {
-            let result = session::compact(&provider, &model, &entries);
+            let result = session::compact(&provider, &model, &entries).map(
+                |(summary, tokens_before, retained)| (summary, tokens_before, retained, entries),
+            );
             let _ = ctx_tx.send(result);
         });
     }
 
-    fn finish_compaction(&mut self, summary: String, tokens_before: usize, retained: Vec<Message>) {
+    fn finish_compaction(
+        &mut self,
+        summary: String,
+        tokens_before: usize,
+        retained: Vec<Message>,
+        mut entries: Vec<session::Entry>,
+    ) {
         self.compacting = false;
         let entry = session::Entry::Compaction {
             summary,
@@ -890,7 +898,7 @@ impl Tui {
                 .push(Entry::Notice(format!("error: save session: {e}")));
             return;
         }
-        let entries = session::load_live(&self.cfg.session_dir);
+        entries.push(entry);
         self.msgs = session::context_messages(&entries);
         self.session_context_len = self.msgs.len();
         self.live_in = 0;
@@ -1151,8 +1159,8 @@ impl Tui {
         self.cur_text = cur;
         if let Some(rx) = self.compact_rx.take() {
             match rx.try_recv() {
-                Ok(Ok((summary, tokens_before, retained))) => {
-                    self.finish_compaction(summary, tokens_before, retained);
+                Ok(Ok((summary, tokens_before, retained, entries))) => {
+                    self.finish_compaction(summary, tokens_before, retained, entries);
                 }
                 Ok(Err(e)) => {
                     self.compacting = false;
