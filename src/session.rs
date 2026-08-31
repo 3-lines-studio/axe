@@ -7,7 +7,7 @@
 
 use crate::{Message, Provider, Request};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -141,7 +141,7 @@ fn workspace_state(entries: &[Entry]) -> String {
     let mut calls = BTreeMap::new();
     let mut read = BTreeSet::new();
     let mut modified = BTreeSet::new();
-    let mut commands = Vec::new();
+    let mut commands = VecDeque::with_capacity(8);
     for entry in entries {
         let Entry::Message { message } = entry else {
             continue;
@@ -176,7 +176,10 @@ fn workspace_state(entries: &[Entry]) -> String {
             } else {
                 compact_observation(&message.content, 300)
             };
-            commands.push(format!(
+            if commands.len() == 8 {
+                commands.pop_front();
+            }
+            commands.push_back(format!(
                 "{} => {result}",
                 command.as_deref().unwrap_or("unknown command")
             ));
@@ -200,15 +203,7 @@ fn workspace_state(entries: &[Entry]) -> String {
     }
     let read = read.into_iter().collect::<Vec<_>>().join(", ");
     let modified = modified.into_iter().collect::<Vec<_>>().join(", ");
-    let commands = commands
-        .into_iter()
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let commands = commands.into_iter().collect::<Vec<_>>().join("\n");
     format!(
         "Files read: {}\nFiles modified: {}\nRecent commands and results:\n{}",
         if read.is_empty() { "none" } else { &read },
