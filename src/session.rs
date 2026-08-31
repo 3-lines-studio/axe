@@ -387,8 +387,17 @@ fn session_summary(path: &Path) -> (String, usize) {
     };
     let mut title = String::new();
     let mut turns = 0;
-    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(entry) = serde_json::from_str::<SummaryLine>(&line) else {
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let Ok(read) = reader.read_until(b'\n', &mut line) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        let Ok(entry) = serde_json::from_slice::<SummaryLine>(&line) else {
             continue;
         };
         match entry.kind.as_deref() {
