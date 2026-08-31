@@ -15,7 +15,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("bins", nargs="+", default=["target/release/axe"])
 parser.add_argument("--runs", type=int, default=30)
 parser.add_argument(
-    "--scenario", choices=("final", "stream", "write", "bash", "sleep", "all"), default="all"
+    "--scenario",
+    choices=("final", "stream", "write", "bash", "sleep", "history", "all"),
+    default="all"
 )
 args = parser.parse_args()
 
@@ -43,7 +45,8 @@ class Handler(BaseHTTPRequestHandler):
         with lock:
             request_bytes.setdefault(run_id, []).append(size)
             connections.setdefault(run_id, set()).add(self.client_address[1])
-        has_tool_result = any(message["role"] == "tool" for message in request["messages"])
+        tool_results = sum(message["role"] == "tool" for message in request["messages"])
+        has_tool_result = tool_results > 0
         user_content = next(
             message.get("content", "")
             for message in reversed(request["messages"])
@@ -61,7 +64,9 @@ class Handler(BaseHTTPRequestHandler):
                     "usage": {"prompt_tokens": 100, "completion_tokens": 1000},
                 }
             )
-        elif has_tool_result or final_only:
+        elif (
+            has_tool_result and user_content != "Build history."
+        ) or user_content == "Build history." and tool_results >= 100 or final_only:
             events = [
                 {"choices": [{"delta": {"content": "done"}, "finish_reason": None}]},
                 {
@@ -70,7 +75,9 @@ class Handler(BaseHTTPRequestHandler):
                 },
             ]
         else:
-            if user_content == "Run true.":
+            if user_content == "Build history.":
+                tool = {"name": "read", "arguments": '{"path":"missing.txt"}'}
+            elif user_content == "Run true.":
                 tool = {"name": "bash", "arguments": '{"command":"true"}'}
             elif user_content == "Run sleep.":
                 tool = {"name": "bash", "arguments": '{"command":"sleep 1"}'}
@@ -124,6 +131,7 @@ def run(binary, index, scenario):
         "write": "Create out.txt containing ok.",
         "bash": "Run true.",
         "sleep": "Run sleep.",
+        "history": "Build history.",
     }
     prompt = prompts[scenario]
     with tempfile.TemporaryDirectory(prefix="axe-bench-") as tmp:

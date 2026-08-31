@@ -51,9 +51,9 @@ impl OpenAI {
     fn build_request(&self, req: &Request, stream: bool) -> Result<BuiltRequest, Error> {
         let mut msgs = Vec::with_capacity(req.messages.len() + 1);
         if !req.system.is_empty() {
-            msgs.push(OaMessage {
-                role: "system".into(),
-                content: Some(req.system.to_string()),
+            msgs.push(OaRequestMessage {
+                role: "system",
+                content: Some(req.system),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -65,41 +65,41 @@ impl OpenAI {
                 Some(
                     m.tool_calls
                         .iter()
-                        .map(|c| OaToolCall {
-                            id: c.id.clone(),
-                            r#type: "function".into(),
-                            function: OaFunction {
-                                name: c.name.clone(),
-                                arguments: c.arguments.clone(),
+                        .map(|c| OaRequestToolCall {
+                            id: &c.id,
+                            r#type: "function",
+                            function: OaRequestFunction {
+                                name: &c.name,
+                                arguments: &c.arguments,
                             },
                         })
                         .collect(),
                 )
             };
-            msgs.push(OaMessage {
-                role: m.role.clone(),
+            msgs.push(OaRequestMessage {
+                role: &m.role,
                 content: if m.content.is_empty() && m.role != "tool" {
                     None
                 } else {
-                    Some(m.content.clone())
+                    Some(&m.content)
                 },
                 tool_calls,
                 tool_call_id: if m.tool_call_id.is_empty() {
                     None
                 } else {
-                    Some(m.tool_call_id.clone())
+                    Some(&m.tool_call_id)
                 },
             });
         }
 
         let mut tools = Vec::new();
         for t in req.tools {
-            tools.push(OaTool {
-                r#type: "function".into(),
-                function: OaToolFunction {
-                    name: t.name.to_string(),
-                    description: t.description.to_string(),
-                    parameters: t.parameters.clone(),
+            tools.push(OaRequestTool {
+                r#type: "function",
+                function: OaRequestToolFunction {
+                    name: t.name,
+                    description: t.description,
+                    parameters: &t.parameters,
                 },
             });
         }
@@ -557,50 +557,70 @@ fn err(e: impl std::fmt::Display) -> Error {
 #[derive(Serialize)]
 struct OaRequest<'a> {
     model: &'a str,
-    messages: Vec<OaMessage>,
+    messages: Vec<OaRequestMessage<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<OaTool>,
+    tools: Vec<OaRequestTool<'a>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
 }
 
-#[derive(Serialize, Deserialize)]
-struct OaMessage {
-    role: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<OaToolCall>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
+#[derive(Serialize)]
+struct OaRequestMessage<'a> {
+    role: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OaRequestToolCall<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
+struct OaRequestToolCall<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    r#type: &'static str,
+    function: OaRequestFunction<'a>,
+}
+
+#[derive(Serialize)]
+struct OaRequestFunction<'a> {
+    name: &'a str,
+    arguments: &'a str,
+}
+
+#[derive(Serialize)]
+struct OaRequestTool<'a> {
+    #[serde(rename = "type")]
+    r#type: &'static str,
+    function: OaRequestToolFunction<'a>,
+}
+
+#[derive(Serialize)]
+struct OaRequestToolFunction<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a Value,
+}
+
+#[derive(Deserialize)]
+struct OaMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OaToolCall>>,
+}
+
+#[derive(Deserialize)]
 struct OaToolCall {
     id: String,
-    #[serde(rename = "type")]
-    r#type: String,
     function: OaFunction,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct OaFunction {
     name: String,
     arguments: String,
-}
-
-#[derive(Serialize)]
-struct OaTool {
-    #[serde(rename = "type")]
-    r#type: String,
-    function: OaToolFunction,
-}
-
-#[derive(Serialize)]
-struct OaToolFunction {
-    name: String,
-    description: String,
-    parameters: Value,
 }
 
 #[derive(Deserialize)]
