@@ -54,11 +54,13 @@ Run live model evals separately:
 OPENAI_API_KEY="..." make eval
 AXE_EVAL_MODEL=gpt-4.1 OPENAI_API_KEY="..." make eval
 python3 scripts/eval.py --bin target/release/axe --runs 3
+python3 scripts/eval.py --agent axe --runs 3
+python3 scripts/eval.py --agent pi --runs 3
 OPENAI_API_KEY="..." make eval-compaction
 AXE_EVAL_MODEL=gpt-4.1-mini AXE_EVAL_COMPACTION_CYCLES=10 OPENAI_API_KEY="..." make eval-compaction
 ```
 
-The compaction eval checks required-fact recall and context size after every compaction cycle. Evals cost money and can vary by model, so `make check` does not run them.
+The agent eval loads the endpoint, model, and API key from `~/.config/axe/config` by default and compares Axe with `pi`. Use `--agent` to run one agent. The compaction eval checks required-fact recall and context size after every compaction cycle. Evals cost money and can vary by model, so `make check` does not run them.
 
 ## Bash
 

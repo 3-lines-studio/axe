@@ -446,6 +446,7 @@ fn system_prompt(tools: &[Tool], dir: &str) -> String {
          - Use edit for precise changes; edits[].oldText must match exactly\n\
          - When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls\n\
          - Keep edits[].oldText small while still unique; do not pad with unchanged regions\n\
+         - After a simple write or edit succeeds, stop unless the user asked you to verify it\n\
          - Tool errors return to you as text; fix them and re-issue\n",
     );
     out.push_str(&format!("\nCurrent working directory: {dir}"));
