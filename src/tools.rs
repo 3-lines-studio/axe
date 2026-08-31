@@ -2,7 +2,6 @@
 
 use crate::{Tool, new_tool, new_tool_with_progress};
 use serde::Deserialize;
-use serde_json::Value;
 use std::os::unix::process::CommandExt;
 
 const MAX_OUTPUT: usize = 16 * 1024;
@@ -49,18 +48,53 @@ struct BashArgs {
 
 static BASH_TAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Process groups of live bash children, so a fatal signal can reap them.
-static CHILD_PGIDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+const CHILD_SLOTS: usize = 32;
+static CHILD_PGIDS: [std::sync::atomic::AtomicI32; CHILD_SLOTS] =
+    [const { std::sync::atomic::AtomicI32::new(0) }; CHILD_SLOTS];
 
-/// Ctrl+C in one-shot mode kills axe but not children in their own process
-/// groups. This handler reaps them, then dies with the default disposition.
-unsafe extern "C" fn sigint_reap_children(_: libc::c_int) {
-    if let Ok(mut v) = CHILD_PGIDS.lock() {
-        for &pgid in v.iter() {
+fn register_pgid(pgid: i32) -> bool {
+    if pgid <= 0 {
+        return false;
+    }
+    for slot in &CHILD_PGIDS {
+        if slot
+            .compare_exchange(
+                0,
+                pgid,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn unregister_pgid(pgid: i32) {
+    for slot in &CHILD_PGIDS {
+        let _ = slot.compare_exchange(
+            pgid,
+            0,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// Kill every live bash process group. Safe from a signal handler.
+pub fn kill_children() {
+    for slot in &CHILD_PGIDS {
+        let pgid = slot.swap(0, std::sync::atomic::Ordering::AcqRel);
+        if pgid > 0 {
             unsafe { libc::kill(-pgid, libc::SIGKILL) };
         }
-        v.clear();
     }
+}
+
+unsafe extern "C" fn sigint_reap_children(_: libc::c_int) {
+    kill_children();
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_DFL);
         libc::raise(libc::SIGINT);
@@ -81,9 +115,7 @@ struct PgidGuard(i32);
 
 impl Drop for PgidGuard {
     fn drop(&mut self) {
-        if let Ok(mut v) = CHILD_PGIDS.lock() {
-            v.retain(|&p| p != self.0);
-        }
+        unregister_pgid(self.0);
     }
 }
 
@@ -92,7 +124,7 @@ pub fn bash(dir: &str) -> Tool {
     let mut t = new_tool_with_progress(
         "bash",
         "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 16KB. Optionally provide a timeout in seconds.",
-        r#"{"type":"object","properties":{"command":{"type":"string","description":"bash command to run"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"}},"required":["command"]}"#,
+        r#"{"type":"object","properties":{"command":{"type":"string","description":"bash command to run"},"timeout":{"type":"integer","description":"Timeout in seconds (optional, no default timeout)"}},"required":["command"]}"#,
         move |a: BashArgs, progress: &mut dyn FnMut(&str)| {
             if a.timeout == Some(0) {
                 return "error: invalid timeout: must be a positive number of seconds".to_string();
@@ -133,13 +165,13 @@ pub fn bash(dir: &str) -> Tool {
             };
             // Registered so sigint_reap_children can kill the group if axe
             // dies first; dropped (unregistered) when the child is reaped.
-            let _guard = {
-                let pgid = child.id() as i32;
-                if let Ok(mut v) = CHILD_PGIDS.lock() {
-                    v.push(pgid);
-                }
-                PgidGuard(pgid)
-            };
+            let pgid = child.id() as i32;
+            if !register_pgid(pgid) {
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                let _ = child.wait();
+                return "error: too many live bash processes".to_string();
+            }
+            let _guard = PgidGuard(pgid);
             let mut exit: Option<std::process::ExitStatus> = None;
             let mut timed_out = false;
             let deadline = a
@@ -324,7 +356,43 @@ mod tests {
     }
 
     #[test]
+    fn read_accepts_float_offset() {
+        let dir = std::env::temp_dir().join(format!("axe-read-float-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        let read = crate::tools::read();
+        let args = format!(
+            r#"{{"path":"{}","offset":2.0,"limit":1.0}}"#,
+            path.display()
+        );
+        let out = (read.run)(&args, &mut |_| {});
+        assert!(out.starts_with("b"), "got: {out}");
+        assert!(!out.contains("invalid arguments"), "got: {out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kill_children_reaps_spawned_group() {
+        use std::os::unix::process::CommandExt;
+        let _lock = BASH_TEST.lock().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as i32;
+        assert!(super::register_pgid(pgid));
+        crate::tools::kill_children();
+        let st = child.wait().unwrap();
+        assert!(!st.success());
+    }
+
+    static BASH_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
     fn bash_truncation_notice() {
+        let _lock = BASH_TEST.lock().unwrap();
         let bash = crate::tools::bash("");
         let args = serde_json::json!({"command": "yes | head -c 20000"}).to_string();
         let out = (bash.run)(&args, &mut |_| {});
@@ -368,7 +436,7 @@ pub fn read() -> Tool {
     let mut t = new_tool(
         "read",
         "Read the contents of a file. Output is truncated to 16KB. Use offset/limit for large files. When you need the full file, continue with the suggested offset.",
-        r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"number","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"number","description":"Maximum number of lines to read"}},"required":["path"]}"#,
+        r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"integer","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"integer","description":"Maximum number of lines to read"}},"required":["path"]}"#,
         |a: ReadArgs| {
             use std::io::BufRead;
             let file = match std::fs::File::open(&a.path) {
@@ -687,17 +755,11 @@ fn diff_lines(old: &str, new: &str) -> String {
 }
 
 pub fn edit() -> Tool {
-    Tool {
-        name: "edit",
-        description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
-        parameters: serde_json::from_str(EDIT_SCHEMA).unwrap_or(Value::Null),
-        snippet: "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
-        sequential: true,
-        run: Box::new(|raw, _progress| {
-            let a: EditArgs = match serde_json::from_str(raw) {
-                Ok(args) => args,
-                Err(e) => return format!("error: invalid arguments: {e}"),
-            };
+    let mut t = new_tool(
+        "edit",
+        "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
+        EDIT_SCHEMA,
+        |a: EditArgs| {
             if a.edits.is_empty() {
                 return "error: edits must contain at least one replacement".into();
             }
@@ -722,6 +784,9 @@ pub fn edit() -> Tool {
                     Err(e) => e,
                 },
             }
-        }),
-    }
+        },
+    );
+    t.sequential = true;
+    t.snippet = "Make precise file edits with exact text replacement, including multiple disjoint edits in one call";
+    t
 }

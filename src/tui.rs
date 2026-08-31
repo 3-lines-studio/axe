@@ -213,14 +213,13 @@ const SLASH: &[SlashSpec] = &[
 pub fn run(cfg: TuiConfig) -> Result<(), String> {
     let mut term = Terminal::new()?;
     let mut tui = Tui::new(cfg);
+    session::archive_live(&tui.cfg.session_dir);
     if let Some(id) = tui.cfg.resume.clone() {
         if id.is_empty() {
             tui.open_screen(Screen::Resume);
         } else {
             tui.resume_by_id(&id);
         }
-    } else {
-        session::archive_live(&tui.cfg.session_dir);
     }
     if tui.entries.is_empty() {
         tui.entries.push(Entry::Welcome);
@@ -363,10 +362,10 @@ impl Tui {
         }
         match self.resume_id.take() {
             Some(id) => {
-                session::continue_archived(&self.cfg.session_dir, &id, &entries);
+                let _ = session::continue_archived(&self.cfg.session_dir, &id, &entries);
             }
             None => {
-                session::save_live(&self.cfg.session_dir, &entries);
+                let _ = session::save_live(&self.cfg.session_dir, &entries);
                 session::archive_live(&self.cfg.session_dir);
             }
         }
@@ -669,6 +668,7 @@ impl Tui {
         if within {
             if self.running {
                 self.cancel.store(true, Ordering::Relaxed);
+                crate::tools::kill_children();
             }
             self.want_quit = true;
         } else {
@@ -676,6 +676,7 @@ impl Tui {
             self.ctrl_c_pending = true;
             if self.running {
                 self.cancel.store(true, Ordering::Relaxed);
+                crate::tools::kill_children();
             }
             if !self.input.buf.is_empty() {
                 self.input.buf.clear();
@@ -794,7 +795,11 @@ impl Tui {
                 context_output: self.live_out,
             });
         }
-        session::save_live(&self.cfg.session_dir, &entries);
+        if let Err(e) = session::save_live(&self.cfg.session_dir, &entries) {
+            self.entries
+                .push(Entry::Notice(format!("error: save session: {e}")));
+            return;
+        }
 
         if resume_after_compaction && !self.compacting {
             self.retry_after_compact = true;
@@ -847,7 +852,11 @@ impl Tui {
         // context projection drops what it supersedes.
         let mut entries = session::load_live(&self.cfg.session_dir);
         entries.push(entry);
-        session::save_live(&self.cfg.session_dir, &entries);
+        if let Err(e) = session::save_live(&self.cfg.session_dir, &entries) {
+            self.entries
+                .push(Entry::Notice(format!("error: save session: {e}")));
+            return;
+        }
         self.msgs = session::context_messages(&entries);
         self.live_in = 0;
         self.live_out = 0;
@@ -1167,16 +1176,15 @@ impl Tui {
             let entries = session::load_live(&self.cfg.session_dir);
             match self.resume_id.take() {
                 Some(id) => {
-                    session::continue_archived(&self.cfg.session_dir, &id, &entries);
+                    let _ = session::continue_archived(&self.cfg.session_dir, &id, &entries);
                 }
                 None => {
                     session::archive_live(&self.cfg.session_dir);
                 }
             }
         } else {
-            // /reset discards in-memory changes; the origin archive keeps
-            // its state from load time.
             self.resume_id = None;
+            session::discard_live(&self.cfg.session_dir);
         }
         self.entries.clear();
         self.entries.push(Entry::Welcome);
@@ -1229,8 +1237,10 @@ impl Tui {
         };
         match loaded {
             Some((id, msgs)) => {
-                self.resume_id = Some(id);
-                self.load_messages(msgs);
+                if self.load_messages(msgs) {
+                    self.resume_id = Some(id.clone());
+                    session::set_resume_id(&dir, &id);
+                }
             }
             None => {
                 self.entries
@@ -1239,7 +1249,7 @@ impl Tui {
         }
     }
 
-    fn load_messages(&mut self, entries: Vec<session::Entry>) {
+    fn load_messages(&mut self, entries: Vec<session::Entry>) -> bool {
         self.msgs = session::context_messages(&entries);
         self.sess_in = 0;
         self.sess_out = 0;
@@ -1298,7 +1308,12 @@ impl Tui {
         self.streamed.clear();
         self.overflow_retried = false;
         self.reprint = true;
-        session::save_live(&self.cfg.session_dir, &entries);
+        if let Err(e) = session::save_live(&self.cfg.session_dir, &entries) {
+            self.entries
+                .push(Entry::Notice(format!("error: save session: {e}")));
+            return false;
+        }
+        true
     }
 
     fn open_screen(&mut self, screen: Screen) {
@@ -1434,15 +1449,17 @@ impl Tui {
                     // does not drop its transcript.
                     if let Some(prev) = self.resume_id.take() {
                         let cur = session::load_live(&self.cfg.session_dir);
-                        session::continue_archived(&self.cfg.session_dir, &prev, &cur);
+                        let _ = session::continue_archived(&self.cfg.session_dir, &prev, &cur);
                     }
                     let msgs = session::load_session(&s.path);
                     let title = s.title.clone();
                     self.close_screen();
-                    self.resume_id = Some(s.id);
-                    self.load_messages(msgs);
-                    self.entries
-                        .push(Entry::Notice(format!("{DIM}resumed: {title}{RESET}")));
+                    if self.load_messages(msgs) {
+                        self.resume_id = Some(s.id.clone());
+                        session::set_resume_id(&self.cfg.session_dir, &s.id);
+                        self.entries
+                            .push(Entry::Notice(format!("{DIM}resumed: {title}{RESET}")));
+                    }
                 }
             }
             Screen::Rewind => {
@@ -3105,6 +3122,44 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Entry::Notice(n) if n.contains("too small")))
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reset_discards_live_transcript() {
+        let dir = std::env::temp_dir().join(format!("axe-reset-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        session::save_live(
+            d,
+            &[session::Entry::Message {
+                message: Message {
+                    role: "user".into(),
+                    content: "old".into(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: String::new(),
+                },
+            }],
+        )
+        .unwrap();
+        session::set_resume_id(d, "abc");
+        let cfg = TuiConfig {
+            base: "http://127.0.0.1:1/v1".into(),
+            model: "m".into(),
+            system: String::new(),
+            dir: String::new(),
+            axe_root: d.to_string(),
+            session_dir: d.to_string(),
+            api_key: "k".into(),
+            resume: None,
+            context_window: None,
+        };
+        let mut tui = Tui::new(cfg);
+        tui.resume_id = Some("abc".into());
+        tui.slash("reset");
+        assert!(tui.resume_id.is_none());
+        assert!(session::load_live(d).is_empty());
+        assert!(session::load_resume_id(d).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

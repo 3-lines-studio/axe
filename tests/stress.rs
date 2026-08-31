@@ -244,7 +244,7 @@ fn fuzz_session(_rng: &mut Rng, seed: u64, input: &[u8]) {
     });
     guard("session save roundtrip", seed, || {
         let msgs = axe::session::load_live(dir.to_str().unwrap());
-        axe::session::save_live(dir.to_str().unwrap(), &msgs);
+        let _ = axe::session::save_live(dir.to_str().unwrap(), &msgs);
         let again = axe::session::load_live(dir.to_str().unwrap());
         assert_eq!(msgs, again);
     });
@@ -494,7 +494,7 @@ fn session_large_roundtrip() {
             message: message.clone(),
         })
         .collect();
-    axe::session::save_live(d, &entries);
+    axe::session::save_live(d, &entries).unwrap();
     let loaded = axe::session::load_live(d);
     assert_eq!(loaded.len(), n);
     assert_eq!(loaded, entries);
@@ -776,7 +776,7 @@ fn session_compaction_roundtrip() {
         context_input: 100,
         context_output: 8,
     };
-    axe::session::save_live(d, &[entry, usage]);
+    axe::session::save_live(d, &[entry, usage]).unwrap();
     let entries = axe::session::load_live(d);
     assert!(matches!(
         entries[1],
@@ -817,7 +817,7 @@ fn session_compaction_is_append_only() {
             message: msg("assistant", "noted"),
         },
     ];
-    axe::session::save_live(d, &entries);
+    axe::session::save_live(d, &entries).unwrap();
 
     // Compaction appends; nothing is rewritten or dropped from disk.
     entries.push(axe::session::Entry::Compaction {
@@ -829,7 +829,7 @@ fn session_compaction_is_append_only() {
     entries.push(axe::session::Entry::Message {
         message: msg("user", "new question"),
     });
-    axe::session::save_live(d, &entries);
+    axe::session::save_live(d, &entries).unwrap();
     assert_eq!(axe::session::load_live(d).len(), 4, "history stays on disk");
 
     // The projection supersedes everything before the summary.

@@ -40,9 +40,9 @@ Set `PREFIX` to install elsewhere.
 
 ## Project rules
 
-- Release binary stays under 1 MB (currently ~920 KB).
+- Release binary stays under 1 MB (currently ~435 KB).
 - Dependencies are exactly `serde`, `serde_json`, `libc`. No new deps
   without asking. No compile-time curl.
-- Extensibility is files-over-code: skills, user commands, SYSTEM.md. No
-  plugin system, no MCP, no permissions layer.
-- Config lives at `~/.config/axe/`; skills at `~/.agents/skills/`.
+- Extra instructions live in `~/.config/axe/SYSTEM.md`. No plugin system,
+  no MCP, no permissions layer.
+- Config and project-scoped sessions live under `~/.config/axe/`.

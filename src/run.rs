@@ -32,10 +32,19 @@ fn backoff(attempt: usize) -> u64 {
     base - now % (base / 4 + 1)
 }
 
+fn cancelled(cancel: &Arc<AtomicBool>) -> bool {
+    if cancel.load(Ordering::Relaxed) {
+        crate::tools::kill_children();
+        true
+    } else {
+        false
+    }
+}
+
 fn sleep_with_cancel(ms: u64, cancel: &Arc<AtomicBool>) -> Result<(), Error> {
     let deadline = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < deadline {
-        if cancel.load(Ordering::Relaxed) {
+        if cancelled(cancel) {
             return Err(Error::Provider("interrupted".into()));
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -92,7 +101,7 @@ pub fn run_stream<P: Provider>(
     let mut h = msgs.to_vec();
     let mut usage = Usage::default();
     for turn in 0..opts.max_turns {
-        if cancel.load(Ordering::Relaxed) {
+        if cancelled(cancel) {
             return RunEnd {
                 messages: h,
                 usage,
@@ -105,7 +114,7 @@ pub fn run_stream<P: Provider>(
         let (resp, calls) = match stream(provider, opts, &h, cancel, sink) {
             Ok(x) => x,
             Err(e) => {
-                if cancel.load(Ordering::Relaxed) {
+                if cancelled(cancel) {
                     return RunEnd {
                         messages: h,
                         usage,
@@ -197,7 +206,7 @@ fn run_tool_batch(
     if truncated || any_sequential || calls.len() <= 1 {
         let mut interrupted = false;
         for call in calls {
-            interrupted |= cancel.load(Ordering::Relaxed);
+            interrupted |= cancelled(cancel);
             sink.tool_start(&call);
             let output = if interrupted {
                 // Synthesize a result for every un-executed call so the
@@ -213,7 +222,7 @@ fn run_tool_batch(
             push_tool_result(h, call, output);
             sink.tool(turn, h.last().unwrap());
         }
-        !cancel.load(Ordering::Relaxed)
+        !cancelled(cancel)
     } else {
         run_parallel(tools, calls, turn, cancel, sink, h)
     }
@@ -251,8 +260,7 @@ fn run_parallel(
             let ptx = ptx.clone();
             let cancel = cancel.clone();
             scope.spawn(move || {
-                let output = if cancel.load(Ordering::Relaxed) {
-                    // Synthesize a result so the transcript stays valid.
+                let output = if cancelled(&cancel) {
                     "error: tool call not executed: the run was interrupted.".to_string()
                 } else {
                     run_tool(tools, call, &mut |text| {
@@ -285,7 +293,7 @@ fn run_parallel(
         push_tool_result(h, call.clone(), content);
         sink.tool(turn, h.last().unwrap());
     }
-    !cancel.load(Ordering::Relaxed)
+    !cancelled(cancel)
 }
 
 fn run_tool(tools: &[Tool], call: &ToolCall, progress: &mut dyn FnMut(&str)) -> String {

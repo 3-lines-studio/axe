@@ -637,6 +637,61 @@ def tui_ctrl_c_quit(h, axe):
 
 
 @case
+def oneshot_resume_last(h, axe):
+    h.seed_session("111", "old", "prior work")
+    with h.mock(ANSWER_SCENARIO) as srv:
+        p = h.oneshot(axe, ["--resume", "last", "continue it"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+        check("Done" in p.stdout, "stdout: %s" % p.stdout[-500:])
+        users = body_msg(srv, 0, "user")
+        check(any("prior work" in m.get("content", "") for m in users), "history not sent: %s" % users)
+        check(users[-1]["content"] == "continue it", "prompt not appended: %s" % users)
+        sessions = list((h.session_root() / "sessions").glob("*.jsonl"))
+        check(len(sessions) == 1, "expected 1 session, got %d" % len(sessions))
+        text = sessions[0].read_text()
+        check("continue it" in text, "resumed prompt not saved: %s" % text)
+        check(not (h.session_root() / "session.jsonl").exists(), "live leftover")
+
+
+@case
+def oneshot_bare_resume_errors(h, axe):
+    p = h.oneshot(axe, ["-r", "hello"])
+    check(p.returncode == 2, "expected exit 2, got %s" % p.returncode)
+    check("needs last or a session id" in p.stderr, "stderr: %s" % p.stderr[-500:])
+
+
+@case
+def oneshot_resume_persists_on_failure(h, axe):
+    h.seed_session("111", "old", "prior work")
+    p = h.oneshot(axe, ["--resume", "111", "keep this"], base="http://127.0.0.1:1")
+    check(p.returncode == 1, "expected exit 1, got %s" % p.returncode)
+    text = (h.session_root() / "sessions" / "111.jsonl").read_text()
+    check("keep this" in text, "failed resume not saved: %s" % text)
+    check("prior work" in text, "history dropped: %s" % text)
+    check(not (h.session_root() / "session.jsonl").exists(), "live leftover")
+
+
+@case
+def oneshot_resume_last_flushes_live(h, axe):
+    h.seed_session("111", "old", "prior work")
+    root = h.session_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "session.jsonl").write_text(
+        json.dumps({"type": "message", "message": {"Role": "user", "Content": "live extra"}}) + "\n"
+    )
+    (root / "session.resume_id").write_text("111")
+    with h.mock(ANSWER_SCENARIO) as srv:
+        p = h.oneshot(axe, ["--resume", "last", "continue it"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+        users = body_msg(srv, 0, "user")
+        check(any("live extra" in m.get("content", "") for m in users), "live not flushed: %s" % users)
+        check(users[-1]["content"] == "continue it", "prompt not appended: %s" % users)
+        text = (root / "sessions" / "111.jsonl").read_text()
+        check("live extra" in text and "continue it" in text, "archive missing live: %s" % text)
+        check(not (root / "session.jsonl").exists(), "live leftover")
+
+
+@case
 def tui_resume_last(h, axe):
     with h.mock(TOOL_SCENARIO) as srv:
         t = h.tui(axe, base=srv.base_url)

@@ -27,6 +27,7 @@ axe
 axe -C /path/to/project
 axe "fix the failing tests"
 axe --resume last
+axe --resume last "continue from there"
 ```
 
 Use another OpenAI-compatible endpoint:
@@ -35,9 +36,9 @@ Use another OpenAI-compatible endpoint:
 axe --base http://localhost:11434/v1 --model qwen3
 ```
 
-The TUI supports streamed Markdown, tool status, file completion, session resume, rewind, and compaction. Run `/help` for its commands.
+The TUI supports streamed Markdown, tool status, file completion, session resume, rewind, and compaction. Run `/help` for its commands. One-shot mode resumes a named session with `--resume last` or `--resume ID` and continues after compaction when `context_window` is set.
 
-Axe stores config and project-scoped sessions under `~/.config/axe` or `$XDG_CONFIG_HOME/axe`.
+Axe stores config and project-scoped sessions under `~/.config/axe` or `$XDG_CONFIG_HOME/axe`. Extra system instructions go in `SYSTEM.md` there.
 
 ## Test
 

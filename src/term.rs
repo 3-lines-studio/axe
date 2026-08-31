@@ -358,19 +358,18 @@ fn utf8_len(first: u8) -> usize {
     }
 }
 
-/// Original termios saved while the terminal is in raw mode, so fatal
-/// signals can restore it before dying.
-static ORIGINAL_TERMIOS: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
+static mut ORIGINAL_TERMIOS: libc::termios = unsafe { std::mem::zeroed() };
+static ORIGINAL_TERMIOS_SET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-/// Handler for signals that kill the process: put the terminal back in a
-/// usable state (termios, cursor, screen), then die with the default
-/// disposition. Only async-signal-safe calls are used.
 unsafe extern "C" fn fatal_restore(sig: libc::c_int) {
-    if let Ok(g) = ORIGINAL_TERMIOS.lock()
-        && let Some(t) = &*g
-    {
+    if ORIGINAL_TERMIOS_SET.load(std::sync::atomic::Ordering::Relaxed) {
         unsafe {
-            libc::tcsetattr(libc::STDOUT_FILENO, libc::TCSANOW, t);
+            libc::tcsetattr(
+                libc::STDOUT_FILENO,
+                libc::TCSANOW,
+                &raw const ORIGINAL_TERMIOS,
+            );
         }
     }
     const RESET: &[u8] = b"\x1b[?25h\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1049l\n";
@@ -382,9 +381,10 @@ unsafe extern "C" fn fatal_restore(sig: libc::c_int) {
 }
 
 fn install_fatal_handlers(original: &libc::termios) {
-    if let Ok(mut g) = ORIGINAL_TERMIOS.lock() {
-        *g = Some(*original);
+    unsafe {
+        ORIGINAL_TERMIOS = *original;
     }
+    ORIGINAL_TERMIOS_SET.store(true, std::sync::atomic::Ordering::Relaxed);
     for sig in [
         libc::SIGABRT,
         libc::SIGBUS,

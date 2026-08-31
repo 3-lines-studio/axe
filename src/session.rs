@@ -228,8 +228,8 @@ fn valid_id(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && !id.contains('/') && !id.contains('\\')
 }
 
-fn write_entries(path: &Path, entries: &[Entry]) {
-    let _ = crate::atomic_write_with(path, |file| {
+fn write_entries(path: &Path, entries: &[Entry]) -> std::io::Result<()> {
+    crate::atomic_write_with(path, |file| {
         use std::io::Write;
         let mut out = std::io::BufWriter::new(file);
         for entry in entries {
@@ -237,25 +237,55 @@ fn write_entries(path: &Path, entries: &[Entry]) {
             out.write_all(b"\n")?;
         }
         out.flush()
-    });
+    })
 }
 
-pub fn save_live(dir: &str, entries: &[Entry]) {
+pub fn save_live(dir: &str, entries: &[Entry]) -> std::io::Result<()> {
     if entries.is_empty() {
+        return Ok(());
+    }
+    write_entries(&live_path(dir), entries)
+}
+
+fn resume_id_path(dir: &str) -> PathBuf {
+    Path::new(dir).join("session.resume_id")
+}
+
+pub fn set_resume_id(dir: &str, id: &str) {
+    if !valid_id(id) {
         return;
     }
-    write_entries(&live_path(dir), entries);
+    let _ = crate::atomic_write(&resume_id_path(dir), id.as_bytes());
+}
+
+pub fn clear_resume_id(dir: &str) {
+    let _ = std::fs::remove_file(resume_id_path(dir));
+}
+
+pub fn discard_live(dir: &str) {
+    let _ = std::fs::remove_file(live_path(dir));
+    let _ = std::fs::remove_file(Path::new(dir).join("session.title"));
+    clear_resume_id(dir);
+}
+
+pub fn load_resume_id(dir: &str) -> Option<String> {
+    let id = std::fs::read_to_string(resume_id_path(dir)).ok()?;
+    let id = id.trim();
+    if valid_id(id) {
+        Some(id.to_string())
+    } else {
+        None
+    }
 }
 
 /// Write a continued session back into its original archive instead of
-/// forking a new one. A live title written by `/rename` during the resumed
-/// session replaces the archived title. Clears the live transcript either
-/// way so the next launch does not re-archive it as a duplicate.
-pub fn continue_archived(dir: &str, id: &str, entries: &[Entry]) -> bool {
+/// forking a new one. Clears the live transcript so the next launch does
+/// not re-archive it as a duplicate.
+pub fn continue_archived(dir: &str, id: &str, entries: &[Entry]) -> std::io::Result<bool> {
     if !valid_id(id) || entries.is_empty() {
-        return false;
+        return Ok(false);
     }
-    write_entries(&store_dir(dir).join(format!("{id}.jsonl")), entries);
+    write_entries(&store_dir(dir).join(format!("{id}.jsonl")), entries)?;
     let live_title = Path::new(dir).join("session.title");
     if let Ok(t) = std::fs::read_to_string(&live_title) {
         let t = t.trim();
@@ -265,7 +295,8 @@ pub fn continue_archived(dir: &str, id: &str, entries: &[Entry]) -> bool {
     }
     let _ = std::fs::remove_file(&live_title);
     let _ = std::fs::remove_file(live_path(dir));
-    true
+    clear_resume_id(dir);
+    Ok(true)
 }
 
 pub fn load_live(dir: &str) -> Vec<Entry> {
@@ -369,8 +400,16 @@ pub fn load_session(path: &Path) -> Vec<Entry> {
 }
 
 pub fn archive_live(dir: &str) -> Option<String> {
-    if read_entries(&live_path(dir)).is_empty() {
+    let entries = read_entries(&live_path(dir));
+    if entries.is_empty() {
         return None;
+    }
+    if let Some(id) = load_resume_id(dir) {
+        match continue_archived(dir, &id, &entries) {
+            Ok(true) => return Some(id),
+            Ok(false) => {}
+            Err(_) => return None,
+        }
     }
     let store = store_dir(dir);
     let _ = std::fs::create_dir_all(&store);
@@ -395,6 +434,7 @@ pub fn archive_live(dir: &str) -> Option<String> {
     let _ = crate::atomic_write(&title_path(dir, &id), title.as_bytes());
     let _ = std::fs::remove_file(live_title_path);
     let _ = std::fs::remove_file(live_path(dir));
+    clear_resume_id(dir);
     Some(id)
 }
 
@@ -858,5 +898,63 @@ mod tests {
         let serialized = serialize_conversation(&[call, result]);
         assert!(serialized.contains("bytes masked"));
         assert!(serialized.len() < 2000);
+    }
+
+    #[test]
+    fn archive_live_continues_resumed_session() {
+        let dir = std::env::temp_dir().join(format!("axe-resume-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        save_live(
+            d,
+            &[Entry::Message {
+                message: message("user", "first"),
+            }],
+        )
+        .unwrap();
+        let id = archive_live(d).expect("archive");
+        let loaded = load_by_id(d, &id).unwrap();
+        save_live(
+            d,
+            &[
+                loaded[0].clone(),
+                Entry::Message {
+                    message: message("user", "second"),
+                },
+            ],
+        )
+        .unwrap();
+        set_resume_id(d, &id);
+        let again = archive_live(d).expect("continue");
+        assert_eq!(again, id);
+        assert_eq!(list_sessions(d).len(), 1);
+        let msgs = context_messages(&load_by_id(d, &id).unwrap());
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1].content, "second");
+        assert!(!live_path(d).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discard_live_drops_transcript_and_resume_id() {
+        let dir = std::env::temp_dir().join(format!("axe-discard-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        save_live(
+            d,
+            &[Entry::Message {
+                message: message("user", "keep me not"),
+            }],
+        )
+        .unwrap();
+        set_resume_id(d, "abc");
+        std::fs::write(Path::new(d).join("session.title"), "t").unwrap();
+        discard_live(d);
+        assert!(!live_path(d).exists());
+        assert!(!resume_id_path(d).exists());
+        assert!(!Path::new(d).join("session.title").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

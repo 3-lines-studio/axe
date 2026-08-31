@@ -424,6 +424,10 @@ fn new_tool_coerces_argument_types() {
         (tool.run)(r#"{"n":null,"b":0,"s":"x","o":null}"#, &mut |_| {}),
         "0 false x None"
     );
+    assert_eq!(
+        (tool.run)(r#"{"n":7.9,"b":1,"s":"x"}"#, &mut |_| {}),
+        "7 true x None"
+    );
 }
 
 #[test]
@@ -678,6 +682,57 @@ fn repeated_compaction_keeps_a_bounded_continuation_context() {
         );
         assert!(context.len() <= 3);
     }
+}
+
+#[test]
+fn run_compact_outcome_leaves_transcript() {
+    struct CompactSink;
+    impl axe::run::Sink for CompactSink {
+        fn should_compact(&mut self, _input: usize, _output: usize) -> bool {
+            true
+        }
+    }
+    let p = Fake {
+        responses: RefCell::new(VecDeque::from([
+            Response {
+                message: call_tool("c1", "echo", "{}"),
+                usage: Usage {
+                    input: 20,
+                    output: 2,
+                    cached_input: 0,
+                },
+                stop_reason: String::new(),
+            },
+            Response {
+                message: assistant("should not run"),
+                usage: Usage::default(),
+                stop_reason: String::new(),
+            },
+        ])),
+        ..Default::default()
+    };
+    let echo = new_tool("echo", "echoes", "{}", |_: Empty| "ok".to_string());
+    let opts = axe::run::RunOptions {
+        model: "m",
+        system: "",
+        tools: &[echo],
+        max_turns: 8,
+    };
+    let mut sink = CompactSink;
+    let end = axe::run::run_stream(
+        &p,
+        &opts,
+        &[user("go")],
+        &Arc::new(AtomicBool::new(false)),
+        &mut sink,
+    );
+    assert!(
+        matches!(end.outcome, axe::run::Outcome::Compact),
+        "{:?}",
+        end.outcome
+    );
+    assert_eq!(end.messages.last().unwrap().role, "tool");
+    assert_eq!(p.requests.borrow().len(), 1);
 }
 
 struct MidStreamFlaky {

@@ -269,13 +269,18 @@ fn coerce_value(value: &mut Value, schema: &Value) {
     let ty = schema.get("type").and_then(|t| t.as_str());
     match ty {
         Some("number") | Some("integer") => {
-            if let Value::String(s) = value {
+            if ty == Some("integer")
+                && let Some(n) = value.as_f64()
+                && n.is_finite()
+                && n >= i64::MIN as f64
+                && n <= i64::MAX as f64
+            {
+                *value = Value::Number(serde_json::Number::from(n as i64));
+            } else if let Value::String(s) = value {
                 if let Ok(n) = s.trim().parse::<f64>()
                     && n.is_finite()
                 {
                     if ty == Some("integer") && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
-                        // Fractional values are truncated: models send "3.5"
-                        // for an integer field more often than they mean it.
                         *value = Value::Number(serde_json::Number::from(n as i64));
                     } else if ty == Some("number")
                         && let Some(num) = serde_json::Number::from_f64(n)
@@ -427,6 +432,18 @@ mod tests {
         assert_eq!(v, Value::Number(serde_json::Number::from(3)));
 
         let mut v = Value::String("7".into());
+        coerce_value(&mut v, &schema);
+        assert_eq!(v, Value::Number(serde_json::Number::from(7)));
+    }
+
+    #[test]
+    fn coerce_integer_accepts_json_floats() {
+        let schema: Value = serde_json::from_str(r#"{"type":"integer"}"#).unwrap();
+        let mut v: Value = serde_json::from_str("430.0").unwrap();
+        coerce_value(&mut v, &schema);
+        assert_eq!(v, Value::Number(serde_json::Number::from(430)));
+
+        let mut v: Value = serde_json::from_str("7.9").unwrap();
         coerce_value(&mut v, &schema);
         assert_eq!(v, Value::Number(serde_json::Number::from(7)));
     }

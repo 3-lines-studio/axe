@@ -75,6 +75,10 @@ fn main() {
         }
         prompt = vec![b];
     }
+    if cfg.resume.as_deref() == Some("") {
+        eprintln!("error: --resume needs last or a session id in one-shot mode");
+        std::process::exit(2);
+    }
     one_shot(&cfg, &fc, &prompt);
 }
 
@@ -208,14 +212,67 @@ impl Sink for CliSink {
     }
 }
 
+fn persist_oneshot(
+    dir: &str,
+    resume_id: Option<&str>,
+    entries: &[axe::session::Entry],
+) -> std::io::Result<()> {
+    let Some(id) = resume_id else {
+        return Ok(());
+    };
+    axe::session::continue_archived(dir, id, entries).map(|_| ())
+}
+
+fn fail_oneshot(
+    dir: &str,
+    resume_id: Option<&str>,
+    entries: &[axe::session::Entry],
+    msg: String,
+) -> ! {
+    eprintln!("{msg}");
+    if let Err(e) = persist_oneshot(dir, resume_id, entries) {
+        eprintln!("error: save session: {e}");
+    }
+    std::process::exit(1);
+}
+
 fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     let start = Instant::now();
-    let history = vec![Message {
+    let session_dir = axe::session::scope_dir(&axe_root(), std::path::Path::new(&work_dir(cfg)));
+    let mut resume_id = None;
+    let mut history = Vec::new();
+    let mut session_entries = Vec::new();
+    if let Some(id) = &cfg.resume {
+        axe::session::archive_live(&session_dir);
+        let loaded = if id == "last" {
+            axe::session::list_sessions(&session_dir)
+                .into_iter()
+                .next()
+                .map(|s| (s.id, axe::session::load_session(&s.path)))
+        } else {
+            axe::session::load_by_id(&session_dir, id).map(|entries| (id.clone(), entries))
+        };
+        match loaded {
+            Some((id, entries)) => {
+                resume_id = Some(id);
+                history = axe::session::context_messages(&entries);
+                session_entries = entries;
+            }
+            None => {
+                eprintln!("error: no such session: {id}");
+                std::process::exit(1);
+            }
+        }
+    }
+    history.push(Message {
         role: "user".into(),
         content: prompt.join(" "),
         tool_calls: Vec::new(),
         tool_call_id: String::new(),
-    }];
+    });
+    session_entries.push(axe::session::Entry::Message {
+        message: history.last().unwrap().clone(),
+    });
     let tools = axe::tui::build_tools(&cfg.dir);
     let system = resolve_system(cfg, &tools);
     let provider = OpenAI::new(cfg.base.clone(), api_key(fc));
@@ -224,23 +281,80 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
         output: 0,
         threshold: fc.context_window.map(|window| window.saturating_sub(16384)),
     };
-    let end = run::run_stream(
-        &provider,
-        &RunOptions {
-            model: &cfg.model,
-            system: &system,
-            tools: &tools,
-            max_turns: usize::MAX,
-        },
-        &history,
-        &Arc::new(AtomicBool::new(false)),
-        &mut sink,
-    );
-    if let Outcome::Failed(error) = &end.outcome {
-        eprintln!("error: {error}");
+    let opts = RunOptions {
+        model: &cfg.model,
+        system: &system,
+        tools: &tools,
+        max_turns: usize::MAX,
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut overflow_retried = false;
+    let msgs;
+    loop {
+        let end = run::run_stream(&provider, &opts, &history, &cancel, &mut sink);
+        session_entries.extend(
+            end.messages[history.len()..]
+                .iter()
+                .cloned()
+                .map(|message| axe::session::Entry::Message { message }),
+        );
+        match end.outcome {
+            Outcome::Failed(error) => {
+                if !overflow_retried && axe::session::is_overflow_error(&error) {
+                    overflow_retried = true;
+                    eprintln!("error: {error}; compacting");
+                    history = compact_or_fail(
+                        &provider,
+                        &cfg.model,
+                        &session_dir,
+                        resume_id.as_deref(),
+                        &mut session_entries,
+                    );
+                    continue;
+                }
+                fail_oneshot(
+                    &session_dir,
+                    resume_id.as_deref(),
+                    &session_entries,
+                    format!("error: {error}"),
+                );
+            }
+            Outcome::Compact => {
+                history = compact_or_fail(
+                    &provider,
+                    &cfg.model,
+                    &session_dir,
+                    resume_id.as_deref(),
+                    &mut session_entries,
+                );
+                continue;
+            }
+            Outcome::Cancelled => {
+                fail_oneshot(
+                    &session_dir,
+                    resume_id.as_deref(),
+                    &session_entries,
+                    "error: interrupted".into(),
+                );
+            }
+            Outcome::MaxTurns => {
+                fail_oneshot(
+                    &session_dir,
+                    resume_id.as_deref(),
+                    &session_entries,
+                    "error: stopped: max turns reached".into(),
+                );
+            }
+            Outcome::Done => {
+                msgs = end.messages;
+                break;
+            }
+        }
+    }
+    if let Err(e) = persist_oneshot(&session_dir, resume_id.as_deref(), &session_entries) {
+        eprintln!("error: save session: {e}");
         std::process::exit(1);
     }
-    let msgs = end.messages;
     if sink.input + sink.output > 0 {
         eprintln!(
             "tokens: {} in / {} out · {}",
@@ -259,6 +373,34 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
                 println!("{}", m.content);
             }
         }
+    }
+}
+
+fn compact_or_fail(
+    provider: &OpenAI,
+    model: &str,
+    dir: &str,
+    resume_id: Option<&str>,
+    entries: &mut Vec<axe::session::Entry>,
+) -> Vec<Message> {
+    match axe::session::compact(provider, model, entries) {
+        Ok((summary, tokens_before, retained)) => {
+            entries.push(axe::session::Entry::Compaction {
+                summary,
+                tokens_before,
+                timestamp: axe::session::now_ms(),
+                retained,
+            });
+            let mut out = axe::session::context_messages(entries);
+            axe::session::trim_trailing_tool_messages(&mut out);
+            out
+        }
+        Err(e) => fail_oneshot(
+            dir,
+            resume_id,
+            entries,
+            format!("error: compaction failed: {e}"),
+        ),
     }
 }
 
