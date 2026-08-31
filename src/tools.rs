@@ -6,6 +6,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 
 const MAX_OUTPUT: usize = 16 * 1024;
+const DEFAULT_BASH_TIMEOUT: u64 = 120;
 
 /// Strip control characters (except tab/newline/CR) and Unicode format
 /// interlinear annotation marks from tool output before it reaches the model.
@@ -155,12 +156,13 @@ pub fn bash(dir: &str) -> Tool {
     let dir = dir.to_string();
     let mut t = new_tool_with_progress(
         "bash",
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 16KB. Optionally provide a timeout in seconds.",
-        r#"{"type":"object","properties":{"command":{"type":"string","description":"bash command to run"},"timeout":{"type":"integer","description":"Timeout in seconds (optional, no default timeout)"}},"required":["command"]}"#,
+        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 16KB. The default timeout is 120 seconds.",
+        r#"{"type":"object","properties":{"command":{"type":"string","description":"bash command to run"},"timeout":{"type":"integer","description":"Timeout in seconds (default: 120)"}},"required":["command"]}"#,
         move |a: BashArgs, progress: &mut dyn FnMut(&str)| {
             if a.timeout == Some(0) {
                 return "error: invalid timeout: must be a positive number of seconds".to_string();
             }
+            let timeout = a.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT);
             let tag = BASH_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             ensure_sigint_handler();
             let out_path =
@@ -207,9 +209,8 @@ pub fn bash(dir: &str) -> Tool {
             let pidfd = child_pidfd(child.id());
             let mut exit: Option<std::process::ExitStatus> = None;
             let mut timed_out = false;
-            let deadline = a
-                .timeout
-                .map(|t| std::time::Instant::now() + std::time::Duration::from_secs(t));
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(timeout);
             let mut last_progress = std::time::Instant::now();
             loop {
                 match child.try_wait() {
@@ -218,9 +219,7 @@ pub fn bash(dir: &str) -> Tool {
                         break;
                     }
                     Ok(None) => {
-                        if let Some(d) = deadline
-                            && std::time::Instant::now() >= d
-                        {
+                        if std::time::Instant::now() >= deadline {
                             unsafe {
                                 libc::kill(-(child.id() as i32), libc::SIGKILL);
                             }
@@ -246,9 +245,7 @@ pub fn bash(dir: &str) -> Tool {
                         let now = std::time::Instant::now();
                         let progress_wait = std::time::Duration::from_millis(100)
                             .saturating_sub(last_progress.elapsed());
-                        let timeout_wait = deadline
-                            .map(|deadline| deadline.saturating_duration_since(now))
-                            .unwrap_or(progress_wait);
+                        let timeout_wait = deadline.saturating_duration_since(now);
                         wait_for_child(pidfd.as_ref(), progress_wait.min(timeout_wait));
                     }
                     Err(e) => {
@@ -285,8 +282,7 @@ pub fn bash(dir: &str) -> Tool {
                     display.push('\n');
                 }
                 display.push_str(&format!(
-                    "error: command timed out after {} seconds",
-                    a.timeout.unwrap_or(0)
+                    "error: command timed out after {timeout} seconds"
                 ));
             } else if let Some(st) = exit
                 && !st.success()
