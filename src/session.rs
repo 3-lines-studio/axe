@@ -580,18 +580,30 @@ fn split_last_turn(mut msgs: Vec<Message>) -> (Vec<Message>, Vec<Message>) {
 }
 
 fn serialize_conversation(msgs: &[Message]) -> String {
-    let mut parts = Vec::new();
+    use std::fmt::Write;
+    let mut out = String::new();
     let mut tools = BTreeMap::new();
     for m in msgs {
         match m.role.as_str() {
-            "user" => parts.push(format!("[User]: {}", m.content)),
+            "user" => {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                let _ = write!(out, "[User]: {}", m.content);
+            }
             "assistant" => {
                 if !m.content.is_empty() {
-                    parts.push(format!("[Assistant]: {}", m.content));
+                    if !out.is_empty() {
+                        out.push_str("\n\n");
+                    }
+                    let _ = write!(out, "[Assistant]: {}", m.content);
                 }
                 for c in &m.tool_calls {
                     tools.insert(c.id.as_str(), c.name.as_str());
-                    parts.push(format!("[Tool call {}]: {}({})", c.id, c.name, c.arguments));
+                    if !out.is_empty() {
+                        out.push_str("\n\n");
+                    }
+                    let _ = write!(out, "[Tool call {}]: {}({})", c.id, c.name, c.arguments);
                 }
             }
             "tool" => {
@@ -601,15 +613,19 @@ fn serialize_conversation(msgs: &[Message]) -> String {
                     4000
                 };
                 let content = compact_observation(&m.content, limit);
-                parts.push(format!(
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                let _ = write!(
+                    out,
                     "[Tool result {}; full result remains in session]: {}",
                     m.tool_call_id, content
-                ));
+                );
             }
             _ => {}
         }
     }
-    parts.join("\n\n")
+    out
 }
 
 fn compact_observation(content: &str, limit: usize) -> String {
