@@ -98,9 +98,17 @@ pub fn run_stream<P: Provider>(
     cancel: &Arc<AtomicBool>,
     sink: &mut dyn Sink,
 ) -> RunEnd {
+    let started = Instant::now();
     let mut h = msgs.to_vec();
     let mut usage = Usage::default();
+    trace(format!(
+        "run start messages={} system_bytes={} tools={}",
+        msgs.len(),
+        opts.system.len(),
+        opts.tools.len()
+    ));
     for turn in 0..opts.max_turns {
+        trace(format!("turn={} start messages={}", turn + 1, h.len()));
         if cancelled(cancel) {
             return RunEnd {
                 messages: h,
@@ -128,6 +136,15 @@ pub fn run_stream<P: Provider>(
                 };
             }
         };
+        trace(format!(
+            "turn={} model_done elapsed_ms={} input_tokens={} cached_input_tokens={} output_tokens={} tool_calls={}",
+            turn + 1,
+            started.elapsed().as_millis(),
+            resp.usage.input,
+            resp.usage.cached_input,
+            resp.usage.output,
+            calls.len()
+        ));
         usage = Usage {
             input: usage.input + resp.usage.input,
             output: usage.output + resp.usage.output,
@@ -141,6 +158,14 @@ pub fn run_stream<P: Provider>(
                 h.push(user_message(text));
                 continue;
             }
+            trace(format!(
+                "run done elapsed_ms={} turns={} input_tokens={} cached_input_tokens={} output_tokens={}",
+                started.elapsed().as_millis(),
+                turn + 1,
+                usage.input,
+                usage.cached_input,
+                usage.output
+            ));
             return RunEnd {
                 messages: h,
                 usage,
@@ -297,11 +322,25 @@ fn run_parallel(
 }
 
 fn run_tool(tools: &[Tool], call: &ToolCall, progress: &mut dyn FnMut(&str)) -> String {
+    let started = Instant::now();
     for t in tools {
         if t.name == call.name {
-            return (t.run)(&call.arguments, progress);
+            let output = (t.run)(&call.arguments, progress);
+            trace(format!(
+                "tool name={} elapsed_ms={} argument_bytes={} output_bytes={}",
+                call.name,
+                started.elapsed().as_millis(),
+                call.arguments.len(),
+                output.len()
+            ));
+            return output;
         }
     }
+    trace(format!(
+        "tool name={} elapsed_ms={} unknown=true",
+        call.name,
+        started.elapsed().as_millis()
+    ));
     format!("error: unknown tool: {}", call.name)
 }
 
@@ -320,16 +359,32 @@ fn stream<P: Provider>(
     };
     let mut attempt = 0;
     loop {
+        let started = Instant::now();
         let handle = provider.stream(&req, cancel);
         let mut calls = Vec::new();
         let mut forwarded = 0usize;
+        let mut first_event = false;
         while let Ok(ev) = handle.events().recv() {
             match ev {
                 StreamEvent::Content(d) => {
+                    if !first_event {
+                        trace(format!(
+                            "model first_event_ms={}",
+                            started.elapsed().as_millis()
+                        ));
+                        first_event = true;
+                    }
                     forwarded += 1;
                     sink.assistant_delta(&d);
                 }
                 StreamEvent::ToolCall(c) => {
+                    if !first_event {
+                        trace(format!(
+                            "model first_event_ms={}",
+                            started.elapsed().as_millis()
+                        ));
+                        first_event = true;
+                    }
                     forwarded += 1;
                     calls.push(c);
                 }
@@ -344,7 +399,14 @@ fn stream<P: Provider>(
             }
         }
         match handle.join() {
-            Ok(resp) => return Ok((resp, calls)),
+            Ok(resp) => {
+                trace(format!(
+                    "model request_done_ms={} attempt={}",
+                    started.elapsed().as_millis(),
+                    attempt + 1
+                ));
+                return Ok((resp, calls));
+            }
             Err(e) => {
                 // Only retry failures that emitted no events yet: once content
                 // reached the sink, a re-run would duplicate it.
@@ -352,7 +414,12 @@ fn stream<P: Provider>(
                     return Err(e.to_string());
                 }
                 attempt += 1;
-                sleep_with_cancel(backoff(attempt), cancel).map_err(|e| e.to_string())?;
+                let delay = backoff(attempt);
+                trace(format!(
+                    "model retry={} backoff_ms={} error={}",
+                    attempt, delay, e
+                ));
+                sleep_with_cancel(delay, cancel).map_err(|e| e.to_string())?;
             }
         }
     }
@@ -360,4 +427,10 @@ fn stream<P: Provider>(
 
 fn exec(tools: &[Tool], call: &ToolCall, sink: &mut dyn Sink) -> String {
     run_tool(tools, call, &mut |text| sink.tool_delta(call, text))
+}
+
+fn trace(message: String) {
+    if std::env::var_os("AXE_TRACE").is_some() {
+        eprintln!("trace: {message}");
+    }
 }

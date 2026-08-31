@@ -169,6 +169,9 @@ fn run_request(
     };
 
     if stream && status == 200 {
+        if let Some(message) = &acc.stream_error {
+            return Err(Error::Provider(format!("openai: {message}")));
+        }
         // A 200 with a body that never produced a recognized SSE event
         // (plain JSON error, proxy page) must not become a silent empty
         // assistant turn.
@@ -266,6 +269,7 @@ struct StreamAcc {
     usage: OaUsage,
     out_tokens: usize,
     finish_reason: Option<String>,
+    stream_error: Option<String>,
     /// Recognized SSE events seen ([DONE] or a parsed chunk).
     events: usize,
 }
@@ -302,6 +306,13 @@ struct OaStreamChunk {
     choices: Vec<OaStreamChoice>,
     #[serde(default)]
     usage: OaUsage,
+    #[serde(default)]
+    error: Option<OaStreamError>,
+}
+
+#[derive(Clone, Deserialize)]
+struct OaStreamError {
+    message: String,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -369,6 +380,10 @@ impl StreamAcc {
         let Ok(chunk) = serde_json::from_str::<OaStreamChunk>(&payload) else {
             return;
         };
+        if let Some(error) = chunk.error {
+            self.stream_error = Some(error.message);
+            return;
+        }
         if let Some(tx) = tx
             && (chunk.usage.prompt_tokens != 0 || chunk.usage.completion_tokens != 0)
         {
@@ -624,6 +639,16 @@ mod tests {
         feed_all(&mut acc, &[b"<html>502 Bad Gateway</html>"]);
         assert_eq!(acc.events, 0);
         assert_eq!(acc.raw, b"<html>502 Bad Gateway</html>");
+    }
+
+    #[test]
+    fn stream_error_is_recorded() {
+        let mut acc = StreamAcc::default();
+        feed_all(
+            &mut acc,
+            &[b"data: {\"error\":{\"message\":\"provider failed\",\"code\":502},\"choices\":[{\"finish_reason\":\"error\",\"delta\":{}}]}\n\n"],
+        );
+        assert_eq!(acc.stream_error.as_deref(), Some("provider failed"));
     }
 
     #[test]
