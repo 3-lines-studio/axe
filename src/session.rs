@@ -386,6 +386,37 @@ pub fn continue_archived(dir: &str, id: &str, entries: &[Entry]) -> std::io::Res
     Ok(true)
 }
 
+pub fn continue_archived_live(dir: &str, id: &str) -> std::io::Result<bool> {
+    if !valid_id(id) {
+        return Ok(false);
+    }
+    let live = live_path(dir);
+    let bytes = match std::fs::metadata(&live) {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return Ok(false),
+    };
+    let Some(mut sidecar) = read_live_sidecar(dir, bytes) else {
+        return Ok(false);
+    };
+    let path = store_dir(dir).join(format!("{id}.jsonl"));
+    if std::fs::rename(&live, &path).is_err() {
+        return Ok(false);
+    }
+    let live_title = Path::new(dir).join("session.title");
+    if let Some(title) = std::fs::read_to_string(&live_title)
+        .ok()
+        .map(|title| title.trim().to_string())
+        .filter(|title| !title.is_empty())
+    {
+        sidecar.title = title;
+    }
+    let _ = write_session_sidecar_value(dir, id, &sidecar);
+    let _ = std::fs::remove_file(live_title);
+    let _ = std::fs::remove_file(live_sidecar_path(dir));
+    clear_resume_id(dir);
+    Ok(true)
+}
+
 pub fn load_live(dir: &str) -> Vec<Entry> {
     read_entries(&live_path(dir))
 }
@@ -540,6 +571,11 @@ pub fn archive_live(dir: &str) -> Option<String> {
     let bytes = std::fs::metadata(&path).ok()?.len();
     let live_sidecar = read_live_sidecar(dir, bytes);
     if let Some(id) = load_resume_id(dir) {
+        match continue_archived_live(dir, &id) {
+            Ok(true) => return Some(id),
+            Ok(false) => {}
+            Err(_) => return None,
+        }
         let entries = read_entries(&path);
         match continue_archived(dir, &id, &entries) {
             Ok(true) => return Some(id),
@@ -1283,10 +1319,11 @@ mod tests {
         serde_json::to_writer(&mut file, &second).unwrap();
         file.write_all(b"\n").unwrap();
         file.sync_all().unwrap();
-        archive_live(d).unwrap();
+        set_resume_id(d, &id);
+        assert_eq!(archive_live(d).unwrap(), id);
         let sessions = list_sessions(d);
-        assert_eq!(sessions.len(), 2);
-        assert!(sessions.iter().all(|session| session.turns == 2));
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].turns, 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 

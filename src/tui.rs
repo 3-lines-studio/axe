@@ -373,8 +373,16 @@ impl Tui {
             .collect();
         match self.resume_id.take() {
             Some(id) => {
+                let appended = session::append_live(&self.cfg.session_dir, &pending).is_ok();
+                if appended
+                    && session::continue_archived_live(&self.cfg.session_dir, &id).unwrap_or(false)
+                {
+                    return;
+                }
                 let mut entries = session::load_live(&self.cfg.session_dir);
-                entries.extend(pending);
+                if !appended {
+                    entries.extend(pending);
+                }
                 let _ = session::continue_archived(&self.cfg.session_dir, &id, &entries);
             }
             None => {
@@ -1226,10 +1234,13 @@ impl Tui {
 
     fn fresh_session(&mut self, archive: bool) {
         if archive {
-            let entries = session::load_live(&self.cfg.session_dir);
             match self.resume_id.take() {
                 Some(id) => {
-                    let _ = session::continue_archived(&self.cfg.session_dir, &id, &entries);
+                    if !session::continue_archived_live(&self.cfg.session_dir, &id).unwrap_or(false)
+                    {
+                        let entries = session::load_live(&self.cfg.session_dir);
+                        let _ = session::continue_archived(&self.cfg.session_dir, &id, &entries);
+                    }
                 }
                 None => {
                     session::archive_live(&self.cfg.session_dir);
@@ -1506,7 +1517,10 @@ impl Tui {
                 if let Some(s) = s {
                     // Flush the session being continued so switching targets
                     // does not drop its transcript.
-                    if let Some(prev) = self.resume_id.take() {
+                    if let Some(prev) = self.resume_id.take()
+                        && !session::continue_archived_live(&self.cfg.session_dir, &prev)
+                            .unwrap_or(false)
+                    {
                         let entries = session::load_live(&self.cfg.session_dir);
                         let _ = session::continue_archived(&self.cfg.session_dir, &prev, &entries);
                     }
