@@ -584,8 +584,12 @@ struct EditArgs {
     edits: Vec<EditArg>,
 }
 
-fn normalize_lf(s: &str) -> String {
-    s.replace("\r\n", "\n").replace('\r', "\n")
+fn normalize_lf(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains('\r') {
+        std::borrow::Cow::Owned(s.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
 }
 
 /// Byte-offset map from `normalize_lf(body)` back into `body`: entry i is
@@ -697,6 +701,7 @@ fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<String, S
     }
     let mut found: Vec<(usize, usize, usize)> = Vec::new();
     for (i, old) in olds.iter().enumerate() {
+        let old = old.as_ref();
         let (start, len) = match normalized.find(old) {
             Some(idx) => {
                 let n = normalized.matches(old).count();
@@ -720,11 +725,11 @@ fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<String, S
     }
     // Apply in body coordinates so each region keeps its own line endings:
     // untouched lines are never rewritten, even in files with mixed endings.
-    let map = lf_map(body);
+    let map = body.contains('\r').then(|| lf_map(body));
     let mut out = body.to_string();
     for &(i, start, len) in found.iter().rev() {
-        let bs = map[start];
-        let be = map[start + len];
+        let bs = map.as_ref().map_or(start, |map| map[start]);
+        let be = map.as_ref().map_or(start + len, |map| map[start + len]);
         let replacement = with_ending(
             &normalize_lf(&edits[i].new_text),
             region_ending(body, bs, be),
@@ -741,38 +746,33 @@ const EDIT_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"stri
 
 /// Line-based diff with line numbers, one hunk per changed region.
 fn diff_lines(old: &str, new: &str) -> String {
-    let a: Vec<&str> = old.split('\n').collect();
-    let b: Vec<&str> = new.split('\n').collect();
+    let mut old_lines = old.split('\n').enumerate().peekable();
+    let mut new_lines = new.split('\n').enumerate().peekable();
     let mut out = String::new();
-    let mut i = 0usize;
-    let mut j = 0usize;
-    while i < a.len() || j < b.len() {
-        if i < a.len() && j < b.len() && a[i] == b[j] {
-            i += 1;
-            j += 1;
+    while old_lines.peek().is_some() || new_lines.peek().is_some() {
+        if old_lines.peek().map(|line| line.1) == new_lines.peek().map(|line| line.1) {
+            old_lines.next();
+            new_lines.next();
             continue;
         }
-        let (start_i, start_j) = (i, j);
-        let mut removed: Vec<&str> = Vec::new();
-        let mut added: Vec<&str> = Vec::new();
-        while i < a.len() || j < b.len() {
-            if i < a.len() && j < b.len() && a[i] == b[j] {
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        while old_lines.peek().is_some() || new_lines.peek().is_some() {
+            if old_lines.peek().map(|line| line.1) == new_lines.peek().map(|line| line.1) {
                 break;
             }
-            if i < a.len() {
-                removed.push(a[i]);
-                i += 1;
+            if let Some(line) = old_lines.next() {
+                removed.push(line);
             }
-            if j < b.len() {
-                added.push(b[j]);
-                j += 1;
+            if let Some(line) = new_lines.next() {
+                added.push(line);
             }
         }
-        for (k, line) in removed.iter().enumerate() {
-            out.push_str(&format!("-{} {}\n", start_i + k + 1, line));
+        for (line, text) in removed {
+            out.push_str(&format!("-{} {text}\n", line + 1));
         }
-        for (k, line) in added.iter().enumerate() {
-            out.push_str(&format!("+{} {}\n", start_j + k + 1, line));
+        for (line, text) in added {
+            out.push_str(&format!("+{} {text}\n", line + 1));
         }
     }
     out.trim_end().to_string()

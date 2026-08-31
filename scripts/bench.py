@@ -24,6 +24,7 @@ parser.add_argument(
         "sleep",
         "history",
         "read-large",
+        "edit-large",
         "all",
     ),
     default="all"
@@ -91,6 +92,11 @@ class Handler(BaseHTTPRequestHandler):
             elif user_content == "Read large.":
                 arguments = json.dumps({"path": str(large_file), "offset": 1, "limit": 1})
                 tool = {"name": "read", "arguments": arguments}
+            elif user_content == "Edit large.":
+                arguments = json.dumps(
+                    {"path": "large.txt", "edits": [{"oldText": "old\n", "newText": "new\n"}]}
+                )
+                tool = {"name": "edit", "arguments": arguments}
             elif user_content == "Run true.":
                 tool = {"name": "bash", "arguments": '{"command":"true"}'}
             elif user_content == "Run sleep.":
@@ -147,9 +153,12 @@ def run(binary, index, scenario):
         "sleep": "Run sleep.",
         "history": "Build history.",
         "read-large": "Read large.",
+        "edit-large": "Edit large.",
     }
     prompt = prompts[scenario]
     with tempfile.TemporaryDirectory(prefix="axe-bench-") as tmp:
+        if scenario == "edit-large":
+            Path(tmp, "large.txt").write_bytes(b"old\n" + b"x\n" * 5_000_000)
         env = os.environ.copy()
         env["OPENAI_API_KEY"] = run_id
         env["XDG_CONFIG_HOME"] = str(Path(tmp) / ".config")
@@ -166,7 +175,10 @@ def run(binary, index, scenario):
         elapsed = (time.perf_counter_ns() - started) / 1_000_000
         cpu = (usage.ru_utime + usage.ru_stime) * 1000
         output = Path(tmp, "out.txt")
-        if code != 0 or (scenario == "write" and output.read_text() != "ok\n"):
+        edited = Path(tmp, "large.txt")
+        valid = scenario != "write" or output.read_text() == "ok\n"
+        valid = valid and (scenario != "edit-large" or edited.read_bytes().startswith(b"new\n"))
+        if code != 0 or not valid:
             raise RuntimeError(f"{binary} failed {scenario} run {index + 1}")
     with lock:
         sizes = request_bytes.pop(run_id)
