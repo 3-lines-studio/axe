@@ -16,7 +16,16 @@ parser.add_argument("bins", nargs="+", default=["target/release/axe"])
 parser.add_argument("--runs", type=int, default=30)
 parser.add_argument(
     "--scenario",
-    choices=("final", "stream", "write", "bash", "sleep", "history", "all"),
+    choices=(
+        "final",
+        "stream",
+        "write",
+        "bash",
+        "sleep",
+        "history",
+        "read-large",
+        "all",
+    ),
     default="all"
 )
 args = parser.parse_args()
@@ -24,6 +33,8 @@ args = parser.parse_args()
 lock = threading.Lock()
 request_bytes = {}
 connections = {}
+large_file = Path(tempfile.gettempdir()) / f"axe-bench-large-{os.getpid()}.txt"
+large_file.write_bytes(b"x\n" * 5_000_000)
 
 
 def chunk(data):
@@ -77,6 +88,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             if user_content == "Build history.":
                 tool = {"name": "read", "arguments": '{"path":"missing.txt"}'}
+            elif user_content == "Read large.":
+                arguments = json.dumps({"path": str(large_file), "offset": 1, "limit": 1})
+                tool = {"name": "read", "arguments": arguments}
             elif user_content == "Run true.":
                 tool = {"name": "bash", "arguments": '{"command":"true"}'}
             elif user_content == "Run sleep.":
@@ -132,6 +146,7 @@ def run(binary, index, scenario):
         "bash": "Run true.",
         "sleep": "Run sleep.",
         "history": "Build history.",
+        "read-large": "Read large.",
     }
     prompt = prompts[scenario]
     with tempfile.TemporaryDirectory(prefix="axe-bench-") as tmp:
@@ -185,3 +200,4 @@ for binary_arg in args.bins:
     print(f"  binary {Path(binary).stat().st_size / 1024:.1f} KiB")
 
 server.shutdown()
+large_file.unlink()

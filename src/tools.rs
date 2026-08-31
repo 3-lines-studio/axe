@@ -453,6 +453,30 @@ pub fn read() -> Tool {
             let mut overflow = false;
             let mut oversized = None;
             loop {
+                if shown >= limit || overflow {
+                    let mut trailing = false;
+                    loop {
+                        let buf = match reader.fill_buf() {
+                            Ok(buf) => buf,
+                            Err(e) => return format!("error: {e}"),
+                        };
+                        if buf.is_empty() {
+                            break;
+                        }
+                        for &byte in buf {
+                            if byte == b'\n' {
+                                total += 1;
+                                trailing = false;
+                            } else {
+                                trailing = true;
+                            }
+                        }
+                        let len = buf.len();
+                        reader.consume(len);
+                    }
+                    total += usize::from(trailing);
+                    break;
+                }
                 line.clear();
                 let read = match reader.read_until(b'\n', &mut line) {
                     Ok(read) => read,
