@@ -277,6 +277,9 @@ struct Tui {
     screen: Screen,
     alt_active: bool,
     streamed: Vec<String>,
+    transcript_cache: Vec<String>,
+    transcript_cache_entries: usize,
+    transcript_cache_width: usize,
     painted_once: bool,
     last_capacity: usize,
     last_frame: Vec<String>,
@@ -335,6 +338,9 @@ impl Tui {
             screen: Screen::None,
             alt_active: false,
             streamed: Vec::new(),
+            transcript_cache: Vec::new(),
+            transcript_cache_entries: 0,
+            transcript_cache_width: 0,
             painted_once: false,
             last_capacity: 0,
             last_frame: Vec::new(),
@@ -1230,6 +1236,8 @@ impl Tui {
             session::discard_live(&self.cfg.session_dir);
         }
         self.entries.clear();
+        self.transcript_cache.clear();
+        self.transcript_cache_entries = 0;
         self.entries.push(Entry::Welcome);
         self.msgs.clear();
         self.pending_tools.clear();
@@ -1315,6 +1323,8 @@ impl Tui {
             }
         }
         self.entries.clear();
+        self.transcript_cache.clear();
+        self.transcript_cache_entries = 0;
         self.entries.push(Entry::Welcome);
         let mut tools: Vec<String> = Vec::new();
         for m in &self.msgs {
@@ -1648,55 +1658,21 @@ impl Tui {
         self.paint_inline(term, resized);
     }
 
-    fn render_transcript(&self) -> Vec<String> {
+    fn render_transcript(&mut self) -> Vec<String> {
         let width = (self.cols as usize).max(1);
-        let mut rows = Vec::new();
-        for entry in &self.entries {
-            match entry {
-                Entry::Welcome => {
-                    rows.push(format!(
-                        "{WELCOME_APP}axe{RESET}{DIM} v{VERSION} · Run /help for commands{RESET}"
-                    ));
-                }
-                Entry::User(text) => {
-                    for line in wrap_text(text, width.saturating_sub(2)) {
-                        rows.push(format!("{USER_RAIL}┃{RESET} {BOLD}{line}{RESET}"));
-                    }
-                }
-                Entry::Text(t) => rows.extend(wrap_gutter(t, width, 2)),
-                Entry::Code(c) => rows.extend(wrap_gutter(c, width, 2)),
-                Entry::Table(t) => rows.extend(wrap_gutter(t, width, 2)),
-                Entry::Rule => rows.push(format!(
-                    "{DIM}{}{RESET}",
-                    "\u{2500}".repeat(markdown::ansi::HORIZONTAL_RULE_WIDTH)
-                )),
-                Entry::Tool { calls } => {
-                    let n = calls.len();
-                    rows.push(format!(
-                        "{USER_RAIL}●{RESET} {DIM}{n} tool call{}{RESET}",
-                        if n == 1 { "" } else { "s" }
-                    ));
-                    let last = n.saturating_sub(1);
-                    for (i, label) in calls.iter().enumerate() {
-                        let branch = if i == last { "└" } else { "├" };
-                        rows.push(format!("{DIM}{branch} {label}{RESET}"));
-                    }
-                }
-                Entry::Notice(text) => rows.push(text.clone()),
-                Entry::Summary {
-                    secs,
-                    input,
-                    output,
-                } => {
-                    rows.push(format!(
-                        "{DIM}  {} (↑{} ↓{}){RESET}",
-                        format_dur(*secs),
-                        tok(*input),
-                        tok(*output)
-                    ));
-                }
-            }
-            rows.push(String::new());
+        let stable_entries = self.entries.len().saturating_sub(1);
+        if self.transcript_cache_width != width || self.transcript_cache_entries > stable_entries {
+            self.transcript_cache.clear();
+            self.transcript_cache_entries = 0;
+            self.transcript_cache_width = width;
+        }
+        for entry in &self.entries[self.transcript_cache_entries..stable_entries] {
+            render_entry(entry, width, &mut self.transcript_cache);
+        }
+        self.transcript_cache_entries = stable_entries;
+        let mut rows = self.transcript_cache.clone();
+        if let Some(entry) = self.entries.last() {
+            render_entry(entry, width, &mut rows);
         }
         if let Some(label) = &self.tool_running {
             let now = self.turn_start.elapsed();
@@ -2839,6 +2815,50 @@ fn sgr_kind(seq: &str) -> Option<&'static str> {
         _ if body.starts_with("38;") => "fg",
         _ => "other",
     })
+}
+
+fn render_entry(entry: &Entry, width: usize, rows: &mut Vec<String>) {
+    match entry {
+        Entry::Welcome => rows.push(format!(
+            "{WELCOME_APP}axe{RESET}{DIM} v{VERSION} · Run /help for commands{RESET}"
+        )),
+        Entry::User(text) => {
+            for line in wrap_text(text, width.saturating_sub(2)) {
+                rows.push(format!("{USER_RAIL}┃{RESET} {BOLD}{line}{RESET}"));
+            }
+        }
+        Entry::Text(text) | Entry::Code(text) | Entry::Table(text) => {
+            rows.extend(wrap_gutter(text, width, 2));
+        }
+        Entry::Rule => rows.push(format!(
+            "{DIM}{}{RESET}",
+            "\u{2500}".repeat(markdown::ansi::HORIZONTAL_RULE_WIDTH)
+        )),
+        Entry::Tool { calls } => {
+            let count = calls.len();
+            rows.push(format!(
+                "{USER_RAIL}●{RESET} {DIM}{count} tool call{}{RESET}",
+                if count == 1 { "" } else { "s" }
+            ));
+            let last = count.saturating_sub(1);
+            for (index, label) in calls.iter().enumerate() {
+                let branch = if index == last { "└" } else { "├" };
+                rows.push(format!("{DIM}{branch} {label}{RESET}"));
+            }
+        }
+        Entry::Notice(text) => rows.push(text.clone()),
+        Entry::Summary {
+            secs,
+            input,
+            output,
+        } => rows.push(format!(
+            "{DIM}  {} (↑{} ↓{}){RESET}",
+            format_dur(*secs),
+            tok(*input),
+            tok(*output)
+        )),
+    }
+    rows.push(String::new());
 }
 
 fn wrap_gutter(text: &str, width: usize, gutter: usize) -> Vec<String> {
