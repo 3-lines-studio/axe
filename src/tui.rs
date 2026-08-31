@@ -67,7 +67,6 @@ enum Entry {
 enum Activity {
     Idle,
     Thinking,
-    Streaming,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -1044,7 +1043,6 @@ impl Tui {
                             self.entries.push(Entry::Text(text));
                             cur = Some(self.entries.len() - 1);
                         }
-                        self.activity = Activity::Streaming;
                     }
                     TurnEvent::AssistantDone => {
                         self.flush_tools();
@@ -1719,34 +1717,20 @@ impl Tui {
                 rows.push(format!("{DIM}  {t}{RESET}"));
             }
         } else {
-            match &self.activity {
-                Activity::Thinking => {
-                    let now = self.turn_start.elapsed();
-                    let secs = now.as_secs();
-                    let half = (now.as_millis() as i64 / 500) % 2 == 0;
-                    let head = if half {
-                        format!("{ACTIVITY}• Thinking ({secs}s)")
-                    } else {
-                        format!(" {ACTIVITY} Thinking ({secs}s)")
-                    };
-                    rows.push(format!(
-                        "{head}{DIM} (↑{} ↓{}){RESET}",
-                        tok(self.live_in),
-                        tok(self.live_out)
-                    ));
-                }
-                Activity::Streaming => {
-                    if self.live_in > 0 || self.live_out > 0 {
-                        rows.push(format!(
-                            "{DIM}  (↑{} ↓{}){RESET}",
-                            tok(self.live_in),
-                            tok(self.live_out)
-                        ));
-                    } else {
-                        rows.push(String::from("  "));
-                    }
-                }
-                _ => {}
+            if self.activity == Activity::Thinking {
+                let now = self.turn_start.elapsed();
+                let secs = now.as_secs();
+                let half = (now.as_millis() as i64 / 500) % 2 == 0;
+                let head = if half {
+                    format!("{ACTIVITY}• Thinking ({secs}s)")
+                } else {
+                    format!(" {ACTIVITY} Thinking ({secs}s)")
+                };
+                rows.push(format!(
+                    "{head}{DIM} (↑{} ↓{}){RESET}",
+                    tok(self.live_in),
+                    tok(self.live_out)
+                ));
             }
         }
         (rows, cached_rows)
