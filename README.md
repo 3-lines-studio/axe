@@ -48,6 +48,13 @@ make check
 
 This runs formatting, clippy, unit tests, integration tests, a release build, and the black-box PTY harness.
 
+Run the deterministic local performance benchmark:
+
+```sh
+make bench
+python3 scripts/bench.py /path/to/baseline target/release/axe --runs 100
+```
+
 Run live model evals separately:
 
 ```sh

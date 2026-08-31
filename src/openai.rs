@@ -365,11 +365,20 @@ impl StreamAcc {
         } else {
             self.buf.extend_from_slice(data);
         }
-        loop {
-            let sep = find_bytes(&self.buf, b"\n\n");
-            let Some(sep) = sep else { break };
-            let event = self.buf.drain(..sep + 2).collect::<Vec<u8>>();
-            self.handle_event(&event, tx);
+        let mut end = 0;
+        while let Some(sep) = find_bytes(&self.buf[end..], b"\n\n") {
+            end += sep + 2;
+        }
+        if end == 0 {
+            return;
+        }
+        let remaining = self.buf.split_off(end);
+        let complete = std::mem::replace(&mut self.buf, remaining);
+        let mut start = 0;
+        while let Some(sep) = find_bytes(&complete[start..], b"\n\n") {
+            let end = start + sep + 2;
+            self.handle_event(&complete[start..end], tx);
+            start = end;
         }
     }
 

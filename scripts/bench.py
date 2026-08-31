@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import statistics
+import subprocess
+import socket
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("bins", nargs="+", default=["target/release/axe"])
+parser.add_argument("--runs", type=int, default=30)
+parser.add_argument(
+    "--scenario", choices=("final", "stream", "write", "bash", "sleep", "all"), default="all"
+)
+args = parser.parse_args()
+
+lock = threading.Lock()
+request_bytes = {}
+connections = {}
+
+
+def chunk(data):
+    return f"data: {json.dumps(data, separators=(',', ':'))}\n\n".encode()
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        super().setup()
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def do_POST(self):
+        size = int(self.headers["Content-Length"])
+        body = self.rfile.read(size)
+        request = json.loads(body)
+        run_id = self.headers.get("Authorization", "").removeprefix("Bearer ")
+        with lock:
+            request_bytes.setdefault(run_id, []).append(size)
+            connections.setdefault(run_id, set()).add(self.client_address[1])
+        has_tool_result = any(message["role"] == "tool" for message in request["messages"])
+        user_content = next(
+            message.get("content", "")
+            for message in reversed(request["messages"])
+            if message["role"] == "user"
+        )
+        final_only = user_content == "Reply with done."
+        if user_content == "Stream.":
+            events = [
+                {"choices": [{"delta": {"content": "x"}, "finish_reason": None}]}
+                for _ in range(1000)
+            ]
+            events.append(
+                {
+                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 1000},
+                }
+            )
+        elif has_tool_result or final_only:
+            events = [
+                {"choices": [{"delta": {"content": "done"}, "finish_reason": None}]},
+                {
+                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 1},
+                },
+            ]
+        else:
+            if user_content == "Run true.":
+                tool = {"name": "bash", "arguments": '{"command":"true"}'}
+            elif user_content == "Run sleep.":
+                tool = {"name": "bash", "arguments": '{"command":"sleep 1"}'}
+            else:
+                tool = {"name": "write", "arguments": '{"path":"out.txt","content":"ok\\n"}'}
+            events = [
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "function": tool,
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ]
+                },
+                {
+                    "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 1},
+                },
+            ]
+        payload = b"".join(chunk(event) for event in events) + b"data: [DONE]\n\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
+
+    def log_message(self, format, *values):
+        pass
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+base = f"http://127.0.0.1:{server.server_port}"
+
+
+def run(binary, index, scenario):
+    run_id = f"{os.getpid()}-{index}-{time.monotonic_ns()}"
+    prompts = {
+        "final": "Reply with done.",
+        "stream": "Stream.",
+        "write": "Create out.txt containing ok.",
+        "bash": "Run true.",
+        "sleep": "Run sleep.",
+    }
+    prompt = prompts[scenario]
+    with tempfile.TemporaryDirectory(prefix="axe-bench-") as tmp:
+        env = os.environ.copy()
+        env["OPENAI_API_KEY"] = run_id
+        env["XDG_CONFIG_HOME"] = str(Path(tmp) / ".config")
+        started = time.perf_counter_ns()
+        process = subprocess.Popen(
+            [binary, "--base", base, "--model", "bench", "-C", tmp, prompt],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _, status, usage = os.wait4(process.pid, 0)
+        code = os.waitstatus_to_exitcode(status)
+        process.returncode = code
+        elapsed = (time.perf_counter_ns() - started) / 1_000_000
+        cpu = (usage.ru_utime + usage.ru_stime) * 1000
+        output = Path(tmp, "out.txt")
+        if code != 0 or (scenario == "write" and output.read_text() != "ok\n"):
+            raise RuntimeError(f"{binary} failed {scenario} run {index + 1}")
+    with lock:
+        sizes = request_bytes.pop(run_id)
+        count = len(connections.pop(run_id))
+    return elapsed, cpu, usage.ru_maxrss, sum(sizes), count
+
+
+scenarios = (
+    ("final", "stream", "write", "bash", "sleep")
+    if args.scenario == "all"
+    else (args.scenario,)
+)
+for binary_arg in args.bins:
+    binary = str(Path(binary_arg).resolve())
+    print(Path(binary).name)
+    for scenario in scenarios:
+        run(binary, -1, scenario)
+        samples = [run(binary, index, scenario) for index in range(args.runs)]
+        elapsed = sorted(sample[0] for sample in samples)
+        cpu = sorted(sample[1] for sample in samples)
+        rss = sorted(sample[2] for sample in samples)
+        sizes = [sample[3] for sample in samples]
+        connection_counts = [sample[4] for sample in samples]
+        p95 = elapsed[max(0, int(len(elapsed) * 0.95) - 1)]
+        print(f"  {scenario}")
+        print(f"    wall median {statistics.median(elapsed):.2f} ms  p95 {p95:.2f} ms")
+        print(f"    CPU median {statistics.median(cpu):.2f} ms")
+        print(f"    peak RSS median {statistics.median(rss) / 1024:.2f} MiB")
+        print(f"    request bytes median {statistics.median(sizes):.0f}")
+        print(f"    connections median {statistics.median(connection_counts):.0f}")
+    print(f"  binary {Path(binary).stat().st_size / 1024:.1f} KiB")
+
+server.shutdown()

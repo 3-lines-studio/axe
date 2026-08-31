@@ -1,7 +1,7 @@
 RELEASE = cargo +nightly build --release --config 'build.rustflags=["-Cforce-unwind-tables=no","-Cllvm-args=-enable-machine-outliner=always"]'
 PREFIX ?= $(HOME)/.local
 
-.PHONY: check run dev harness eval eval-compaction install
+.PHONY: check run dev harness bench eval eval-compaction install
 
 check:
 	cargo fmt
@@ -21,6 +21,10 @@ dev:
 harness:
 	$(RELEASE)
 	python3 scripts/harness.py --bin target/release/axe
+
+bench:
+	$(RELEASE)
+	python3 scripts/bench.py target/release/axe --runs 100
 
 eval:
 	$(RELEASE)
