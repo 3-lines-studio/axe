@@ -543,7 +543,7 @@ pub fn archive_live(dir: &str) -> Option<String> {
         dest = store.join(format!("{id}.jsonl"));
         n += 1;
     }
-    if std::fs::copy(live_path(dir), &dest).is_err() {
+    if std::fs::rename(live_path(dir), &dest).is_err() {
         return None;
     }
     let live_title_path = Path::new(dir).join("session.title");
@@ -554,7 +554,6 @@ pub fn archive_live(dir: &str) -> Option<String> {
         .unwrap_or_else(|| title_from_entries(&entries));
     let _ = write_session_sidecar(dir, &id, &dest, &title, &entries);
     let _ = std::fs::remove_file(live_title_path);
-    let _ = std::fs::remove_file(live_path(dir));
     clear_resume_id(dir);
     Some(id)
 }
