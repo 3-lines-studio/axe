@@ -1686,7 +1686,7 @@ impl Tui {
         self.paint_inline(term, resized);
     }
 
-    fn render_transcript(&mut self) -> Vec<String> {
+    fn render_transcript(&mut self) -> (Vec<String>, usize) {
         let width = (self.cols as usize).max(1);
         let stable_entries = self.entries.len().saturating_sub(1);
         if self.transcript_cache_width != width || self.transcript_cache_entries > stable_entries {
@@ -1698,7 +1698,8 @@ impl Tui {
             render_entry(entry, width, &mut self.transcript_cache);
         }
         self.transcript_cache_entries = stable_entries;
-        let mut rows = self.transcript_cache.clone();
+        let mut rows = std::mem::take(&mut self.transcript_cache);
+        let cached_rows = rows.len();
         if let Some(entry) = self.entries.last() {
             render_entry(entry, width, &mut rows);
         }
@@ -1747,7 +1748,7 @@ impl Tui {
                 _ => {}
             }
         }
-        rows
+        (rows, cached_rows)
     }
 
     fn paint_inline(&mut self, term: &mut Terminal, resized: bool) {
@@ -1757,7 +1758,7 @@ impl Tui {
             self.painted_once = true;
             self.streamed.clear();
         }
-        let content = self.render_transcript();
+        let (mut content, cached_rows) = self.render_transcript();
         self.sync_picker();
         let (chrome, cursor_row, cursor_col) = self.chrome_rows();
         let rows = (self.rows as usize).max(1);
@@ -1811,6 +1812,8 @@ impl Tui {
             self.last_chrome = Some((vis, chrome, cursor_row, cursor_col));
         }
         let _ = out.flush();
+        content.truncate(cached_rows);
+        self.transcript_cache = content;
     }
 
     fn update_content(
