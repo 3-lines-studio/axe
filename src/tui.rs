@@ -2155,7 +2155,7 @@ impl Tui {
         if j < cursor
             && chars.get(j) == Some(&'/')
             && j + 1 < cursor
-            && !input[..j].trim().is_empty()
+            && chars[..j].iter().any(|c| !c.is_whitespace())
         {
             let q: String = chars[j + 1..cursor].iter().collect();
             return Some((PickerKind::Slash, q, j, cursor));
@@ -2217,8 +2217,15 @@ impl Input {
         v
     }
 
+    fn byte_index(&self, index: usize) -> usize {
+        self.buf
+            .char_indices()
+            .nth(index)
+            .map_or(self.buf.len(), |(index, _)| index)
+    }
+
     fn insert(&mut self, c: char) {
-        self.buf.insert(self.cursor, c);
+        self.buf.insert(self.byte_index(self.cursor), c);
         self.cursor += 1;
         self.preferred_col = None;
     }
@@ -2226,14 +2233,14 @@ impl Input {
     fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
-            self.buf.remove(self.cursor);
+            self.buf.remove(self.byte_index(self.cursor));
         }
         self.preferred_col = None;
     }
 
     fn delete(&mut self) {
         if self.cursor < self.buf.chars().count() {
-            self.buf.remove(self.cursor);
+            self.buf.remove(self.byte_index(self.cursor));
         }
         self.preferred_col = None;
     }
@@ -3177,6 +3184,17 @@ impl Sink for TuiSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_edits_unicode() {
+        let mut input = Input::default();
+        input.paste("App — Plan → done".as_bytes());
+        input.move_left();
+        input.backspace();
+        input.delete();
+        input.insert('!');
+        assert_eq!(input.buf(), "App — Plan → do!");
+    }
 
     #[test]
     fn slash_compact_small_session_shows_notice() {
