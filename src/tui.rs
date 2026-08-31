@@ -1859,13 +1859,17 @@ impl Tui {
             && window > 0
         {
             let percent = self.live_in.saturating_mul(100) / window;
-            segs.push(format!(
-                "ctx {}/{} ({percent}%)",
-                tok(self.live_in),
-                tok(window)
-            ));
+            if self.cols <= 60 {
+                segs.push(format!("{percent}%"));
+            } else {
+                segs.push(format!(
+                    "{}/{} ({percent}%)",
+                    tok(self.live_in),
+                    tok(window)
+                ));
+            }
         }
-        if self.live_cached_in > 0 {
+        if self.cols > 60 && self.live_cached_in > 0 {
             let percent = self
                 .live_cached_in
                 .saturating_mul(100)
@@ -1873,11 +1877,9 @@ impl Tui {
                 .unwrap_or(0);
             segs.push(format!("cache {} ({percent}%)", tok(self.live_cached_in)));
         }
-        segs.push(format!(
-            "session ↑{} ↓{}",
-            tok(self.sess_in),
-            tok(self.sess_out)
-        ));
+        if self.cols > 60 {
+            segs.push(format!("↑{} ↓{}", tok(self.sess_in), tok(self.sess_out)));
+        }
         if let Some(extra) = scroll_hint {
             segs.push(extra.to_string());
         }
@@ -1929,7 +1931,9 @@ impl Tui {
             }
             rows.push(picker_divider(width));
         }
-        rows.push(String::new());
+        if self.cols > 60 {
+            rows.push(String::new());
+        }
         rows.push(self.hint_line(scroll_hint));
         (rows, vis_cursor_row, cursor_col)
     }
