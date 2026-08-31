@@ -342,7 +342,10 @@ pub fn list_sessions(dir: &str) -> Vec<SessionMeta> {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        let sidecar = read_session_sidecar(dir, &id, &path);
+        let metadata = std::fs::metadata(&path).ok();
+        let sidecar = metadata
+            .as_ref()
+            .and_then(|metadata| read_session_sidecar(dir, &id, metadata.len()));
         let (derived_title, derived_turns) = sidecar
             .as_ref()
             .map(|sidecar| (String::new(), sidecar.turns))
@@ -356,9 +359,8 @@ pub fn list_sessions(dir: &str) -> Vec<SessionMeta> {
             })
             .unwrap_or(derived_title);
         let turns = derived_turns;
-        let meta = std::fs::metadata(&path).ok();
-        let updated = meta
-            .and_then(|m| m.modified().ok())
+        let updated = metadata
+            .and_then(|metadata| metadata.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
@@ -567,11 +569,11 @@ fn write_session_sidecar(
     crate::atomic_write(&sidecar_path(dir, id), &bytes)
 }
 
-fn read_session_sidecar(dir: &str, id: &str, path: &Path) -> Option<SessionSidecar> {
+fn read_session_sidecar(dir: &str, id: &str, bytes: u64) -> Option<SessionSidecar> {
     let sidecar =
         serde_json::from_slice::<SessionSidecar>(&std::fs::read(sidecar_path(dir, id)).ok()?)
             .ok()?;
-    if std::fs::metadata(path).ok()?.len() != sidecar.bytes {
+    if bytes != sidecar.bytes {
         return None;
     }
     Some(sidecar)
