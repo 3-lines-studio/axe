@@ -77,6 +77,18 @@ pub const COMPACTION_SUFFIX: &str = "\n</summary>";
 /// message before it: the projection restarts from its summary plus the
 /// recent messages it retains. The entry list itself is never rewritten.
 pub fn context_messages(entries: &[Entry]) -> Vec<Message> {
+    if !entries
+        .iter()
+        .any(|entry| matches!(entry, Entry::Compaction { .. }))
+    {
+        return entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Message { message } => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+    }
     let original_task = original_task(entries);
     let workspace = workspace_state(entries);
     let mut out: Vec<Message> = Vec::new();
