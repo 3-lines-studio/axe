@@ -3292,6 +3292,7 @@ mod tests {
 
         struct SeqProvider {
             responses: RefCell<VecDeque<crate::Response>>,
+            started: mpsc::Sender<()>,
         }
         impl crate::Provider for SeqProvider {
             fn complete(&self, _req: &crate::Request) -> Result<crate::Response, crate::Error> {
@@ -3308,6 +3309,7 @@ mod tests {
             ) -> crate::StreamHandle {
                 let (tx, rx) = mpsc::channel();
                 let resp = self.complete(_req).expect("no fake response");
+                let _ = self.started.send(());
                 let thread = std::thread::spawn(move || {
                     if !resp.message.content.is_empty() {
                         let _ = tx.send(crate::StreamEvent::Content(resp.message.content.clone()));
@@ -3346,6 +3348,7 @@ mod tests {
         }];
 
         let bash_tool = crate::tools::bash("");
+        let (started_tx, started_rx) = mpsc::channel();
         let p = SeqProvider {
             responses: RefCell::new(VecDeque::from([
                 crate::Response {
@@ -3373,6 +3376,7 @@ mod tests {
                     stop_reason: String::new(),
                 },
             ])),
+            started: started_tx,
         };
 
         let (tx, rx) = mpsc::channel::<TurnEvent>();
@@ -3408,7 +3412,7 @@ mod tests {
                 compact,
             });
         });
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        started_rx.recv().unwrap();
         tui.input.buf = "continue".into();
         tui.steer();
         let _ = worker.join();
