@@ -929,9 +929,6 @@ impl Tui {
         self.turn_start = Instant::now();
         self.activity = Activity::Thinking;
         self.cur_text = None;
-        self.live_in = 0;
-        self.live_out = 0;
-        self.live_cached_in = 0;
         let cancel = self.cancel.clone();
         let provider = OpenAI::new(self.cfg.base.clone(), self.cfg.api_key.clone());
         let model = self.cfg.model.clone();
@@ -1003,9 +1000,11 @@ impl Tui {
                                     output,
                                     cached_input,
                                 }) => {
-                                    self.live_in = input;
+                                    if input > 0 {
+                                        self.live_in = input;
+                                        self.live_cached_in = cached_input;
+                                    }
                                     self.live_out = output;
-                                    self.live_cached_in = cached_input;
                                 }
                                 Ok(next) => {
                                     deferred = Some(next);
@@ -1089,9 +1088,11 @@ impl Tui {
                         output,
                         cached_input,
                     } => {
-                        self.live_in = input;
+                        if input > 0 {
+                            self.live_in = input;
+                            self.live_cached_in = cached_input;
+                        }
                         self.live_out = output;
-                        self.live_cached_in = cached_input;
                     }
                     TurnEvent::Notice(text) => {
                         self.flush_tools();
