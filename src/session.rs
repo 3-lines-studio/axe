@@ -7,7 +7,7 @@
 
 use crate::{Message, Provider, Request};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -138,7 +138,7 @@ struct WorkspaceArgs<'a> {
 }
 
 fn workspace_state(entries: &[Entry]) -> String {
-    let mut calls = BTreeMap::new();
+    let mut calls = HashMap::new();
     let mut read = Vec::new();
     let mut modified = Vec::new();
     let mut commands = VecDeque::with_capacity(8);
