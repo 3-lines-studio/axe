@@ -262,7 +262,10 @@ pub fn save_live(dir: &str, entries: &[Entry]) -> std::io::Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
-    write_entries(&live_path(dir), entries)
+    let path = live_path(dir);
+    write_entries(&path, entries)?;
+    let _ = write_live_sidecar(dir, &path, entries);
+    Ok(())
 }
 
 pub fn append_live(dir: &str, entries: &[Entry]) -> std::io::Result<()> {
@@ -272,7 +275,9 @@ pub fn append_live(dir: &str, entries: &[Entry]) -> std::io::Result<()> {
     }
     let path = live_path(dir);
     if !path.exists() {
-        return write_entries(&path, entries);
+        write_entries(&path, entries)?;
+        let _ = write_live_sidecar(dir, &path, entries);
+        return Ok(());
     }
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -302,6 +307,8 @@ pub fn append_live(dir: &str, entries: &[Entry]) -> std::io::Result<()> {
             file.set_len(complete)?;
         }
     }
+    let old_bytes = file.metadata()?.len();
+    let mut sidecar = read_live_sidecar(dir, old_bytes);
     file.seek(std::io::SeekFrom::End(0))?;
     {
         let mut out = std::io::BufWriter::new(&mut file);
@@ -311,7 +318,13 @@ pub fn append_live(dir: &str, entries: &[Entry]) -> std::io::Result<()> {
         }
         out.flush()?;
     }
-    file.sync_all()
+    file.sync_all()?;
+    if let Some(sidecar) = &mut sidecar {
+        update_sidecar(sidecar, entries);
+        sidecar.bytes = file.metadata()?.len();
+        let _ = write_live_sidecar_value(dir, sidecar);
+    }
+    Ok(())
 }
 
 fn resume_id_path(dir: &str) -> PathBuf {
@@ -331,6 +344,7 @@ pub fn clear_resume_id(dir: &str) {
 
 pub fn discard_live(dir: &str) {
     let _ = std::fs::remove_file(live_path(dir));
+    let _ = std::fs::remove_file(live_sidecar_path(dir));
     let _ = std::fs::remove_file(Path::new(dir).join("session.title"));
     clear_resume_id(dir);
 }
@@ -367,6 +381,7 @@ pub fn continue_archived(dir: &str, id: &str, entries: &[Entry]) -> std::io::Res
     let _ = write_session_sidecar(dir, id, &path, title.trim(), entries);
     let _ = std::fs::remove_file(&live_title);
     let _ = std::fs::remove_file(live_path(dir));
+    let _ = std::fs::remove_file(live_sidecar_path(dir));
     clear_resume_id(dir);
     Ok(true)
 }
@@ -521,17 +536,26 @@ pub fn load_session(path: &Path) -> Vec<Entry> {
 }
 
 pub fn archive_live(dir: &str) -> Option<String> {
-    let entries = read_entries(&live_path(dir));
-    if entries.is_empty() {
-        return None;
-    }
+    let path = live_path(dir);
+    let bytes = std::fs::metadata(&path).ok()?.len();
+    let live_sidecar = read_live_sidecar(dir, bytes);
     if let Some(id) = load_resume_id(dir) {
+        let entries = read_entries(&path);
         match continue_archived(dir, &id, &entries) {
             Ok(true) => return Some(id),
             Ok(false) => {}
             Err(_) => return None,
         }
     }
+    let entries = if live_sidecar.is_none() {
+        let entries = read_entries(&path);
+        if entries.is_empty() {
+            return None;
+        }
+        Some(entries)
+    } else {
+        None
+    };
     let store = store_dir(dir);
     let _ = std::fs::create_dir_all(&store);
     let base = format!("{}", now_ms());
@@ -543,17 +567,22 @@ pub fn archive_live(dir: &str) -> Option<String> {
         dest = store.join(format!("{id}.jsonl"));
         n += 1;
     }
-    if std::fs::rename(live_path(dir), &dest).is_err() {
+    if std::fs::rename(&path, &dest).is_err() {
         return None;
     }
     let live_title_path = Path::new(dir).join("session.title");
-    let title = std::fs::read_to_string(&live_title_path)
+    let legacy_title = std::fs::read_to_string(&live_title_path)
         .ok()
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| title_from_entries(&entries));
-    let _ = write_session_sidecar(dir, &id, &dest, &title, &entries);
+        .map(|title| title.trim().to_string())
+        .filter(|title| !title.is_empty());
+    let mut sidecar = live_sidecar
+        .unwrap_or_else(|| metadata_from_entries(entries.as_deref().unwrap_or_default(), bytes));
+    if let Some(title) = legacy_title {
+        sidecar.title = title;
+    }
+    let _ = write_session_sidecar_value(dir, &id, &sidecar);
     let _ = std::fs::remove_file(live_title_path);
+    let _ = std::fs::remove_file(live_sidecar_path(dir));
     clear_resume_id(dir);
     Some(id)
 }
@@ -582,6 +611,60 @@ struct SessionSidecar {
 
 fn sidecar_path(dir: &str, id: &str) -> PathBuf {
     store_dir(dir).join(format!("{id}.meta"))
+}
+
+fn live_sidecar_path(dir: &str) -> PathBuf {
+    Path::new(dir).join("session.meta")
+}
+
+fn metadata_from_entries(entries: &[Entry], bytes: u64) -> SessionSidecar {
+    let mut sidecar = SessionSidecar {
+        title: "Untitled session".into(),
+        turns: 0,
+        bytes,
+    };
+    update_sidecar(&mut sidecar, entries);
+    sidecar
+}
+
+fn update_sidecar(sidecar: &mut SessionSidecar, entries: &[Entry]) {
+    for entry in entries {
+        match entry {
+            Entry::Message { message } if message.role == "user" => {
+                if sidecar.title == "Untitled session" && !message.content.is_empty() {
+                    sidecar.title = first_words(&message.content, 8);
+                }
+                sidecar.turns += 1;
+            }
+            Entry::Compaction {
+                summary, retained, ..
+            } => {
+                sidecar.title = first_words(
+                    &format!("{COMPACTION_PREFIX}{summary}{COMPACTION_SUFFIX}"),
+                    8,
+                );
+                sidecar.turns = 1 + retained
+                    .iter()
+                    .filter(|message| message.role == "user")
+                    .count();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn write_live_sidecar(dir: &str, path: &Path, entries: &[Entry]) -> std::io::Result<()> {
+    let sidecar = metadata_from_entries(entries, std::fs::metadata(path)?.len());
+    write_live_sidecar_value(dir, &sidecar)
+}
+
+fn write_live_sidecar_value(dir: &str, sidecar: &SessionSidecar) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(sidecar)?;
+    crate::atomic_write(&live_sidecar_path(dir), &bytes)
+}
+
+fn read_live_sidecar(dir: &str, bytes: u64) -> Option<SessionSidecar> {
+    read_sidecar(&live_sidecar_path(dir), bytes)
 }
 
 fn entry_turns(entries: &[Entry]) -> usize {
@@ -613,14 +696,24 @@ fn write_session_sidecar(
         turns: entry_turns(entries),
         bytes: std::fs::metadata(path)?.len(),
     };
-    let bytes = serde_json::to_vec(&sidecar)?;
+    write_session_sidecar_value(dir, id, &sidecar)
+}
+
+fn write_session_sidecar_value(
+    dir: &str,
+    id: &str,
+    sidecar: &SessionSidecar,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(sidecar)?;
     crate::atomic_write(&sidecar_path(dir, id), &bytes)
 }
 
 fn read_session_sidecar(dir: &str, id: &str, bytes: u64) -> Option<SessionSidecar> {
-    let sidecar =
-        serde_json::from_slice::<SessionSidecar>(&std::fs::read(sidecar_path(dir, id)).ok()?)
-            .ok()?;
+    read_sidecar(&sidecar_path(dir, id), bytes)
+}
+
+fn read_sidecar(path: &Path, bytes: u64) -> Option<SessionSidecar> {
+    let sidecar = serde_json::from_slice::<SessionSidecar>(&std::fs::read(path).ok()?).ok()?;
     if bytes != sidecar.bytes {
         return None;
     }
@@ -1159,6 +1252,41 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1].content, "second");
         assert!(!live_path(d).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn live_sidecar_tracks_appends_and_falls_back_when_stale() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("axe-live-meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        let first = Entry::Message {
+            message: message("user", "first title"),
+        };
+        let second = Entry::Message {
+            message: message("user", "second"),
+        };
+        save_live(d, std::slice::from_ref(&first)).unwrap();
+        append_live(d, std::slice::from_ref(&second)).unwrap();
+        let id = archive_live(d).unwrap();
+        let sessions = list_sessions(d);
+        assert_eq!(sessions[0].id, id);
+        assert_eq!(sessions[0].title, "first title");
+        assert_eq!(sessions[0].turns, 2);
+        save_live(d, std::slice::from_ref(&first)).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(live_path(d))
+            .unwrap();
+        serde_json::to_writer(&mut file, &second).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_all().unwrap();
+        archive_live(d).unwrap();
+        let sessions = list_sessions(d);
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().all(|session| session.turns == 2));
         std::fs::remove_dir_all(&dir).ok();
     }
 
