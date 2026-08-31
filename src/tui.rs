@@ -43,7 +43,6 @@ pub struct TuiConfig {
     pub resume: Option<String>,
     /// Model context window in tokens; unset means the model's default applies.
     pub context_window: Option<usize>,
-    pub compaction_threshold: Option<usize>,
 }
 
 enum Entry {
@@ -812,11 +811,10 @@ impl Tui {
         if overflow || self.compacting {
             return;
         }
-        let threshold = self.cfg.compaction_threshold.or_else(|| {
-            self.cfg
-                .context_window
-                .map(|window| window.saturating_sub(16384))
-        });
+        let threshold = self
+            .cfg
+            .context_window
+            .map(|window| window.saturating_sub(16384));
         if let Some(threshold) = threshold
             && session::latest_context_tokens(&entries).is_some_and(|tokens| tokens > threshold)
         {
@@ -888,17 +886,16 @@ impl Tui {
         let system = self.cfg.system.clone();
         let dir = self.cfg.dir.clone();
         let tools = build_tools(&dir);
-        let compaction_threshold = self.cfg.compaction_threshold.or_else(|| {
-            self.cfg
-                .context_window
-                .map(|window| window.saturating_sub(16384))
-        });
+        let threshold = self
+            .cfg
+            .context_window
+            .map(|window| window.saturating_sub(16384));
         std::thread::spawn(move || {
             let end = {
                 let mut sink = TuiSink {
                     tx: &tx,
                     steer: steer_rx,
-                    compaction_threshold,
+                    threshold,
                 };
                 run::run_stream(
                     &provider,
@@ -3040,7 +3037,7 @@ fn tool_label(call: &ToolCall, running: bool) -> String {
 struct TuiSink<'a> {
     tx: &'a Sender<TurnEvent>,
     steer: Receiver<String>,
-    compaction_threshold: Option<usize>,
+    threshold: Option<usize>,
 }
 
 impl Sink for TuiSink<'_> {
@@ -3079,7 +3076,7 @@ impl Sink for TuiSink<'_> {
     }
 
     fn should_compact(&mut self, input: usize, output: usize) -> bool {
-        self.compaction_threshold
+        self.threshold
             .is_some_and(|threshold| input.saturating_add(output) > threshold)
     }
 
@@ -3106,7 +3103,6 @@ mod tests {
             api_key: "k".into(),
             resume: None,
             context_window: None,
-            compaction_threshold: None,
         };
         let mut tui = Tui::new(cfg);
         tui.slash("compact");
@@ -3133,7 +3129,6 @@ mod tests {
             api_key: "k".into(),
             resume: None,
             context_window: None,
-            compaction_threshold: None,
         };
         let mut tui = Tui::new(cfg);
         let (tx, rx) = std::sync::mpsc::channel::<TurnEvent>();
@@ -3243,7 +3238,6 @@ mod tests {
             api_key: "k".into(),
             resume: None,
             context_window: None,
-            compaction_threshold: None,
         };
         let mut tui = Tui::new(cfg);
         tui.entries.clear();
@@ -3300,7 +3294,7 @@ mod tests {
             let mut sink = TuiSink {
                 tx: &tx,
                 steer: steer_rx,
-                compaction_threshold: None,
+                threshold: None,
             };
             let end = run::run_stream(&p, &opts, &msgs, &cancel, &mut sink);
             let (err, cancelled, compact) = match end.outcome {

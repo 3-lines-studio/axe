@@ -22,7 +22,6 @@ struct FileConfig {
     model: String,
     base: String,
     context_window: Option<usize>,
-    compaction_threshold: Option<usize>,
 }
 
 fn main() {
@@ -61,7 +60,6 @@ fn main() {
             api_key: api_key(&fc),
             resume: cfg.resume.clone(),
             context_window: fc.context_window,
-            compaction_threshold: fc.compaction_threshold,
         };
         if let Err(e) = axe::tui::run(tui_cfg) {
             eprintln!("error: {e}");
@@ -185,7 +183,7 @@ fn usage() {
 struct CliSink {
     input: usize,
     output: usize,
-    compaction_threshold: Option<usize>,
+    threshold: Option<usize>,
 }
 
 impl Sink for CliSink {
@@ -205,7 +203,7 @@ impl Sink for CliSink {
     }
 
     fn should_compact(&mut self, input: usize, output: usize) -> bool {
-        self.compaction_threshold
+        self.threshold
             .is_some_and(|threshold| input.saturating_add(output) > threshold)
     }
 }
@@ -224,9 +222,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     let mut sink = CliSink {
         input: 0,
         output: 0,
-        compaction_threshold: fc
-            .compaction_threshold
-            .or_else(|| fc.context_window.map(|window| window.saturating_sub(16384))),
+        threshold: fc.context_window.map(|window| window.saturating_sub(16384)),
     };
     let end = run::run_stream(
         &provider,
@@ -359,7 +355,6 @@ fn load_config() -> FileConfig {
         model: String::new(),
         base: String::new(),
         context_window: None,
-        compaction_threshold: None,
     };
     let Some(dir) = config_dir() else {
         return c;
@@ -384,7 +379,6 @@ fn load_config() -> FileConfig {
             "model" => c.model = val,
             "base" => c.base = val,
             "context_window" => c.context_window = val.parse().ok(),
-            "compaction_threshold" => c.compaction_threshold = val.parse().ok(),
             _ => {}
         }
     }
@@ -535,7 +529,6 @@ mod tests {
             model: String::new(),
             base: String::new(),
             context_window: None,
-            compaction_threshold: None,
         };
         let tokens = [
             "-base",
