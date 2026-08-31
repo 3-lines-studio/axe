@@ -1866,14 +1866,6 @@ impl Tui {
                 ));
             }
         }
-        if self.cols > 60 && self.live_cached_in > 0 {
-            let percent = self
-                .live_cached_in
-                .saturating_mul(100)
-                .checked_div(self.live_in)
-                .unwrap_or(0);
-            segs.push(format!("cache {} ({percent}%)", tok(self.live_cached_in)));
-        }
         if self.cols > 60 {
             segs.push(format!("↑{} ↓{}", tok(self.sess_in), tok(self.sess_out)));
         }
