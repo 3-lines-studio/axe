@@ -11,13 +11,23 @@ Axe includes:
 
 It has no plugins, external tools, skills, web fetcher, sidecar, or TUI framework.
 
-## Build
+## Install
+
+Download the latest release for Linux or macOS:
+
+```sh
+curl -fsSL https://github.com/3-lines-studio/axe/releases/latest/download/install.sh | sh
+```
+
+This installs `axe` to `~/.local/bin`. Set `AXE_PREFIX` to install elsewhere. Releases support Linux on x86_64 and aarch64, and macOS on Apple silicon.
+
+Build from source with nightly Rust and the `rust-src` component:
 
 ```sh
 cargo +nightly build --release --config 'build.rustflags=["-Cforce-unwind-tables=no","-Cllvm-args=-enable-machine-outliner=always"]'
 ```
 
-Nightly Rust and the `rust-src` component are required. Axe loads system libcurl at runtime.
+Axe loads system libcurl at runtime.
 
 ## Use
 
@@ -36,9 +46,24 @@ Use another OpenAI-compatible endpoint:
 axe --base http://localhost:11434/v1 --model qwen3
 ```
 
-The TUI supports streamed Markdown, tool status, file completion, session resume, rewind, and compaction. Run `/help` for its commands. One-shot mode resumes a named session with `--resume last` or `--resume ID` and continues after compaction when `context_window` is set.
+Flags also accept a single dash. Run `axe --help` for the full list. If standard input is not a terminal and no prompt is given, Axe reads the prompt from standard input.
 
-Axe stores config and project-scoped sessions under `~/.config/axe` or `$XDG_CONFIG_HOME/axe`. Extra system instructions go in `SYSTEM.md` there.
+The TUI supports streamed Markdown, tool status, file completion, session resume, rewind, and compaction. Run `/help` in the TUI for its commands. Use `axe --resume` or `axe -r` to open the session picker. One-shot mode requires `--resume last` or `--resume ID`.
+
+## Config
+
+Axe reads `~/.config/axe/config`, or `$XDG_CONFIG_HOME/axe/config` when `XDG_CONFIG_HOME` is set:
+
+```ini
+api_key = "..."
+model = "gpt-4.1-mini"
+base = "https://api.openai.com/v1"
+context_window = 128000
+```
+
+`OPENAI_API_KEY` overrides `api_key`. The command-line `--model` and `--base` flags override the file. Set `context_window` to enable automatic compaction before the configured limit. Extra system instructions go in `SYSTEM.md` beside the config file; `--system` replaces the full built-in system prompt for that run.
+
+Sessions are scoped by project and stored under the same Axe config directory. Starting a fresh TUI archives the prior live session for that project.
 
 ## Test
 

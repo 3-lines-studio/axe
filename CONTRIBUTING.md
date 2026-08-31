@@ -40,7 +40,7 @@ Set `PREFIX` to install elsewhere.
 
 ## Project rules
 
-- Release binary stays under 1 MB (currently ~435 KB).
+- Release binary stays under 1 MB (currently ~458 KB).
 - Dependencies are exactly `serde`, `serde_json`, `libc`. No new deps
   without asking. No compile-time curl.
 - Extra instructions live in `~/.config/axe/SYSTEM.md`. No plugin system,
