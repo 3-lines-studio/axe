@@ -265,6 +265,55 @@ pub fn save_live(dir: &str, entries: &[Entry]) -> std::io::Result<()> {
     write_entries(&live_path(dir), entries)
 }
 
+pub fn append_live(dir: &str, entries: &[Entry]) -> std::io::Result<()> {
+    use std::io::{Read, Seek, Write};
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let path = live_path(dir);
+    if !path.exists() {
+        return write_entries(&path, entries);
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let len = file.metadata()?.len();
+    if len > 0 {
+        file.seek(std::io::SeekFrom::End(-1))?;
+        let mut last = [0];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            let mut end = len;
+            let mut buffer = [0; 8192];
+            let complete = loop {
+                let start = end.saturating_sub(buffer.len() as u64);
+                let size = (end - start) as usize;
+                file.seek(std::io::SeekFrom::Start(start))?;
+                file.read_exact(&mut buffer[..size])?;
+                if let Some(index) = buffer[..size].iter().rposition(|byte| *byte == b'\n') {
+                    break start + index as u64 + 1;
+                }
+                if start == 0 {
+                    break 0;
+                }
+                end = start;
+            };
+            file.set_len(complete)?;
+        }
+    }
+    file.seek(std::io::SeekFrom::End(0))?;
+    {
+        let mut out = std::io::BufWriter::new(&mut file);
+        for entry in entries {
+            serde_json::to_writer(&mut out, entry)?;
+            out.write_all(b"\n")?;
+        }
+        out.flush()?;
+    }
+    file.sync_all()
+}
+
 fn resume_id_path(dir: &str) -> PathBuf {
     Path::new(dir).join("session.resume_id")
 }
@@ -1111,6 +1160,34 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1].content, "second");
         assert!(!live_path(d).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn append_live_recovers_partial_tail() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("axe-append-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        let first = Entry::Message {
+            message: message("user", "first"),
+        };
+        let second = Entry::Message {
+            message: message("user", "second"),
+        };
+        save_live(d, std::slice::from_ref(&first)).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(live_path(d))
+            .unwrap();
+        file.write_all(br#"{"type":"message""#).unwrap();
+        file.sync_all().unwrap();
+        append_live(d, std::slice::from_ref(&second)).unwrap();
+        assert_eq!(load_live(d), vec![first, second.clone()]);
+        std::fs::write(live_path(d), []).unwrap();
+        append_live(d, std::slice::from_ref(&second)).unwrap();
+        assert_eq!(load_live(d), vec![second]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

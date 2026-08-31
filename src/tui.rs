@@ -799,6 +799,7 @@ impl Tui {
         resume_after_compaction: bool,
     ) {
         let mut entries = session::load_live(&self.cfg.session_dir);
+        let append_start = entries.len();
         let projected_len = session::context_messages(&entries).len();
         let new_msgs: Vec<Message> = if messages.len() > projected_len {
             messages[projected_len..].to_vec()
@@ -817,7 +818,7 @@ impl Tui {
                 context_output: self.live_out,
             });
         }
-        if let Err(e) = session::save_live(&self.cfg.session_dir, &entries) {
+        if let Err(e) = session::append_live(&self.cfg.session_dir, &entries[append_start..]) {
             self.entries
                 .push(Entry::Notice(format!("error: save session: {e}")));
             return;
@@ -873,12 +874,12 @@ impl Tui {
         // Append-only: the summary entry joins the existing entries; the
         // context projection drops what it supersedes.
         let mut entries = session::load_live(&self.cfg.session_dir);
-        entries.push(entry);
-        if let Err(e) = session::save_live(&self.cfg.session_dir, &entries) {
+        if let Err(e) = session::append_live(&self.cfg.session_dir, std::slice::from_ref(&entry)) {
             self.entries
                 .push(Entry::Notice(format!("error: save session: {e}")));
             return;
         }
+        entries.push(entry);
         self.msgs = session::context_messages(&entries);
         self.live_in = 0;
         self.live_out = 0;
