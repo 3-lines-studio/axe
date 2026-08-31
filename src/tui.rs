@@ -940,10 +940,37 @@ impl Tui {
         let mut any = false;
         let mut cur = self.cur_text;
         if let Some(rx) = self.rx.take() {
-            while let Ok(ev) = rx.try_recv() {
+            let mut deferred = None;
+            loop {
+                let ev = match deferred.take() {
+                    Some(ev) => ev,
+                    None => match rx.try_recv() {
+                        Ok(ev) => ev,
+                        Err(_) => break,
+                    },
+                };
                 any = true;
                 match ev {
-                    TurnEvent::AssistantDelta(delta) => {
+                    TurnEvent::AssistantDelta(mut delta) => {
+                        loop {
+                            match rx.try_recv() {
+                                Ok(TurnEvent::AssistantDelta(next)) => delta.push_str(&next),
+                                Ok(TurnEvent::Tokens {
+                                    input,
+                                    output,
+                                    cached_input,
+                                }) => {
+                                    self.live_in = input;
+                                    self.live_out = output;
+                                    self.live_cached_in = cached_input;
+                                }
+                                Ok(next) => {
+                                    deferred = Some(next);
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
                         self.flush_tools();
                         if self.md.is_none() {
                             let pending = Rc::new(RefCell::new(Vec::new()));
@@ -3188,6 +3215,11 @@ mod tests {
             tx.send(ev).unwrap();
         };
         send(TurnEvent::AssistantDelta("initial ".into()));
+        send(TurnEvent::Tokens {
+            input: 10,
+            output: 1,
+            cached_input: 5,
+        });
         send(TurnEvent::AssistantDelta("answer".into()));
         send(TurnEvent::AssistantDone);
         send(TurnEvent::ToolStart {
