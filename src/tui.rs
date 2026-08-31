@@ -1688,7 +1688,7 @@ impl Tui {
 
     fn paint_inline(&mut self, term: &mut Terminal, resized: bool) {
         let out = term.out();
-        if !self.painted_once || resized {
+        if !self.painted_once {
             let _ = out.write_all(term::clear_display().as_bytes());
             self.painted_once = true;
             self.streamed.clear();
@@ -1700,15 +1700,12 @@ impl Tui {
         let capacity = rows.saturating_sub(chrome.len()).max(1);
         if std::mem::take(&mut self.reprint) {
             if content.len() > capacity {
-                // Feed the whole transcript through the bottom row so the
-                // terminal scrollback keeps everything above the viewport.
                 for line in &content {
                     let _ = write!(out, "{}", term::move_to(rows as u16, 1));
                     let _ = writeln!(out, "{line}");
                 }
                 self.streamed = content.clone();
                 self.last_capacity = capacity;
-                // Scrolling shifted the chrome rows; force a repaint below.
                 self.last_chrome = None;
             } else {
                 self.repaint_tail(out, &content, capacity);
