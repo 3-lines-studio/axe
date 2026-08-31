@@ -2,6 +2,7 @@
 
 use crate::{Tool, new_tool, new_tool_with_progress};
 use serde::Deserialize;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 
 const MAX_OUTPUT: usize = 16 * 1024;
@@ -119,6 +120,37 @@ impl Drop for PgidGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn child_pidfd(pid: u32) -> Option<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
+    if fd < 0 {
+        None
+    } else {
+        Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn child_pidfd(_: u32) -> Option<OwnedFd> {
+    None
+}
+
+fn wait_for_child(pidfd: Option<&OwnedFd>, timeout: std::time::Duration) {
+    let Some(pidfd) = pidfd else {
+        std::thread::sleep(timeout.min(std::time::Duration::from_millis(1)));
+        return;
+    };
+    let mut fd = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+    unsafe {
+        libc::poll(&mut fd, 1, millis.max(1));
+    }
+}
+
 pub fn bash(dir: &str) -> Tool {
     let dir = dir.to_string();
     let mut t = new_tool_with_progress(
@@ -172,6 +204,7 @@ pub fn bash(dir: &str) -> Tool {
                 return "error: too many live bash processes".to_string();
             }
             let _guard = PgidGuard(pgid);
+            let pidfd = child_pidfd(child.id());
             let mut exit: Option<std::process::ExitStatus> = None;
             let mut timed_out = false;
             let deadline = a
@@ -210,7 +243,13 @@ pub fn bash(dir: &str) -> Tool {
                                 progress(&sanitize(&tail));
                             }
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        let now = std::time::Instant::now();
+                        let progress_wait = std::time::Duration::from_millis(100)
+                            .saturating_sub(last_progress.elapsed());
+                        let timeout_wait = deadline
+                            .map(|deadline| deadline.saturating_duration_since(now))
+                            .unwrap_or(progress_wait);
+                        wait_for_child(pidfd.as_ref(), progress_wait.min(timeout_wait));
                     }
                     Err(e) => {
                         unsafe {
