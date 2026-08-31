@@ -129,6 +129,14 @@ fn original_task(entries: &[Entry]) -> &str {
         .unwrap_or("")
 }
 
+#[derive(Deserialize)]
+struct WorkspaceArgs<'a> {
+    #[serde(borrow)]
+    path: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    command: Option<std::borrow::Cow<'a, str>>,
+}
+
 fn workspace_state(entries: &[Entry]) -> String {
     let mut calls = BTreeMap::new();
     let mut read = BTreeSet::new();
@@ -140,16 +148,14 @@ fn workspace_state(entries: &[Entry]) -> String {
         };
         if message.role == "assistant" {
             for call in &message.tool_calls {
-                let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments).ok();
+                let arguments = serde_json::from_str::<WorkspaceArgs>(&call.arguments).ok();
                 let path = arguments
                     .as_ref()
-                    .and_then(|value| value.get("path"))
-                    .and_then(|value| value.as_str())
+                    .and_then(|arguments| arguments.path.as_deref())
                     .map(str::to_string);
                 let command = arguments
                     .as_ref()
-                    .and_then(|value| value.get("command"))
-                    .and_then(|value| value.as_str())
+                    .and_then(|arguments| arguments.command.as_deref())
                     .map(str::to_string);
                 calls.insert(call.id.clone(), (call.name.clone(), path, command));
             }
