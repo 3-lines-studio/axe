@@ -7,7 +7,7 @@
 
 use crate::{Message, Provider, Request};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -139,8 +139,8 @@ struct WorkspaceArgs<'a> {
 
 fn workspace_state(entries: &[Entry]) -> String {
     let mut calls = BTreeMap::new();
-    let mut read = BTreeSet::new();
-    let mut modified = BTreeSet::new();
+    let mut read = Vec::new();
+    let mut modified = Vec::new();
     let mut commands = VecDeque::with_capacity(8);
     for entry in entries {
         let Entry::Message { message } = entry else {
@@ -186,17 +186,17 @@ fn workspace_state(entries: &[Entry]) -> String {
             continue;
         };
         match name.as_str() {
-            "read" => {
-                read.insert(path);
-            }
-            "write" | "edit" => {
-                modified.insert(path);
-            }
+            "read" => read.push(path),
+            "write" | "edit" => modified.push(path),
             _ => {}
         }
     }
-    let read = read.into_iter().collect::<Vec<_>>().join(", ");
-    let modified = modified.into_iter().collect::<Vec<_>>().join(", ");
+    read.sort_unstable();
+    read.dedup();
+    modified.sort_unstable();
+    modified.dedup();
+    let read = read.join(", ");
+    let modified = modified.join(", ");
     let commands = commands
         .into_iter()
         .map(|(command, content, failed)| {
