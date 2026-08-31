@@ -354,6 +354,26 @@ pub fn list_sessions(dir: &str) -> Vec<SessionMeta> {
     out
 }
 
+#[derive(Deserialize)]
+struct SummaryLine<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    message: Option<SummaryMessage<'a>>,
+    #[serde(borrow)]
+    summary: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    retained: Vec<SummaryMessage<'a>>,
+}
+
+#[derive(Deserialize)]
+struct SummaryMessage<'a> {
+    #[serde(borrow, alias = "Role")]
+    role: std::borrow::Cow<'a, str>,
+    #[serde(default, borrow, alias = "Content")]
+    content: std::borrow::Cow<'a, str>,
+}
+
 fn session_summary(path: &Path) -> (String, usize) {
     use std::io::BufRead;
     let Ok(file) = std::fs::File::open(path) else {
@@ -362,21 +382,30 @@ fn session_summary(path: &Path) -> (String, usize) {
     let mut title = String::new();
     let mut turns = 0;
     for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-        match parse_entry_line(&line) {
-            Some(Entry::Message { message }) if message.role == "user" => {
+        let Ok(entry) = serde_json::from_str::<SummaryLine>(&line) else {
+            continue;
+        };
+        match entry.kind.as_deref() {
+            Some("message") => {
+                let Some(message) = entry.message else {
+                    continue;
+                };
+                if message.role != "user" {
+                    continue;
+                }
                 if title.is_empty() && !message.content.is_empty() {
                     title = first_words(&message.content, 8);
                 }
                 turns += 1;
             }
-            Some(Entry::Compaction {
-                summary, retained, ..
-            }) => {
+            Some("compaction") => {
+                let summary = entry.summary.unwrap_or_default();
                 title = first_words(
                     &format!("{COMPACTION_PREFIX}{summary}{COMPACTION_SUFFIX}"),
                     8,
                 );
-                turns = 1 + retained
+                turns = 1 + entry
+                    .retained
                     .iter()
                     .filter(|message| message.role == "user")
                     .count();
@@ -788,6 +817,38 @@ mod tests {
             context_input,
             context_output,
         }
+    }
+
+    #[test]
+    fn session_summary_reads_minimal_fields() {
+        let dir = std::env::temp_dir().join(format!("axe-summary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let entries = vec![
+            Entry::Message {
+                message: message("user", "quoted \" title"),
+            },
+            Entry::Message {
+                message: message("assistant", "answer"),
+            },
+            Entry::Message {
+                message: message("user", "again"),
+            },
+        ];
+        write_entries(&path, &entries).unwrap();
+        assert_eq!(session_summary(&path), ("quoted \" title".into(), 2));
+        write_entries(
+            &path,
+            &[Entry::Compaction {
+                summary: "summary".into(),
+                tokens_before: 10,
+                timestamp: 1,
+                retained: vec![message("user", "recent")],
+            }],
+        )
+        .unwrap();
+        assert_eq!(session_summary(&path).1, 2);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
