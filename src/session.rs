@@ -165,7 +165,7 @@ fn workspace_state(entries: &[Entry]) -> String {
             continue;
         }
         let failed = message.content.trim_start().starts_with("error:");
-        let Some((name, path, command)) = calls.get(&message.tool_call_id) else {
+        let Some((name, path, command)) = calls.remove(&message.tool_call_id) else {
             continue;
         };
         if name == "bash" {
@@ -190,10 +190,10 @@ fn workspace_state(entries: &[Entry]) -> String {
         };
         match name.as_str() {
             "read" => {
-                read.insert(path.clone());
+                read.insert(path);
             }
             "write" | "edit" => {
-                modified.insert(path.clone());
+                modified.insert(path);
             }
             _ => {}
         }
