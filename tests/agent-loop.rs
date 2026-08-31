@@ -610,6 +610,76 @@ fn compact_generates_structured_summary() {
     assert!(last[0].content.contains("## Critical Context"));
 }
 
+#[test]
+fn compact_falls_back_when_a_small_model_cannot_follow_the_schema() {
+    let p = Fake {
+        responses: RefCell::new(VecDeque::from([
+            Response {
+                message: assistant("short summary"),
+                usage: Usage::default(),
+                stop_reason: String::new(),
+            },
+            Response {
+                message: assistant("still short"),
+                usage: Usage::default(),
+                stop_reason: String::new(),
+            },
+        ])),
+        ..Default::default()
+    };
+    let entries: Vec<axe::session::Entry> = (0..30)
+        .map(|i| axe::session::Entry::Message {
+            message: user(&format!("message {i} {}", "x".repeat(1000))),
+        })
+        .collect();
+    let (summary, _, retained) = axe::session::compact(&p, "small", &entries).expect("compact");
+    assert!(summary.contains("## Critical Context"));
+    assert!(summary.contains("still short"));
+    assert!(!retained.is_empty());
+}
+
+#[test]
+fn repeated_compaction_keeps_a_bounded_continuation_context() {
+    let structured = "## Goal\nkeep running\n## User Requirements\n- preserve task\n## Progress\n### Done\n- cycle\n### In Progress\n- work\n### Blocked\n- none\n## Key Decisions\n- none\n## Files\n- none\n## Commands and Results\n- none\n## Open Questions\n- none\n## Next Steps\n- continue\n## Critical Context\n- state";
+    let p = Fake {
+        responses: RefCell::new(
+            (0..5)
+                .map(|_| Response {
+                    message: assistant(structured),
+                    usage: Usage::default(),
+                    stop_reason: String::new(),
+                })
+                .collect::<VecDeque<_>>(),
+        ),
+        ..Default::default()
+    };
+    let mut entries = vec![axe::session::Entry::Message {
+        message: user("the original task must survive"),
+    }];
+    for cycle in 0..5 {
+        for turn in 0..10 {
+            entries.push(axe::session::Entry::Message {
+                message: user(&format!("cycle {cycle} turn {turn} {}", "x".repeat(500))),
+            });
+        }
+        let (summary, tokens_before, retained) =
+            axe::session::compact(&p, "small", &entries).expect("compact");
+        entries.push(axe::session::Entry::Compaction {
+            summary,
+            tokens_before,
+            timestamp: cycle,
+            retained,
+        });
+        let context = axe::session::context_messages(&entries);
+        assert!(
+            context[0]
+                .content
+                .contains("the original task must survive")
+        );
+        assert!(context.len() <= 3);
+    }
+}
+
 struct MidStreamFlaky {
     attempts: RefCell<usize>,
 }

@@ -7,6 +7,7 @@
 
 use crate::{Message, Provider, Request};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -76,6 +77,8 @@ pub const COMPACTION_SUFFIX: &str = "\n</summary>";
 /// message before it: the projection restarts from its summary plus the
 /// recent messages it retains. The entry list itself is never rewritten.
 pub fn context_messages(entries: &[Entry]) -> Vec<Message> {
+    let original_task = original_task(entries);
+    let workspace = workspace_state(entries);
     let mut out: Vec<Message> = Vec::new();
     for e in entries {
         match e {
@@ -86,7 +89,9 @@ pub fn context_messages(entries: &[Entry]) -> Vec<Message> {
                 out.clear();
                 out.push(Message {
                     role: "user".into(),
-                    content: format!("{COMPACTION_PREFIX}{summary}{COMPACTION_SUFFIX}"),
+                    content: format!(
+                        "{COMPACTION_PREFIX}{summary}\n\n## Authoritative Original Task\n{original_task}\n\n## Authoritative Workspace State\n{workspace}{COMPACTION_SUFFIX}"
+                    ),
                     tool_calls: Vec::new(),
                     tool_call_id: String::new(),
                 });
@@ -96,6 +101,110 @@ pub fn context_messages(entries: &[Entry]) -> Vec<Message> {
         }
     }
     out
+}
+
+fn original_task(entries: &[Entry]) -> &str {
+    entries
+        .iter()
+        .find_map(|entry| match entry {
+            Entry::Message { message }
+                if message.role == "user" && !message.content.starts_with(COMPACTION_PREFIX) =>
+            {
+                Some(message.content.as_str())
+            }
+            _ => None,
+        })
+        .unwrap_or("")
+}
+
+fn workspace_state(entries: &[Entry]) -> String {
+    let mut calls = BTreeMap::new();
+    let mut read = BTreeSet::new();
+    let mut modified = BTreeSet::new();
+    let mut commands = Vec::new();
+    for entry in entries {
+        let Entry::Message { message } = entry else {
+            continue;
+        };
+        if message.role == "assistant" {
+            for call in &message.tool_calls {
+                let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments).ok();
+                let path = arguments
+                    .as_ref()
+                    .and_then(|value| value.get("path"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                let command = arguments
+                    .as_ref()
+                    .and_then(|value| value.get("command"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                calls.insert(call.id.clone(), (call.name.clone(), path, command));
+            }
+            continue;
+        }
+        if message.role != "tool" {
+            continue;
+        }
+        let failed = message.content.trim_start().starts_with("error:");
+        let Some((name, path, command)) = calls.get(&message.tool_call_id) else {
+            continue;
+        };
+        if name == "bash" {
+            let result = if failed {
+                compact_observation(&message.content, 300)
+            } else if message.content.trim().is_empty() {
+                "success with no output".into()
+            } else {
+                compact_observation(&message.content, 300)
+            };
+            commands.push(format!(
+                "{} => {result}",
+                command.as_deref().unwrap_or("unknown command")
+            ));
+            continue;
+        }
+        if failed {
+            continue;
+        }
+        let Some(path) = path else {
+            continue;
+        };
+        match name.as_str() {
+            "read" => {
+                read.insert(path.clone());
+            }
+            "write" | "edit" => {
+                modified.insert(path.clone());
+            }
+            _ => {}
+        }
+    }
+    let read = read.into_iter().collect::<Vec<_>>().join(", ");
+    let modified = modified.into_iter().collect::<Vec<_>>().join(", ");
+    let commands = commands
+        .into_iter()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Files read: {}\nFiles modified: {}\nRecent commands and results:\n{}",
+        if read.is_empty() { "none" } else { &read },
+        if modified.is_empty() {
+            "none"
+        } else {
+            &modified
+        },
+        if commands.is_empty() {
+            "none"
+        } else {
+            &commands
+        }
+    )
 }
 
 fn parse_entry_line(line: &str) -> Option<Entry> {
@@ -391,6 +500,7 @@ fn split_last_turn(msgs: Vec<Message>) -> (Vec<Message>, Vec<Message>) {
 
 fn serialize_conversation(msgs: &[Message]) -> String {
     let mut parts = Vec::new();
+    let mut tools = BTreeMap::new();
     for m in msgs {
         match m.role.as_str() {
             "user" => parts.push(format!("[User]: {}", m.content)),
@@ -399,33 +509,47 @@ fn serialize_conversation(msgs: &[Message]) -> String {
                     parts.push(format!("[Assistant]: {}", m.content));
                 }
                 for c in &m.tool_calls {
-                    parts.push(format!("[Tool call]: {}({})", c.name, c.arguments));
+                    tools.insert(c.id.as_str(), c.name.as_str());
+                    parts.push(format!("[Tool call {}]: {}({})", c.id, c.name, c.arguments));
                 }
             }
             "tool" => {
-                let content = if m.content.len() > 4000 {
-                    let mut head_end = 2000;
-                    while !m.content.is_char_boundary(head_end) {
-                        head_end -= 1;
-                    }
-                    let mut tail_start = m.content.len() - 2000;
-                    while !m.content.is_char_boundary(tail_start) {
-                        tail_start += 1;
-                    }
-                    format!(
-                        "{}\n… [middle truncated] …\n{}",
-                        &m.content[..head_end],
-                        &m.content[tail_start..]
-                    )
+                let limit = if tools.get(m.tool_call_id.as_str()) == Some(&"read") {
+                    1200
                 } else {
-                    m.content.clone()
+                    4000
                 };
-                parts.push(format!("[Tool result for {}]: {}", m.tool_call_id, content));
+                let content = compact_observation(&m.content, limit);
+                parts.push(format!(
+                    "[Tool result {}; full result remains in session]: {}",
+                    m.tool_call_id, content
+                ));
             }
             _ => {}
         }
     }
     parts.join("\n\n")
+}
+
+fn compact_observation(content: &str, limit: usize) -> String {
+    if content.len() <= limit {
+        return content.to_string();
+    }
+    let half = limit / 2;
+    let mut head_end = half;
+    while !content.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = content.len() - half;
+    while !content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n… [{} bytes masked] …\n{}",
+        &content[..head_end],
+        tail_start.saturating_sub(head_end),
+        &content[tail_start..]
+    )
 }
 
 const SUMMARY_SYSTEM: &str = "You are a context summarization assistant. Read the conversation and produce a structured summary so another LLM can continue the work. Do NOT continue the conversation. Do NOT respond to questions in it. ONLY output the summary.";
@@ -472,6 +596,37 @@ fn valid_summary(summary: &str) -> bool {
             .all(|heading| summary.contains(heading))
 }
 
+fn fallback_summary(msgs: &[Message], candidate: &str) -> String {
+    let mut facts = Vec::new();
+    let mut size = 0;
+    for message in msgs.iter().rev() {
+        if message.content.is_empty() || !matches!(message.role.as_str(), "user" | "assistant") {
+            continue;
+        }
+        let available = 6000usize.saturating_sub(size);
+        if available < 200 {
+            break;
+        }
+        let content = compact_observation(&message.content, available.min(1200));
+        size += content.len();
+        facts.push(format!("- {}: {content}", message.role));
+    }
+    facts.reverse();
+    let candidate = candidate.trim();
+    let candidate = if candidate.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n- Model checkpoint: {}",
+            compact_observation(candidate, 1200)
+        )
+    };
+    format!(
+        "## Goal\n- Continue the original task\n## User Requirements\n- See original task and retained messages\n## Progress\n### Done\n- See critical context\n### In Progress\n- Continue from the latest retained state\n### Blocked\n- Unknown\n## Key Decisions\n- See critical context\n## Files\n- See deterministic workspace state\n## Commands and Results\n- See critical context\n## Open Questions\n- Re-evaluate from retained state\n## Next Steps\n- Continue from the latest retained state\n## Critical Context\n{}{candidate}",
+        facts.join("\n")
+    )
+}
+
 fn request_summary(
     provider: &impl Provider,
     model: &str,
@@ -513,20 +668,28 @@ pub fn compact(
         return Err("nothing to summarize".into());
     }
     let conversation = serialize_conversation(&to_summarize);
-    let mut summary = request_summary(provider, model, &conversation, None)?;
-    if !valid_summary(&summary) {
-        summary = request_summary(
+    let first = request_summary(provider, model, &conversation, None).unwrap_or_default();
+    let summary = if valid_summary(&first) {
+        first
+    } else {
+        let second = request_summary(
             provider,
             model,
             &conversation,
             Some(
                 "Your previous response was invalid. Return all required headings and substantive factual content.",
             ),
-        )?;
-    }
-    if !valid_summary(&summary) {
-        return Err("invalid compaction summary".into());
-    }
+        )
+        .unwrap_or_default();
+        if valid_summary(&second) {
+            second
+        } else {
+            fallback_summary(
+                &to_summarize,
+                if second.is_empty() { &first } else { &second },
+            )
+        }
+    };
     Ok((summary, tokens_before, retained))
 }
 
@@ -633,5 +796,67 @@ mod tests {
             },
         ];
         assert_eq!(latest_context_tokens(&entries), None);
+    }
+
+    #[test]
+    fn compacted_context_keeps_original_task_and_workspace_state() {
+        let mut read_call = message("assistant", "");
+        read_call.tool_calls.push(crate::ToolCall {
+            id: "read-1".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"src/session.rs"}"#.into(),
+        });
+        let mut read_result = message("tool", "contents");
+        read_result.tool_call_id = "read-1".into();
+        let mut bash_call = message("assistant", "");
+        bash_call.tool_calls.push(crate::ToolCall {
+            id: "bash-1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"cargo test"}"#.into(),
+        });
+        let mut bash_result = message("tool", "all tests passed");
+        bash_result.tool_call_id = "bash-1".into();
+        let entries = vec![
+            Entry::Message {
+                message: message("user", "Fix compaction exactly"),
+            },
+            Entry::Message { message: read_call },
+            Entry::Message {
+                message: read_result,
+            },
+            Entry::Message { message: bash_call },
+            Entry::Message {
+                message: bash_result,
+            },
+            Entry::Compaction {
+                summary: "summary".into(),
+                tokens_before: 100,
+                timestamp: 1,
+                retained: Vec::new(),
+            },
+        ];
+        let context = context_messages(&entries);
+        assert!(context[0].content.contains("Fix compaction exactly"));
+        assert!(context[0].content.contains("Files read: src/session.rs"));
+        assert!(
+            context[0]
+                .content
+                .contains("cargo test => all tests passed")
+        );
+    }
+
+    #[test]
+    fn old_read_observations_are_masked() {
+        let mut call = message("assistant", "");
+        call.tool_calls.push(crate::ToolCall {
+            id: "read-1".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"large"}"#.into(),
+        });
+        let mut result = message("tool", &"x".repeat(5000));
+        result.tool_call_id = "read-1".into();
+        let serialized = serialize_conversation(&[call, result]);
+        assert!(serialized.contains("bytes masked"));
+        assert!(serialized.len() < 2000);
     }
 }

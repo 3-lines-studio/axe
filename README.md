@@ -53,9 +53,11 @@ Run live model evals separately:
 OPENAI_API_KEY="..." make eval
 AXE_EVAL_MODEL=gpt-4.1 OPENAI_API_KEY="..." make eval
 python3 scripts/eval.py --bin target/release/axe --runs 3
+OPENAI_API_KEY="..." make eval-compaction
+AXE_EVAL_MODEL=gpt-4.1-mini AXE_EVAL_COMPACTION_CYCLES=10 OPENAI_API_KEY="..." make eval-compaction
 ```
 
-Evals use temporary projects and check filesystem state and test results. They cost money and can vary by model, so `make check` does not run them.
+The compaction eval checks required-fact recall and context size after every compaction cycle. Evals cost money and can vary by model, so `make check` does not run them.
 
 ## Bash
 
