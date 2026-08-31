@@ -24,6 +24,7 @@ parser.add_argument(
         "sleep",
         "history",
         "read-large",
+        "read-large-offset",
         "edit-large",
         "all",
     ),
@@ -92,6 +93,11 @@ class Handler(BaseHTTPRequestHandler):
             elif user_content == "Read large.":
                 arguments = json.dumps({"path": str(large_file), "offset": 1, "limit": 1})
                 tool = {"name": "read", "arguments": arguments}
+            elif user_content == "Read large offset.":
+                arguments = json.dumps(
+                    {"path": str(large_file), "offset": 4_999_999, "limit": 1}
+                )
+                tool = {"name": "read", "arguments": arguments}
             elif user_content == "Edit large.":
                 arguments = json.dumps(
                     {"path": "large.txt", "edits": [{"oldText": "old\n", "newText": "new\n"}]}
@@ -153,6 +159,7 @@ def run(binary, index, scenario):
         "sleep": "Run sleep.",
         "history": "Build history.",
         "read-large": "Read large.",
+        "read-large-offset": "Read large offset.",
         "edit-large": "Edit large.",
     }
     prompt = prompts[scenario]

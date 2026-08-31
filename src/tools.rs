@@ -496,6 +496,31 @@ pub fn read() -> Tool {
             let mut line = Vec::new();
             let mut output = String::new();
             let mut total = 0usize;
+            let mut skipped_partial = false;
+            while total < start {
+                let buf = match reader.fill_buf() {
+                    Ok(buf) => buf,
+                    Err(e) => return format!("error: {e}"),
+                };
+                if buf.is_empty() {
+                    total += usize::from(skipped_partial);
+                    break;
+                }
+                let mut consumed = buf.len();
+                for (index, byte) in buf.iter().enumerate() {
+                    if *byte == b'\n' {
+                        total += 1;
+                        skipped_partial = false;
+                        if total == start {
+                            consumed = index + 1;
+                            break;
+                        }
+                    } else {
+                        skipped_partial = true;
+                    }
+                }
+                reader.consume(consumed);
+            }
             let mut shown = 0usize;
             let mut overflow = false;
             let mut oversized = None;
