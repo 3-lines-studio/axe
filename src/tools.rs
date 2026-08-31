@@ -776,8 +776,9 @@ fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<String, S
         let old = old.as_ref();
         let (start, len) = match normalized.find(old) {
             Some(idx) => {
-                let n = normalized.matches(old).count();
-                if n > 1 {
+                let remaining = &normalized[idx + old.len()..];
+                if remaining.contains(old) {
+                    let n = 1 + remaining.matches(old).count();
                     return Err(duplicate_error(path, i, edits.len(), n));
                 }
                 (idx, old.len())

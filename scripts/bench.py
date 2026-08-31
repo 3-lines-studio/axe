@@ -26,6 +26,7 @@ parser.add_argument(
         "read-large",
         "read-large-offset",
         "edit-large",
+        "edit-large-end",
         "all",
     ),
     default="all"
@@ -98,7 +99,7 @@ class Handler(BaseHTTPRequestHandler):
                     {"path": str(large_file), "offset": 4_999_999, "limit": 1}
                 )
                 tool = {"name": "read", "arguments": arguments}
-            elif user_content == "Edit large.":
+            elif user_content in ("Edit large.", "Edit large end."):
                 arguments = json.dumps(
                     {"path": "large.txt", "edits": [{"oldText": "old\n", "newText": "new\n"}]}
                 )
@@ -161,11 +162,14 @@ def run(binary, index, scenario):
         "read-large": "Read large.",
         "read-large-offset": "Read large offset.",
         "edit-large": "Edit large.",
+        "edit-large-end": "Edit large end.",
     }
     prompt = prompts[scenario]
     with tempfile.TemporaryDirectory(prefix="axe-bench-") as tmp:
         if scenario == "edit-large":
             Path(tmp, "large.txt").write_bytes(b"old\n" + b"x\n" * 5_000_000)
+        if scenario == "edit-large-end":
+            Path(tmp, "large.txt").write_bytes(b"x\n" * 5_000_000 + b"old\n")
         env = os.environ.copy()
         env["OPENAI_API_KEY"] = run_id
         env["XDG_CONFIG_HOME"] = str(Path(tmp) / ".config")
@@ -185,6 +189,7 @@ def run(binary, index, scenario):
         edited = Path(tmp, "large.txt")
         valid = scenario != "write" or output.read_text() == "ok\n"
         valid = valid and (scenario != "edit-large" or edited.read_bytes().startswith(b"new\n"))
+        valid = valid and (scenario != "edit-large-end" or edited.read_bytes().endswith(b"new\n"))
         if code != 0 or not valid:
             raise RuntimeError(f"{binary} failed {scenario} run {index + 1}")
     with lock:
