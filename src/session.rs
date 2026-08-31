@@ -169,19 +169,13 @@ fn workspace_state(entries: &[Entry]) -> String {
             continue;
         };
         if name == "bash" {
-            let result = if failed {
-                compact_observation(&message.content, 300)
-            } else if message.content.trim().is_empty() {
-                "success with no output".into()
-            } else {
-                compact_observation(&message.content, 300)
-            };
             if commands.len() == 8 {
                 commands.pop_front();
             }
-            commands.push_back(format!(
-                "{} => {result}",
-                command.as_deref().unwrap_or("unknown command")
+            commands.push_back((
+                command.unwrap_or_else(|| "unknown command".into()),
+                message.content.as_str(),
+                failed,
             ));
             continue;
         }
@@ -203,7 +197,18 @@ fn workspace_state(entries: &[Entry]) -> String {
     }
     let read = read.into_iter().collect::<Vec<_>>().join(", ");
     let modified = modified.into_iter().collect::<Vec<_>>().join(", ");
-    let commands = commands.into_iter().collect::<Vec<_>>().join("\n");
+    let commands = commands
+        .into_iter()
+        .map(|(command, content, failed)| {
+            let result = if !failed && content.trim().is_empty() {
+                "success with no output".into()
+            } else {
+                compact_observation(content, 300)
+            };
+            format!("{command} => {result}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         "Files read: {}\nFiles modified: {}\nRecent commands and results:\n{}",
         if read.is_empty() { "none" } else { &read },
