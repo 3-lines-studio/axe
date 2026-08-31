@@ -315,7 +315,6 @@ pub fn continue_archived(dir: &str, id: &str, entries: &[Entry]) -> std::io::Res
                 .filter(|title| !title.trim().is_empty())
         })
         .unwrap_or_else(|| title_from_entries(entries));
-    let _ = crate::atomic_write(&title_path(dir, id), title.trim().as_bytes());
     let _ = write_session_sidecar(dir, id, &path, title.trim(), entries);
     let _ = std::fs::remove_file(&live_title);
     let _ = std::fs::remove_file(live_path(dir));
@@ -502,7 +501,6 @@ pub fn archive_live(dir: &str) -> Option<String> {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| title_from_entries(&entries));
-    let _ = crate::atomic_write(&title_path(dir, &id), title.as_bytes());
     let _ = write_session_sidecar(dir, &id, &dest, &title, &entries);
     let _ = std::fs::remove_file(live_title_path);
     let _ = std::fs::remove_file(live_path(dir));
