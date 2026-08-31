@@ -303,14 +303,20 @@ pub fn continue_archived(dir: &str, id: &str, entries: &[Entry]) -> std::io::Res
     if !valid_id(id) || entries.is_empty() {
         return Ok(false);
     }
-    write_entries(&store_dir(dir).join(format!("{id}.jsonl")), entries)?;
+    let path = store_dir(dir).join(format!("{id}.jsonl"));
+    write_entries(&path, entries)?;
     let live_title = Path::new(dir).join("session.title");
-    if let Ok(t) = std::fs::read_to_string(&live_title) {
-        let t = t.trim();
-        if !t.is_empty() {
-            let _ = crate::atomic_write(&title_path(dir, id), t.as_bytes());
-        }
-    }
+    let title = std::fs::read_to_string(&live_title)
+        .ok()
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| {
+            std::fs::read_to_string(title_path(dir, id))
+                .ok()
+                .filter(|title| !title.trim().is_empty())
+        })
+        .unwrap_or_else(|| title_from_entries(entries));
+    let _ = crate::atomic_write(&title_path(dir, id), title.trim().as_bytes());
+    let _ = write_session_sidecar(dir, id, &path, title.trim(), entries);
     let _ = std::fs::remove_file(&live_title);
     let _ = std::fs::remove_file(live_path(dir));
     clear_resume_id(dir);
@@ -337,11 +343,20 @@ pub fn list_sessions(dir: &str) -> Vec<SessionMeta> {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        let (derived_title, turns) = session_summary(&path);
-        let title = std::fs::read_to_string(title_path(dir, &id))
-            .ok()
-            .filter(|title| !title.trim().is_empty())
+        let sidecar = read_session_sidecar(dir, &id, &path);
+        let (derived_title, derived_turns) = sidecar
+            .as_ref()
+            .map(|sidecar| (String::new(), sidecar.turns))
+            .unwrap_or_else(|| session_summary(&path));
+        let title = sidecar
+            .map(|sidecar| sidecar.title)
+            .or_else(|| {
+                std::fs::read_to_string(title_path(dir, &id))
+                    .ok()
+                    .filter(|title| !title.trim().is_empty())
+            })
             .unwrap_or(derived_title);
+        let turns = derived_turns;
         let meta = std::fs::metadata(&path).ok();
         let updated = meta
             .and_then(|m| m.modified().ok())
@@ -486,8 +501,9 @@ pub fn archive_live(dir: &str) -> Option<String> {
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| title_from_entries(&read_entries(&dest)));
+        .unwrap_or_else(|| title_from_entries(&entries));
     let _ = crate::atomic_write(&title_path(dir, &id), title.as_bytes());
+    let _ = write_session_sidecar(dir, &id, &dest, &title, &entries);
     let _ = std::fs::remove_file(live_title_path);
     let _ = std::fs::remove_file(live_path(dir));
     clear_resume_id(dir);
@@ -507,6 +523,60 @@ pub fn load_by_id(dir: &str, id: &str) -> Option<Vec<Entry>> {
 
 fn title_path(dir: &str, id: &str) -> PathBuf {
     store_dir(dir).join(format!("{id}.title"))
+}
+
+#[derive(Serialize, Deserialize)]
+struct SessionSidecar {
+    title: String,
+    turns: usize,
+    bytes: u64,
+}
+
+fn sidecar_path(dir: &str, id: &str) -> PathBuf {
+    store_dir(dir).join(format!("{id}.meta"))
+}
+
+fn entry_turns(entries: &[Entry]) -> usize {
+    let mut turns = 0;
+    for entry in entries {
+        match entry {
+            Entry::Message { message } if message.role == "user" => turns += 1,
+            Entry::Compaction { retained, .. } => {
+                turns = 1 + retained
+                    .iter()
+                    .filter(|message| message.role == "user")
+                    .count();
+            }
+            _ => {}
+        }
+    }
+    turns
+}
+
+fn write_session_sidecar(
+    dir: &str,
+    id: &str,
+    path: &Path,
+    title: &str,
+    entries: &[Entry],
+) -> std::io::Result<()> {
+    let sidecar = SessionSidecar {
+        title: title.to_string(),
+        turns: entry_turns(entries),
+        bytes: std::fs::metadata(path)?.len(),
+    };
+    let bytes = serde_json::to_vec(&sidecar)?;
+    crate::atomic_write(&sidecar_path(dir, id), &bytes)
+}
+
+fn read_session_sidecar(dir: &str, id: &str, path: &Path) -> Option<SessionSidecar> {
+    let sidecar =
+        serde_json::from_slice::<SessionSidecar>(&std::fs::read(sidecar_path(dir, id)).ok()?)
+            .ok()?;
+    if std::fs::metadata(path).ok()?.len() != sidecar.bytes {
+        return None;
+    }
+    Some(sidecar)
 }
 
 /// Rough token estimate for context budgeting: chars/4.
@@ -1032,7 +1102,11 @@ mod tests {
         set_resume_id(d, &id);
         let again = archive_live(d).expect("continue");
         assert_eq!(again, id);
-        assert_eq!(list_sessions(d).len(), 1);
+        let sessions = list_sessions(d);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].turns, 2);
+        std::fs::remove_file(sidecar_path(d, &id)).unwrap();
+        assert_eq!(list_sessions(d)[0].turns, 2);
         let msgs = context_messages(&load_by_id(d, &id).unwrap());
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1].content, "second");
