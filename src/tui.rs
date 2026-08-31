@@ -268,6 +268,7 @@ struct Tui {
     tool_live: Option<String>,
     pending_tools: Vec<String>,
     turn_start: Instant,
+    last_animation_tick: u128,
     input: Input,
     model_display: String,
     sess_in: usize,
@@ -325,6 +326,7 @@ impl Tui {
             tool_live: None,
             pending_tools: Vec::new(),
             turn_start: Instant::now(),
+            last_animation_tick: 0,
             input: Input::default(),
             model_display,
             sess_in: 0,
@@ -382,29 +384,43 @@ impl Tui {
             unsafe {
                 libc::poll(fds.as_mut_ptr(), 1, 40);
             }
-            if fds[0].revents & libc::POLLIN != 0 && !self.handle_key(term.read_key()?)? {
+            let input_ready = fds[0].revents & libc::POLLIN != 0;
+            if input_ready && !self.handle_key(term.read_key()?)? {
                 break;
             }
             if self.want_quit {
                 break;
             }
+            let mut changed = input_ready;
             if self.exit_alt_pending {
                 self.exit_alt_pending = false;
                 self.leave_alt(term);
+                changed = true;
             }
             if let Some(t) = self.ctrl_c_armed_ms
                 && t.elapsed().as_millis() >= 3000
             {
                 self.ctrl_c_armed_ms = None;
                 self.ctrl_c_pending = false;
+                changed = true;
             }
             if let Some(t) = self.esc_armed_ms
                 && t.elapsed().as_millis() >= REWIND_ESC_MS
             {
                 self.esc_armed_ms = None;
+                changed = true;
             }
-            self.drain_events();
-            self.paint(term);
+            changed |= self.drain_events();
+            changed |= term.size() != (self.rows, self.cols);
+            let animation_tick = self.turn_start.elapsed().as_millis() / 500;
+            let animated = self.tool_running.is_some() || self.activity == Activity::Thinking;
+            if animated && animation_tick != self.last_animation_tick {
+                self.last_animation_tick = animation_tick;
+                changed = true;
+            }
+            if changed {
+                self.paint(term);
+            }
         }
         Ok(())
     }
