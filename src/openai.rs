@@ -6,13 +6,14 @@ use serde_json::Value;
 use std::cell::RefCell;
 use std::ffi::{c_char, c_int, c_void};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 pub struct OpenAI {
     base_url: String,
     api_key: String,
+    easy: Arc<Mutex<Option<crate::curlffi::Easy>>>,
 }
 
 type BuiltRequest = (String, Vec<(String, String)>, Vec<u8>);
@@ -24,6 +25,7 @@ impl OpenAI {
         OpenAI {
             base_url: base_url.into(),
             api_key: api_key.into(),
+            easy: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -35,10 +37,11 @@ impl OpenAI {
     ) -> std::thread::JoinHandle<Result<Response, Error>> {
         match self.build_request(req, true) {
             Ok((url, headers, body)) => {
+                let easy = self.easy.clone();
                 let c2 = cancel.clone();
                 let tx2 = tx.clone();
                 std::thread::spawn(move || {
-                    run_request(&url, &headers, &body, true, &c2, Some(&tx2))
+                    run_request(&easy, &url, &headers, &body, true, &c2, Some(&tx2))
                 })
             }
             Err(e) => std::thread::spawn(move || Err(e)),
@@ -120,6 +123,7 @@ impl OpenAI {
 }
 
 fn run_request(
+    shared_easy: &Mutex<Option<crate::curlffi::Easy>>,
     url: &str,
     headers: &[(String, String)],
     body: &[u8],
@@ -127,7 +131,11 @@ fn run_request(
     cancel: &Arc<AtomicBool>,
     tx: Option<&Sender<StreamEvent>>,
 ) -> Result<Response, Error> {
-    let mut easy = crate::curlffi::Easy::new().map_err(Error::Transport)?;
+    let mut guard = shared_easy.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(crate::curlffi::Easy::new().map_err(Error::Transport)?);
+    }
+    let easy = guard.as_mut().unwrap();
     easy.url(url).map_err(err)?;
     easy.post().map_err(err)?;
     // SAFETY: curl may or may not copy POSTFIELDS; `body` outlives perform
@@ -160,6 +168,12 @@ fn run_request(
                 Error::Transport(e)
             }
         })?;
+        if std::env::var_os("AXE_TRACE").is_some() {
+            eprintln!(
+                "trace: http new_connections={}",
+                easy.new_connections().map_err(err)?
+            );
+        }
         let status = easy.response_code().map_err(err)? as u16;
         let acc = match Rc::try_unwrap(acc) {
             Ok(cell) => cell.into_inner(),
@@ -243,6 +257,7 @@ impl Provider for OpenAI {
     fn complete(&self, req: &Request) -> Result<Response, Error> {
         let (url, headers, body) = self.build_request(req, false)?;
         run_request(
+            &self.easy,
             &url,
             &headers,
             &body,

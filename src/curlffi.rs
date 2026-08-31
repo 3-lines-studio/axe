@@ -29,6 +29,7 @@ const CURLOPT_PROGRESSDATA: c_int = 10057;
 const CURLOPT_WRITEFUNCTION: c_int = 20011;
 const CURLOPT_PROGRESSFUNCTION: c_int = 20056;
 const CURLINFO_RESPONSE_CODE: c_int = 0x200002;
+const CURLINFO_NUM_CONNECTS: c_int = 0x20001a;
 
 pub type WriteCb = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize;
 pub type ProgressCb = unsafe extern "C" fn(*mut c_void, f64, f64, f64, f64) -> c_int;
@@ -148,6 +149,8 @@ pub struct Easy {
     headers: *mut c_void,
 }
 
+unsafe impl Send for Easy {}
+
 impl Easy {
     pub fn new() -> Result<Easy, String> {
         let c = curl()?;
@@ -197,6 +200,8 @@ impl Easy {
 
     pub fn headers(&mut self, headers: &[(String, String)]) -> Result<(), String> {
         let c = curl()?;
+        unsafe { (c.slist_free_all)(self.headers) };
+        self.headers = std::ptr::null_mut();
         for (k, v) in headers {
             let line =
                 CString::new(format!("{k}: {v}")).map_err(|_| "header contains NUL".to_string())?;
@@ -220,13 +225,23 @@ impl Easy {
     }
 
     pub fn response_code(&self) -> Result<u32, String> {
+        self.getinfo_long(CURLINFO_RESPONSE_CODE)
+            .map(|value| value as u32)
+    }
+
+    pub fn new_connections(&self) -> Result<u32, String> {
+        self.getinfo_long(CURLINFO_NUM_CONNECTS)
+            .map(|value| value as u32)
+    }
+
+    fn getinfo_long(&self, info: c_int) -> Result<c_long, String> {
         let c = curl()?;
-        let mut code: c_long = 0;
-        let r = unsafe { (c.getinfo_long)(self.handle, CURLINFO_RESPONSE_CODE, &mut code) };
-        if r != 0 {
-            return Err(curl_err(c, r));
+        let mut value = 0;
+        let result = unsafe { (c.getinfo_long)(self.handle, info, &mut value) };
+        if result != 0 {
+            return Err(curl_err(c, result));
         }
-        Ok(code as u32)
+        Ok(value)
     }
 }
 
