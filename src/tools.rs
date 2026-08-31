@@ -273,7 +273,15 @@ fn status_str(st: std::process::ExitStatus) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_edits, sanitize};
+    use super::{apply_edits, diff_lines, sanitize};
+
+    #[test]
+    fn diff_limits_output_to_changed_lines() {
+        assert_eq!(diff_lines("a\nold\nz", "a\nnew\nz"), "-2 old\n+2 new");
+        assert_eq!(diff_lines("a\nz", "a\nnew\nz"), "+2 new");
+        assert_eq!(diff_lines("a\nold\nz", "a\nz"), "-2 old");
+        assert_eq!(diff_lines("a\n🙈\nz", "a\n✅\nz"), "-2 🙈\n+2 ✅");
+    }
 
     #[test]
     fn sanitize_strips_control_characters() {
@@ -746,8 +754,49 @@ const EDIT_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"stri
 
 /// Line-based diff with line numbers, one hunk per changed region.
 fn diff_lines(old: &str, new: &str) -> String {
-    let mut old_lines = old.split('\n').enumerate().peekable();
-    let mut new_lines = new.split('\n').enumerate().peekable();
+    if old == new {
+        return String::new();
+    }
+    let equal_prefix = old
+        .bytes()
+        .zip(new.bytes())
+        .take_while(|(old, new)| old == new)
+        .count();
+    let prefix = old.as_bytes()[..equal_prefix]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let max_suffix = old.len().min(new.len()).saturating_sub(prefix);
+    let equal_suffix = old
+        .bytes()
+        .rev()
+        .zip(new.bytes().rev())
+        .take(max_suffix)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let mut old_end = old.len() - equal_suffix;
+    let mut new_end = new.len() - equal_suffix;
+    if old_end > prefix
+        && (old.as_bytes()[old_end - 1] != b'\n' || new.as_bytes()[new_end - 1] != b'\n')
+    {
+        old_end = old.as_bytes()[old_end..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(old.len(), |index| old_end + index + 1);
+        new_end = new.as_bytes()[new_end..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(new.len(), |index| new_end + index + 1);
+    }
+    let line_offset = old[..prefix].bytes().filter(|byte| *byte == b'\n').count();
+    let mut old_lines = old[prefix..old_end]
+        .split_terminator('\n')
+        .enumerate()
+        .peekable();
+    let mut new_lines = new[prefix..new_end]
+        .split_terminator('\n')
+        .enumerate()
+        .peekable();
     let mut out = String::new();
     while old_lines.peek().is_some() || new_lines.peek().is_some() {
         if old_lines.peek().map(|line| line.1) == new_lines.peek().map(|line| line.1) {
@@ -769,10 +818,10 @@ fn diff_lines(old: &str, new: &str) -> String {
             }
         }
         for (line, text) in removed {
-            out.push_str(&format!("-{} {text}\n", line + 1));
+            out.push_str(&format!("-{} {text}\n", line_offset + line + 1));
         }
         for (line, text) in added {
-            out.push_str(&format!("+{} {text}\n", line + 1));
+            out.push_str(&format!("+{} {text}\n", line_offset + line + 1));
         }
     }
     out.trim_end().to_string()
