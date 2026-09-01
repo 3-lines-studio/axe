@@ -372,15 +372,9 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
             fmt_dur(start.elapsed())
         );
     }
-    let pretty = std::io::stdout().is_terminal();
     for m in &msgs {
         if m.role == "assistant" && !m.content.is_empty() && m.tool_calls.is_empty() {
-            if pretty {
-                let rendered = axe::markdown::Markdown::render(&m.content);
-                print!("{rendered}");
-            } else {
-                println!("{}", m.content);
-            }
+            println!("{}", m.content);
         }
     }
 }
