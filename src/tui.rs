@@ -1702,38 +1702,42 @@ impl Tui {
         if let Some(entry) = self.entries.last() {
             render_entry(entry, width, &mut rows);
         }
+        (rows, cached_rows)
+    }
+
+    fn activity_rows(&self) -> Vec<String> {
         if let Some(label) = &self.tool_running {
             let now = self.turn_start.elapsed();
             let half = (now.as_millis() as i64 / 500) % 2 == 0;
             let marker = if half { "●" } else { " " };
-            rows.push(format!("{ACTIVITY}{marker} {label}{RESET}"));
+            let mut rows = vec![format!("{ACTIVITY}{marker} {label}{RESET}")];
             if let Some(live) = &self.tool_live {
                 let width = self.cols.saturating_sub(4) as usize;
                 let count = live.chars().count();
-                let mut t: String = live.chars().take(width).collect();
+                let mut text: String = live.chars().take(width).collect();
                 if count > width {
-                    t.push('…');
+                    text.push('…');
                 }
-                rows.push(format!("{DIM}  {t}{RESET}"));
+                rows.push(format!("{DIM}  {text}{RESET}"));
             }
-        } else {
-            if self.activity == Activity::Thinking {
-                let now = self.turn_start.elapsed();
-                let secs = now.as_secs();
-                let half = (now.as_millis() as i64 / 500) % 2 == 0;
-                let head = if half {
-                    format!("{ACTIVITY}• Thinking ({secs}s)")
-                } else {
-                    format!(" {ACTIVITY} Thinking ({secs}s)")
-                };
-                rows.push(format!(
-                    "{head}{DIM} (↑{} ↓{}){RESET}",
-                    tok(self.live_in),
-                    tok(self.live_out)
-                ));
-            }
+            return rows;
         }
-        (rows, cached_rows)
+        if self.activity != Activity::Thinking {
+            return Vec::new();
+        }
+        let now = self.turn_start.elapsed();
+        let secs = now.as_secs();
+        let half = (now.as_millis() as i64 / 500) % 2 == 0;
+        let head = if half {
+            format!("{ACTIVITY}• Thinking ({secs}s)")
+        } else {
+            format!(" {ACTIVITY} Thinking ({secs}s)")
+        };
+        vec![format!(
+            "{head}{DIM} (↑{} ↓{}){RESET}",
+            tok(self.live_in),
+            tok(self.live_out)
+        )]
     }
 
     fn paint_inline(&mut self, term: &mut Terminal, resized: bool) {
@@ -1750,6 +1754,7 @@ impl Tui {
         let capacity = rows.saturating_sub(chrome.len()).max(1);
         if std::mem::take(&mut self.reprint) {
             if content.len() > capacity {
+                Self::clear_rows(out, self.streamed.len().min(capacity) + 1, rows);
                 for line in &content {
                     let _ = write!(out, "{}", term::move_to(rows as u16, 1));
                     let _ = writeln!(out, "{line}");
@@ -1801,6 +1806,13 @@ impl Tui {
         self.transcript_cache = content;
     }
 
+    fn clear_rows(out: &mut std::io::Stdout, start: usize, end: usize) {
+        for row in start..=end {
+            let _ = write!(out, "{}", term::move_to(row as u16, 1));
+            let _ = out.write_all(term::clear_eol().as_bytes());
+        }
+    }
+
     fn update_content(
         &mut self,
         out: &mut std::io::Stdout,
@@ -1822,6 +1834,7 @@ impl Tui {
             d += 1;
         }
         if jump > capacity && old.len().saturating_sub(d) <= 2 {
+            Self::clear_rows(out, old_vis + 1, rows);
             for line in &new[d..] {
                 let _ = write!(out, "{}", term::move_to(rows as u16, 1));
                 let _ = writeln!(out, "{}", line);
@@ -1853,6 +1866,7 @@ impl Tui {
                         self.streamed = new.to_vec();
                         return;
                     }
+                    Self::clear_rows(out, old_vis + 1, rows);
                     for _ in 0..(new_scrolled - old_scrolled) {
                         let _ = write!(out, "{}", term::move_to(rows as u16, 1));
                         let _ = out.write_all(b"\n");
@@ -1944,8 +1958,9 @@ impl Tui {
         if cursor_row < vis_start {
             vis_start = cursor_row;
         }
-        let mut rows: Vec<String> = input_rows[vis_start..].to_vec();
-        let vis_cursor_row = cursor_row - vis_start;
+        let mut rows = self.activity_rows();
+        let vis_cursor_row = rows.len() + cursor_row - vis_start;
+        rows.extend_from_slice(&input_rows[vis_start..]);
         if let Some(p) = &self.picker {
             let width = self.cols as usize;
             rows.push(picker_divider(width));
