@@ -25,6 +25,10 @@ struct FileConfig {
 }
 
 fn main() {
+    run(false);
+}
+
+pub fn run(use_ratatui: bool) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.as_slice(), [arg] if arg == "-V" || arg == "--version") {
         println!("axe {}", env!("CARGO_PKG_VERSION"));
@@ -61,7 +65,12 @@ fn main() {
             resume: cfg.resume.clone(),
             context_window: fc.context_window,
         };
-        if let Err(e) = axe::tui::run(tui_cfg) {
+        let result = if use_ratatui {
+            axe::ratatui_tui::run(tui_cfg)
+        } else {
+            axe::tui::run(tui_cfg)
+        };
+        if let Err(e) = result {
             eprintln!("error: {e}");
             std::process::exit(1);
         }

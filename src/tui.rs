@@ -5,6 +5,7 @@
 //! (mouse wheel, Shift+PgUp) works on sessions. Ctrl+O opens the
 //! full-transcript mode with internal PgUp/PgDn/wheel scrolling.
 
+use crate::app::{self, Command, CommandSpec, RewindItem};
 use crate::markdown::{self, Block, Markdown};
 use crate::openai::OpenAI;
 use crate::run::{self, Outcome, RunOptions, Sink};
@@ -77,13 +78,6 @@ enum Screen {
     Rewind,
 }
 
-#[derive(Clone)]
-struct RewindItem {
-    msg_idx: usize,
-    role: String,
-    preview: String,
-}
-
 /// Two Esc presses within this window open the rewind screen.
 const REWIND_ESC_MS: u128 = 800;
 
@@ -114,13 +108,6 @@ pub enum TurnEvent {
     },
 }
 
-struct SlashSpec {
-    command: &'static str,
-    help: &'static str,
-    description: &'static str,
-    category: &'static str,
-}
-
 struct SlashItem {
     command: String,
     help: String,
@@ -129,7 +116,7 @@ struct SlashItem {
 }
 
 impl SlashItem {
-    fn builtin(spec: &SlashSpec) -> SlashItem {
+    fn builtin(spec: &CommandSpec) -> SlashItem {
         SlashItem {
             command: spec.command.to_string(),
             help: spec.help.to_string(),
@@ -157,57 +144,6 @@ struct Picker {
 }
 
 const PICKER_VISIBLE: usize = 6;
-
-const SLASH: &[SlashSpec] = &[
-    SlashSpec {
-        command: "/help",
-        help: "/help",
-        description: "show available slash commands",
-        category: "General",
-    },
-    SlashSpec {
-        command: "/new",
-        help: "/new",
-        description: "start a fresh session",
-        category: "Session",
-    },
-    SlashSpec {
-        command: "/reset",
-        help: "/reset",
-        description: "reset the current session context",
-        category: "Session",
-    },
-    SlashSpec {
-        command: "/resume",
-        help: "/resume",
-        description: "resume a saved session",
-        category: "Session",
-    },
-    SlashSpec {
-        command: "/rewind",
-        help: "/rewind",
-        description: "rewind the session to an earlier message",
-        category: "Session",
-    },
-    SlashSpec {
-        command: "/compact",
-        help: "/compact",
-        description: "summarize the conversation so far",
-        category: "Session",
-    },
-    SlashSpec {
-        command: "/copy",
-        help: "/copy",
-        description: "copy the last assistant response",
-        category: "Session",
-    },
-    SlashSpec {
-        command: "/quit",
-        help: "/quit",
-        description: "exit the interactive shell",
-        category: "General",
-    },
-];
 
 pub fn run(cfg: TuiConfig) -> Result<(), String> {
     let mut term = Terminal::new()?;
@@ -1195,25 +1131,24 @@ impl Tui {
     }
 
     fn slash(&mut self, cmd: &str) {
-        let name = match cmd.split_once(' ') {
-            Some((n, _)) => n,
-            None => cmd,
-        };
-        // These replace session state; running them mid-turn would clobber
-        // the transcript the worker is still producing.
-        if self.running && matches!(name, "new" | "reset" | "resume" | "rewind" | "compact") {
+        let command = app::parse_command(cmd);
+        if self.running
+            && matches!(
+                command,
+                Some(Command::New | Command::Resume | Command::Rewind | Command::Compact)
+            )
+        {
             self.entries.push(Entry::Notice(
                 "agent is running; ctrl+c interrupts it first".into(),
             ));
             return;
         }
-        match name {
-            "help" => self.open_screen(Screen::Help),
-            "new" => self.fresh_session(true),
-            "reset" => self.fresh_session(false),
-            "resume" => self.open_screen(Screen::Resume),
-            "rewind" => self.open_screen(Screen::Rewind),
-            "compact" => {
+        match command {
+            Some(Command::Help) => self.open_screen(Screen::Help),
+            Some(Command::New) => self.fresh_session(),
+            Some(Command::Resume) => self.open_screen(Screen::Resume),
+            Some(Command::Rewind) => self.open_screen(Screen::Rewind),
+            Some(Command::Compact) => {
                 if self.compacting {
                     self.entries
                         .push(Entry::Notice("already compacting…".into()));
@@ -1227,11 +1162,12 @@ impl Tui {
                     }
                 }
             }
-            "copy" => self.copy_last(),
-            "quit" => {
+            Some(Command::Copy) => self.copy_last(),
+            Some(Command::Quit) => {
                 self.want_quit = true;
             }
-            _ => {
+            None => {
+                let name = cmd.split_whitespace().next().unwrap_or_default();
                 self.entries.push(Entry::Notice(format!(
                     "{DIM}unknown command: /{name}{RESET}"
                 )));
@@ -1239,23 +1175,17 @@ impl Tui {
         }
     }
 
-    fn fresh_session(&mut self, archive: bool) {
-        if archive {
-            match self.resume_id.take() {
-                Some(id) => {
-                    if !session::continue_archived_live(&self.cfg.session_dir, &id).unwrap_or(false)
-                    {
-                        let entries = session::load_live(&self.cfg.session_dir);
-                        let _ = session::continue_archived(&self.cfg.session_dir, &id, &entries);
-                    }
-                }
-                None => {
-                    session::archive_live(&self.cfg.session_dir);
+    fn fresh_session(&mut self) {
+        match self.resume_id.take() {
+            Some(id) => {
+                if !session::continue_archived_live(&self.cfg.session_dir, &id).unwrap_or(false) {
+                    let entries = session::load_live(&self.cfg.session_dir);
+                    let _ = session::continue_archived(&self.cfg.session_dir, &id, &entries);
                 }
             }
-        } else {
-            self.resume_id = None;
-            session::discard_live(&self.cfg.session_dir);
+            None => {
+                session::archive_live(&self.cfg.session_dir);
+            }
         }
         self.entries.clear();
         self.transcript_cache.clear();
@@ -1279,19 +1209,12 @@ impl Tui {
     }
 
     fn copy_last(&mut self) {
-        let mut text = String::new();
-        for m in self.msgs.iter().rev() {
-            if m.role == "assistant" && !m.content.is_empty() {
-                text = m.content.clone();
-                break;
-            }
-        }
-        if text.is_empty() {
+        let Some(text) = app::last_assistant_response(&self.msgs) else {
             self.entries.push(Entry::Notice(format!(
                 "{DIM}no assistant response to copy{RESET}"
             )));
             return;
-        }
+        };
         let b64 = b64_encode(text.as_bytes());
         print!("\x1b]52;c;{b64}\x1b\\");
         let _ = std::io::stdout().flush();
@@ -1301,14 +1224,7 @@ impl Tui {
 
     fn resume_by_id(&mut self, id: &str) {
         let dir = self.cfg.session_dir.clone();
-        let loaded = if id == "last" {
-            session::list_sessions(&dir)
-                .into_iter()
-                .next()
-                .map(|s| (s.id, session::load_session(&s.path)))
-        } else {
-            session::load_by_id(&dir, id).map(|msgs| (id.to_string(), msgs))
-        };
+        let loaded = app::load_session(&dir, id);
         match loaded {
             Some((id, msgs)) => {
                 if self.load_messages(msgs) {
@@ -1325,26 +1241,12 @@ impl Tui {
 
     fn load_messages(&mut self, entries: Vec<session::Entry>) -> bool {
         self.msgs = session::context_messages(&entries);
-        self.sess_in = 0;
-        self.sess_out = 0;
-        self.live_in = 0;
+        let usage = app::session_usage(&entries);
+        self.sess_in = usage.input;
+        self.sess_out = usage.output;
+        self.live_in = usage.context_input;
         self.live_out = 0;
-        self.live_cached_in = 0;
-        for entry in &entries {
-            if let session::Entry::Usage {
-                input,
-                output,
-                cached_input,
-                context_input,
-                ..
-            } = entry
-            {
-                self.sess_in += input;
-                self.sess_out += output;
-                self.live_in = *context_input;
-                self.live_cached_in = *cached_input;
-            }
-        }
+        self.live_cached_in = usage.cached_input;
         self.entries.clear();
         self.transcript_cache.clear();
         self.transcript_cache_entries = 0;
@@ -1371,7 +1273,7 @@ impl Tui {
                             .push(Entry::Text(markdown::Markdown::render(&m.content)));
                     }
                     for c in &m.tool_calls {
-                        tools.push(tool_label(c, false));
+                        tools.push(app::tool_label(c, false));
                     }
                 }
                 _ => {}
@@ -1416,44 +1318,11 @@ impl Tui {
     }
 
     fn build_rewind_items(&self) -> Vec<RewindItem> {
-        let mut out = Vec::new();
-        for (i, m) in self.msgs.iter().enumerate() {
-            let role = m.role.as_str();
-            if role != "user" && role != "assistant" {
-                continue;
-            }
-            if role == "user" && m.content.starts_with(session::COMPACTION_PREFIX) {
-                continue;
-            }
-            let mut preview = m.content.lines().next().unwrap_or("").trim().to_string();
-            if preview.is_empty() {
-                if role == "assistant" && !m.tool_calls.is_empty() {
-                    let n = m.tool_calls.len();
-                    preview = format!("({n} tool call{})", if n == 1 { "" } else { "s" });
-                } else {
-                    continue;
-                }
-            }
-            out.push(RewindItem {
-                msg_idx: i,
-                role: m.role.clone(),
-                preview,
-            });
-        }
-        out
+        app::rewind_items(&self.msgs)
     }
 
     fn filtered_rewind_items(&self) -> Vec<RewindItem> {
-        let q = self.input.buf().trim().to_lowercase();
-        self.rewind_items
-            .iter()
-            .filter(|it| {
-                q.is_empty()
-                    || it.preview.to_lowercase().contains(&q)
-                    || it.role.to_lowercase().contains(&q)
-            })
-            .cloned()
-            .collect()
+        app::filter_rewind_items(&self.rewind_items, self.input.buf())
     }
 
     /// Drop everything from message `idx` onward, in memory and on disk.
@@ -1461,13 +1330,7 @@ impl Tui {
     /// truncated transcript is rewritten as a flat message list; a later
     /// compaction will re-summarize as usual.
     fn rewind_to(&mut self, idx: usize) {
-        let idx = idx.min(self.msgs.len());
-        let entries: Vec<session::Entry> = self.msgs[..idx]
-            .iter()
-            .map(|message| session::Entry::Message {
-                message: message.clone(),
-            })
-            .collect();
+        let entries = app::rewind_entries(&self.msgs, idx);
         self.load_messages(entries);
         let n = self.msgs.len();
         self.entries.push(Entry::Notice(format!(
@@ -1486,15 +1349,8 @@ impl Tui {
     }
 
     fn help_items(&self) -> Vec<SlashItem> {
-        let query = self.input.buf().trim().to_lowercase();
-        SLASH
+        app::command_search(self.input.buf())
             .iter()
-            .filter(|spec| {
-                query.is_empty()
-                    || spec.command.to_lowercase().contains(&query)
-                    || spec.description.to_lowercase().contains(&query)
-                    || spec.category.to_lowercase().contains(&query)
-            })
             .map(SlashItem::builtin)
             .collect()
     }
@@ -1545,7 +1401,7 @@ impl Tui {
             Screen::Rewind => {
                 let item = self.filtered_rewind_items().get(self.sel).cloned();
                 if let Some(it) = item {
-                    let idx = it.msg_idx;
+                    let idx = it.message_index;
                     self.close_screen();
                     self.rewind_to(idx);
                 }
@@ -2136,8 +1992,15 @@ impl Tui {
                     file_matches: Vec::new(),
                 };
                 match p.kind {
-                    PickerKind::Slash => p.slash_matches = slash_matches(&p.query),
-                    PickerKind::Files => p.file_matches = file_matches(&p.query, &self.cfg.dir),
+                    PickerKind::Slash => {
+                        p.slash_matches = app::command_matches(&p.query)
+                            .iter()
+                            .map(SlashItem::builtin)
+                            .collect()
+                    }
+                    PickerKind::Files => {
+                        p.file_matches = app::file_matches(&p.query, &self.cfg.dir)
+                    }
                 }
                 self.picker = Some(p);
             }
@@ -2534,112 +2397,6 @@ fn line_display_pos(chars: &[char], char_idx: usize, avail: usize) -> (usize, us
         (sub, total - sub * a)
     } else {
         (w / a, w % a)
-    }
-}
-
-fn slash_matches(query: &str) -> Vec<SlashItem> {
-    let query = query.to_lowercase();
-    SLASH
-        .iter()
-        .filter(|spec| query.is_empty() || spec.command[1..].to_lowercase().contains(&query))
-        .map(SlashItem::builtin)
-        .collect()
-}
-
-fn file_matches(query: &str, dir: &str) -> Vec<String> {
-    let root = if dir.is_empty() { "." } else { dir };
-    if let Some(slash) = query.rfind('/') {
-        let (d, prefix) = query.split_at(slash + 1);
-        let base = if d.is_empty() {
-            root.to_string()
-        } else if d == "/" {
-            "/".to_string()
-        } else {
-            format!("{}/{}", root.trim_end_matches('/'), d.trim_end_matches('/'))
-        };
-        let mut names: Vec<String> = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&base) {
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                if name.starts_with('.') && is_dir {
-                    continue;
-                }
-                if name.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                    names.push(format!("{d}{name}"));
-                }
-            }
-        }
-        names.sort();
-        return names;
-    }
-    let mut pref: Vec<String> = Vec::new();
-    let mut rest: Vec<String> = Vec::new();
-    let mut visited = 0usize;
-    walk_files(root, "", query, &mut pref, &mut rest, &mut visited);
-    pref.sort();
-    rest.sort();
-    pref.extend(rest);
-    pref
-}
-
-fn walk_files(
-    dir: &str,
-    rel: &str,
-    query: &str,
-    pref: &mut Vec<String>,
-    rest: &mut Vec<String>,
-    visited: &mut usize,
-) {
-    if *visited > 4000 {
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        *visited += 1;
-        if *visited > 4000 {
-            return;
-        }
-        let name = e.file_name().to_string_lossy().into_owned();
-        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if name.starts_with('.') && is_dir {
-            continue;
-        }
-        let path = if rel.is_empty() {
-            name.clone()
-        } else {
-            format!("{rel}/{name}")
-        };
-        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if is_dir {
-            if name == "target" || name == "node_modules" {
-                continue;
-            }
-            walk_files(
-                &format!("{}/{}", dir.trim_end_matches('/'), name),
-                &path,
-                query,
-                pref,
-                rest,
-                visited,
-            );
-        }
-        let lower = path.to_lowercase();
-        let q = query.to_lowercase();
-        let base = name.to_lowercase();
-        let matched =
-            q.is_empty() || base.starts_with(&q) || lower.starts_with(&q) || lower.contains(&q);
-        if !matched {
-            continue;
-        }
-        let display = if is_dir { format!("{path}/") } else { path };
-        if q.is_empty() || base.starts_with(&q) || lower.starts_with(&q) {
-            pref.push(display);
-        } else {
-            rest.push(display);
-        }
     }
 }
 
@@ -3113,38 +2870,6 @@ fn tool_kind(call: &ToolCall) -> String {
     }
 }
 
-fn tool_label(call: &ToolCall, running: bool) -> String {
-    #[derive(serde::Deserialize)]
-    struct Args {
-        path: Option<String>,
-        command: Option<String>,
-    }
-    let args: Option<Args> = serde_json::from_str(&call.arguments).ok();
-    let path = args
-        .as_ref()
-        .and_then(|a| a.path.clone())
-        .unwrap_or_default();
-    let command = args
-        .as_ref()
-        .and_then(|a| a.command.clone())
-        .unwrap_or_default();
-    match call.name.as_str() {
-        "bash" => {
-            let cmd = command.split_whitespace().collect::<Vec<_>>().join(" ");
-            let cmd = clip(&cmd, 120);
-            if running {
-                format!("Running {cmd}")
-            } else {
-                format!("Ran {cmd}")
-            }
-        }
-        "read" => format!("{} {path}", if running { "Reading" } else { "Read" }),
-        "write" => format!("{} {path}", if running { "Writing" } else { "Wrote" }),
-        "edit" => format!("{} {path}", if running { "Editing" } else { "Edited" }),
-        _ => format!("Working: {}", call.name),
-    }
-}
-
 struct TuiSink<'a> {
     tx: &'a Sender<TurnEvent>,
     steer: Receiver<String>,
@@ -3162,7 +2887,7 @@ impl Sink for TuiSink<'_> {
 
     fn tool_start(&mut self, call: &ToolCall) {
         let _ = self.tx.send(TurnEvent::ToolStart {
-            label: tool_label(call, true),
+            label: app::tool_label(call, true),
             kind: tool_kind(call),
         });
     }
@@ -3173,7 +2898,7 @@ impl Sink for TuiSink<'_> {
 
     fn tool_result(&mut self, call: &ToolCall) {
         let _ = self.tx.send(TurnEvent::ToolResult {
-            label: tool_label(call, false),
+            label: app::tool_label(call, false),
             kind: tool_kind(call),
         });
     }
@@ -3315,44 +3040,6 @@ mod tests {
         tui.persist_session(&messages, Usage::default(), None, false);
         assert_eq!(session::context_messages(&session::load_live(d)), messages);
         assert_eq!(tui.session_context_len, 4);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn reset_discards_live_transcript() {
-        let dir = std::env::temp_dir().join(format!("axe-reset-live-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let d = dir.to_str().unwrap();
-        session::save_live(
-            d,
-            &[session::Entry::Message {
-                message: Message {
-                    role: "user".into(),
-                    content: "old".into(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: String::new(),
-                },
-            }],
-        )
-        .unwrap();
-        session::set_resume_id(d, "abc");
-        let cfg = TuiConfig {
-            base: "http://127.0.0.1:1/v1".into(),
-            model: "m".into(),
-            system: String::new(),
-            dir: String::new(),
-            axe_root: d.to_string(),
-            session_dir: d.to_string(),
-            api_key: "k".into(),
-            resume: None,
-            context_window: None,
-        };
-        let mut tui = Tui::new(cfg);
-        tui.resume_id = Some("abc".into());
-        tui.slash("reset");
-        assert!(tui.resume_id.is_none());
-        assert!(session::load_live(d).is_empty());
-        assert!(session::load_resume_id(d).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
