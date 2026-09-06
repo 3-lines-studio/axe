@@ -15,12 +15,9 @@ use std::sync::mpsc;
 pub mod app;
 pub mod curlffi;
 mod http;
-pub mod markdown;
 pub mod openai;
-pub mod ratatui_tui;
 pub mod run;
 pub mod session;
-pub mod term;
 pub mod tools;
 pub mod tui;
 

@@ -209,8 +209,7 @@ pub fn bash(dir: &str) -> Tool {
             let pidfd = child_pidfd(child.id());
             let mut exit: Option<std::process::ExitStatus> = None;
             let mut timed_out = false;
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
             let mut last_progress = std::time::Instant::now();
             loop {
                 match child.try_wait() {
@@ -281,9 +280,7 @@ pub fn bash(dir: &str) -> Tool {
                 if !display.is_empty() && !display.ends_with('\n') {
                     display.push('\n');
                 }
-                display.push_str(&format!(
-                    "error: command timed out after {timeout} seconds"
-                ));
+                display.push_str(&format!("error: command timed out after {timeout} seconds"));
             } else if let Some(st) = exit
                 && !st.success()
             {

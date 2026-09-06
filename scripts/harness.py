@@ -376,12 +376,15 @@ class Tui:
 
     def expect(self, text, timeout=20):
         deadline = time.time() + timeout
+        expected = "".join(text.split())
         while time.time() < deadline:
-            if text in self.output():
+            output = self.output()
+            if text in output or expected in "".join(output.split()):
                 return
             if self.proc.poll() is not None:
                 time.sleep(0.1)
-                if text in self.output():
+                output = self.output()
+                if text in output or expected in "".join(output.split()):
                     return
                 raise AssertionError(
                     "tui exited (code %s) before %r appeared\n--- output ---\n%s"
@@ -735,7 +738,7 @@ def tui_rewind(h, axe):
             t.expect("second question")
             t.key("up")
             t.key("enter")
-            t.expect("rewound · 2 messages remaining")
+            t.expect("2 messages remaining")
             t.type("/quit\r")
             check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
         finally:

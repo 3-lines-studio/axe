@@ -6,7 +6,6 @@
 //!
 //! Run: cargo test --release --test stress
 
-use axe::markdown::{Markdown, ansi};
 use axe::openai::StreamEvent;
 use axe::{Message, OpenAI, Request, new_tool};
 use std::io::{Read, Write};
@@ -140,38 +139,6 @@ fn assert_sane(name: &str, seed: u64, out: &str) {
     }
 }
 
-fn fuzz_markdown(rng: &mut Rng, seed: u64, input: &[u8]) {
-    let s = String::from_utf8_lossy(input);
-    guard("markdown render", seed, || {
-        assert_sane("markdown render", seed, &Markdown::render(&s));
-    });
-    guard("markdown stream", seed, || {
-        let mut md = Markdown::new();
-        let n = s.len();
-        let mut i = 0;
-        while i < n {
-            let step = 1 + rng.below(64);
-            let end = (i + step).min(n);
-            md.push(&s[i..end]);
-            i = end;
-        }
-        let out = md.finish();
-        assert_sane("markdown stream", seed, &out);
-    });
-    guard("markdown on_block", seed, || {
-        let mut md = Markdown::new();
-        let blocks = std::rc::Rc::new(std::cell::Cell::new(0usize));
-        let count = std::rc::Rc::clone(&blocks);
-        md.set_on_block(move |_b: axe::markdown::Block, _out: &mut String| {
-            count.set(count.get() + 1);
-        });
-        md.push(&s);
-        let out = md.finish();
-        assert_sane("markdown on_block", seed, &out);
-        assert!(blocks.get() <= 4096, "too many blocks {}", blocks.get());
-    });
-}
-
 const TOKENS: [&str; 20] = [
     "```", "``", "`", "**", "__", "*", "_", "[", "]", "(", ")", "|", "^", "<", ">", "\n\n", "\n",
     "#", "-", "\\",
@@ -216,15 +183,6 @@ fn mutate(rng: &mut Rng, buf: &mut Vec<u8>, rounds: usize) {
             }
         }
     }
-}
-
-fn fuzz_ansi(_rng: &mut Rng, seed: u64, input: &[u8]) {
-    guard("ansi writers", seed, || {
-        let mut out = String::new();
-        ansi::write_dim(&mut out, input);
-        ansi::write_horizontal_rule(&mut out);
-        assert_sane("ansi writers", seed, &out);
-    });
 }
 
 fn fuzz_session(_rng: &mut Rng, seed: u64, input: &[u8]) {
@@ -296,18 +254,6 @@ fn fuzz_new_tool(_rng: &mut Rng, seed: u64, input: &[u8]) {
     let s = String::from_utf8_lossy(input);
     guard("new_tool args", seed, || {
         let _ = (tool.run)(&s, &mut |_| {});
-    });
-}
-
-fn fuzz_tui_text(rng: &mut Rng, seed: u64, input: &[u8]) {
-    let s = String::from_utf8_lossy(input);
-    guard("tui wrap_ansi", seed, || {
-        let width = 1 + rng.below(40);
-        let rows = axe::tui::wrap_ansi(&s, width);
-        assert!(rows.len() <= s.chars().count().max(1) + 1);
-        for row in rows {
-            assert_sane("tui wrap row", seed, &row);
-        }
     });
 }
 
@@ -416,24 +362,6 @@ fn sse_payload(rng: &mut Rng, input: &[u8]) -> Vec<u8> {
     }
 }
 
-#[test]
-fn stress_markdown_and_ansi() {
-    let seeds = corpus();
-    let mut cases = 0;
-    for (si, base) in seeds.iter().enumerate() {
-        let mut rng = Rng(si as u64 ^ 0x9E3779B97F4A7C15);
-        for it in 0..3000 {
-            let seed = (si as u64) << 20 | it;
-            let mut buf = base.clone();
-            mutate(&mut rng, &mut buf, 24);
-            fuzz_markdown(&mut rng, seed, &buf);
-            fuzz_ansi(&mut rng, seed, &buf);
-            cases += 1;
-        }
-    }
-    eprintln!("stress_markdown_and_ansi: {cases} cases");
-}
-
 fn read_seed(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     let mut buf = Vec::new();
@@ -462,13 +390,9 @@ fn fuzz_corpus(rng_seed: u64, iterations: usize, fns: &[fn(&mut Rng, u64, &[u8])
 }
 
 #[test]
-fn fuzz_text_and_session() {
-    let cases = fuzz_corpus(
-        0xD1B54A32D192ED03,
-        100,
-        &[fuzz_session, fuzz_new_tool, fuzz_tui_text],
-    );
-    eprintln!("fuzz_text_and_session: {cases} cases");
+fn fuzz_session_and_tools() {
+    let cases = fuzz_corpus(0xD1B54A32D192ED03, 100, &[fuzz_session, fuzz_new_tool]);
+    eprintln!("fuzz_session_and_tools: {cases} cases");
 }
 
 #[test]

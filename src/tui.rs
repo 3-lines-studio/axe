@@ -1,2854 +1,40 @@
-//! Transcript TUI replicating the vercel-labs/fx terminal UX.
-//!
-//! Inline mode (default) streams the transcript into the terminal scrollback
-//! with the footer pinned at the bottom, so the terminal's native scrolling
-//! (mouse wheel, Shift+PgUp) works on sessions. Ctrl+O opens the
-//! full-transcript mode with internal PgUp/PgDn/wheel scrolling.
-
-use crate::app::{self, Command, CommandSpec, RewindItem};
-use crate::markdown::{self, Block, Markdown};
+use crate::app;
 use crate::openai::OpenAI;
 use crate::run::{self, Outcome, RunOptions, Sink};
-use crate::session::{self, SessionMeta};
-use crate::term::{self, Key, Terminal};
+use crate::session;
 use crate::{Message, Tool, ToolCall, Usage};
-use std::cell::RefCell;
-use std::io::Write;
-use std::rc::Rc;
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Paragraph, Wrap};
+use std::io::{self, Stdout, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::time::Instant;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[38;5;245m";
-const DIVIDER: &str = "\x1b[38;5;240m";
-const ACTIVITY: &str = "\x1b[38;5;252m";
-const HINT: &str = "\x1b[38;5;255m";
-const SELECTED: &str = "\x1b[1;38;5;255m";
-const USER_RAIL: &str = "\x1b[38;5;255m";
-const WELCOME_APP: &str = "\x1b[1;38;5;255m";
 
 pub struct TuiConfig {
     pub base: String,
     pub model: String,
     pub system: String,
     pub dir: String,
-    pub axe_root: String,
     pub session_dir: String,
     pub api_key: String,
-    /// None = fresh session. Some("") = resume picker. Some("last") or id = load.
     pub resume: Option<String>,
-    /// Model context window in tokens; unset means the model's default applies.
     pub context_window: Option<usize>,
-}
-
-enum Entry {
-    Welcome,
-    User(String),
-    Text(String),
-    Code(String),
-    Table(String),
-    Rule,
-    Tool {
-        calls: Vec<String>,
-    },
-    Notice(String),
-    Summary {
-        secs: u64,
-        input: usize,
-        output: usize,
-    },
-}
-
-#[derive(PartialEq, Clone)]
-enum Activity {
-    Idle,
-    Thinking,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum Screen {
-    None,
-    Help,
-    Resume,
-    Rewind,
-}
-
-/// Two Esc presses within this window open the rewind screen.
-const REWIND_ESC_MS: u128 = 800;
-
-pub enum TurnEvent {
-    AssistantDelta(String),
-    AssistantDone,
-    ToolStart {
-        label: String,
-        kind: String,
-    },
-    ToolDelta(String),
-    ToolResult {
-        label: String,
-        kind: String,
-    },
-    Tokens {
-        input: usize,
-        output: usize,
-        cached_input: usize,
-    },
-    Notice(String),
-    End {
-        messages: Vec<Message>,
-        usage: Usage,
-        err: Option<String>,
-        cancelled: bool,
-        compact: bool,
-    },
-}
-
-struct SlashItem {
-    command: String,
-    help: String,
-    description: String,
-    category: String,
-}
-
-impl SlashItem {
-    fn builtin(spec: &CommandSpec) -> SlashItem {
-        SlashItem {
-            command: spec.command.to_string(),
-            help: spec.help.to_string(),
-            description: spec.description.to_string(),
-            category: spec.category.to_string(),
-        }
-    }
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum PickerKind {
-    Slash,
-    Files,
-}
-
-struct Picker {
-    kind: PickerKind,
-    token_start: usize,
-    token_end: usize,
-    query: String,
-    sel: usize,
-    win: usize,
-    slash_matches: Vec<SlashItem>,
-    file_matches: Vec<String>,
-}
-
-const PICKER_VISIBLE: usize = 6;
-
-pub fn run(cfg: TuiConfig) -> Result<(), String> {
-    let mut term = Terminal::new()?;
-    let mut tui = Tui::new(cfg);
-    session::archive_live(&tui.cfg.session_dir);
-    if let Some(id) = tui.cfg.resume.clone() {
-        if id.is_empty() {
-            tui.open_screen(Screen::Resume);
-        } else {
-            tui.resume_by_id(&id);
-        }
-    }
-    if tui.entries.is_empty() {
-        tui.entries.push(Entry::Welcome);
-    }
-    tui.paint(&mut term);
-    let result = tui.loop_forever(&mut term);
-    term.restore();
-    let mut out = std::io::stdout();
-    let _ = write!(out, "{}", term::move_to(tui.last_input_row, 1));
-    let _ = out.write_all(b"\x1b[J\n");
-    let _ = out.flush();
-    if result.is_ok() {
-        tui.on_exit();
-    }
-    result
-}
-
-type PendingBlocks = Rc<RefCell<Vec<(String, Block)>>>;
-
-#[allow(clippy::type_complexity)]
-type CompactResult = Result<(String, usize, Vec<Message>, Vec<session::Entry>), String>;
-
-struct Tui {
-    cfg: TuiConfig,
-    entries: Vec<Entry>,
-    running: bool,
-    cancel: Arc<AtomicBool>,
-    ctrl_c_pending: bool,
-    ctrl_c_armed_ms: Option<Instant>,
-    esc_armed_ms: Option<Instant>,
-    last_input_row: u16,
-    exit_alt_pending: bool,
-    tx: Option<Sender<TurnEvent>>,
-    rx: Option<Receiver<TurnEvent>>,
-    steer_tx: Option<Sender<String>>,
-    compacting: bool,
-    compact_rx: Option<Receiver<CompactResult>>,
-    retry_after_compact: bool,
-    overflow_retried: bool,
-    cur_text: Option<usize>,
-    md: Option<Markdown>,
-    md_pending: Option<PendingBlocks>,
-    msgs: Vec<Message>,
-    session_context_len: usize,
-    activity: Activity,
-    tool_running: Option<String>,
-    tool_live: Option<String>,
-    pending_tools: Vec<String>,
-    turn_start: Instant,
-    last_animation_tick: u128,
-    input: Input,
-    model_display: String,
-    sess_in: usize,
-    sess_out: usize,
-    want_quit: bool,
-    screen: Screen,
-    alt_active: bool,
-    streamed: Vec<String>,
-    transcript_cache: Vec<String>,
-    transcript_cache_entries: usize,
-    transcript_cache_width: usize,
-    painted_once: bool,
-    last_capacity: usize,
-    last_frame: Vec<String>,
-    last_chrome: Option<(usize, Vec<String>, usize, usize)>,
-    reprint: bool,
-    live_in: usize,
-    live_out: usize,
-    live_cached_in: usize,
-    rows: u16,
-    cols: u16,
-    sel: usize,
-    window_start: usize,
-    sessions: Vec<SessionMeta>,
-    picker: Option<Picker>,
-    picker_dismissed: Option<PickerKind>,
-    rewind_items: Vec<RewindItem>,
-    /// Archive id being continued; None = a fresh session that forks on exit.
-    resume_id: Option<String>,
-}
-
-impl Tui {
-    fn new(cfg: TuiConfig) -> Tui {
-        let model_display = compact_model_label(&cfg.model);
-        Tui {
-            cfg,
-            entries: Vec::new(),
-            running: false,
-            cancel: Arc::new(AtomicBool::new(false)),
-            ctrl_c_pending: false,
-            ctrl_c_armed_ms: None,
-            esc_armed_ms: None,
-            last_input_row: 1,
-            exit_alt_pending: false,
-            tx: None,
-            rx: None,
-            steer_tx: None,
-            compacting: false,
-            compact_rx: None,
-            retry_after_compact: false,
-            overflow_retried: false,
-            cur_text: None,
-            md: None,
-            md_pending: None,
-            msgs: Vec::new(),
-            session_context_len: 0,
-            activity: Activity::Idle,
-            tool_running: None,
-            tool_live: None,
-            pending_tools: Vec::new(),
-            turn_start: Instant::now(),
-            last_animation_tick: 0,
-            input: Input::default(),
-            model_display,
-            sess_in: 0,
-            sess_out: 0,
-            want_quit: false,
-            screen: Screen::None,
-            alt_active: false,
-            streamed: Vec::new(),
-            transcript_cache: Vec::new(),
-            transcript_cache_entries: 0,
-            transcript_cache_width: 0,
-            painted_once: false,
-            last_capacity: 0,
-            last_frame: Vec::new(),
-            last_chrome: None,
-            reprint: false,
-            live_in: 0,
-            live_out: 0,
-            live_cached_in: 0,
-            rows: 24,
-            cols: 80,
-            sel: 0,
-            window_start: 0,
-            sessions: Vec::new(),
-            picker: None,
-            picker_dismissed: None,
-            rewind_items: Vec::new(),
-            resume_id: None,
-        }
-    }
-
-    fn on_exit(&mut self) {
-        let pending: Vec<session::Entry> = self.msgs
-            [self.session_context_len.min(self.msgs.len())..]
-            .iter()
-            .map(|message| session::Entry::Message {
-                message: message.clone(),
-            })
-            .collect();
-        match self.resume_id.take() {
-            Some(id) => {
-                let appended = session::append_live(&self.cfg.session_dir, &pending).is_ok();
-                if appended
-                    && session::continue_archived_live(&self.cfg.session_dir, &id).unwrap_or(false)
-                {
-                    return;
-                }
-                let mut entries = session::load_live(&self.cfg.session_dir);
-                if !appended {
-                    entries.extend(pending);
-                }
-                let _ = session::continue_archived(&self.cfg.session_dir, &id, &entries);
-            }
-            None => {
-                let _ = session::append_live(&self.cfg.session_dir, &pending);
-                session::archive_live(&self.cfg.session_dir);
-            }
-        }
-    }
-
-    fn loop_forever(&mut self, term: &mut Terminal) -> Result<(), String> {
-        let stdin_fd = libc::STDIN_FILENO;
-        loop {
-            let mut fds = [libc::pollfd {
-                fd: stdin_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            }];
-            unsafe {
-                libc::poll(fds.as_mut_ptr(), 1, 40);
-            }
-            let input_ready = fds[0].revents & libc::POLLIN != 0;
-            if input_ready && !self.handle_key(term.read_key()?)? {
-                break;
-            }
-            if self.want_quit {
-                break;
-            }
-            let mut changed = input_ready;
-            if self.exit_alt_pending {
-                self.exit_alt_pending = false;
-                self.leave_alt(term);
-                changed = true;
-            }
-            if let Some(t) = self.ctrl_c_armed_ms
-                && t.elapsed().as_millis() >= 3000
-            {
-                self.ctrl_c_armed_ms = None;
-                self.ctrl_c_pending = false;
-                changed = true;
-            }
-            if let Some(t) = self.esc_armed_ms
-                && t.elapsed().as_millis() >= REWIND_ESC_MS
-            {
-                self.esc_armed_ms = None;
-                changed = true;
-            }
-            changed |= self.drain_events();
-            changed |= term.size() != (self.rows, self.cols);
-            let animation_tick = self.turn_start.elapsed().as_millis() / 500;
-            let animated = self.tool_running.is_some() || self.activity == Activity::Thinking;
-            if animated && animation_tick != self.last_animation_tick {
-                self.last_animation_tick = animation_tick;
-                changed = true;
-            }
-            if changed {
-                self.paint(term);
-            }
-        }
-        Ok(())
-    }
-
-    fn ctrl_letter(c: char) -> Option<char> {
-        let b = c as u8;
-        if (1..=26).contains(&b) {
-            Some((b + 96) as char)
-        } else {
-            None
-        }
-    }
-
-    fn handle_key(&mut self, key: Key) -> Result<bool, String> {
-        match key {
-            Key::CtrlC | Key::Esc => {}
-            Key::Ctrl(c) if c as u8 == 3 => {}
-            _ => {
-                self.ctrl_c_pending = false;
-                self.ctrl_c_armed_ms = None;
-                self.esc_armed_ms = None;
-            }
-        }
-        if self.screen != Screen::None {
-            return self.handle_screen_key(key);
-        }
-        match key {
-            Key::CtrlC => {
-                self.ctrl_c();
-                return Ok(true);
-            }
-            Key::Ctrl(c) if c as u8 == 3 => {
-                // Ctrl+C via modifyOtherKeys (ESC[27;5;99~)
-                self.ctrl_c();
-                return Ok(true);
-            }
-            Key::Ctrl(c) => {
-                let letter = Self::ctrl_letter(c).unwrap_or(c);
-                if !self.handle_ctrl(letter) {
-                    return Ok(false);
-                }
-            }
-            Key::Char(c) => self.input.insert(c),
-            Key::Enter => {
-                if self.picker.is_some() {
-                    self.picker_enter();
-                } else if self.running {
-                    self.steer();
-                } else {
-                    self.submit();
-                    if self.want_quit {
-                        return Ok(false);
-                    }
-                }
-            }
-            Key::ShiftEnter => self.input.insert('\n'),
-            Key::Tab => {
-                if self.picker.is_some() {
-                    self.picker_tab();
-                }
-            }
-            Key::ShiftTab => {
-                if self.picker.is_some() {
-                    self.picker_move(true);
-                }
-            }
-            Key::Backspace => self.input.backspace(),
-            Key::Delete => self.input.delete(),
-            Key::Left => self.input.move_left(),
-            Key::Right => self.input.move_right(),
-            Key::Home => self.input.home(),
-            Key::End => self.input.end(),
-            Key::CtrlHome => self.input.doc_home(),
-            Key::CtrlEnd => self.input.doc_end(),
-            Key::Up => {
-                if self.picker.is_some() {
-                    self.picker_move(true);
-                } else {
-                    let (line, _) = self.input.cursor_line_col();
-                    if line > 0 {
-                        self.input.move_line_up();
-                    } else {
-                        self.input.history_prev();
-                    }
-                }
-            }
-            Key::Down => {
-                if self.picker.is_some() {
-                    self.picker_move(false);
-                } else {
-                    let lines = self.input.buf().chars().filter(|c| *c == '\n').count();
-                    let (line, _) = self.input.cursor_line_col();
-                    if line < lines {
-                        self.input.move_line_down();
-                    } else {
-                        self.input.history_next();
-                    }
-                }
-            }
-            Key::AltLeft | Key::CtrlLeft => self.input.move_word_left(),
-            Key::AltRight | Key::CtrlRight => self.input.move_word_right(),
-            Key::AltUp | Key::AltDown | Key::CtrlUp | Key::CtrlDown => {}
-            Key::PageUp | Key::PageDown => {}
-            Key::Alt(c) if c == '\r' || c == '\n' => self.input.insert('\n'),
-            Key::Alt(_) => self.input.esc(),
-            Key::Esc => {
-                if self.picker.is_some() {
-                    self.picker_dismiss();
-                } else {
-                    self.input.esc();
-                    if self.double_esc() {
-                        if self.busy_for_rewind() {
-                            self.entries.push(Entry::Notice(
-                                "agent is running; ctrl+c interrupts it first".into(),
-                            ));
-                        } else {
-                            self.open_screen(Screen::Rewind);
-                        }
-                    } else {
-                        self.esc_armed_ms = Some(Instant::now());
-                    }
-                }
-            }
-            Key::Paste(bytes) => self.input.paste(&bytes),
-            Key::PasteEnd => {}
-            Key::Eof => return Ok(false),
-        }
-        Ok(true)
-    }
-
-    fn handle_screen_key(&mut self, key: Key) -> Result<bool, String> {
-        match key {
-            Key::CtrlC => {
-                let now = Instant::now();
-                let within = self
-                    .ctrl_c_armed_ms
-                    .map(|t| now.duration_since(t).as_millis() < 3000)
-                    .unwrap_or(false);
-                if within {
-                    self.want_quit = true;
-                } else {
-                    self.ctrl_c_armed_ms = Some(now);
-                    self.ctrl_c_pending = true;
-                    self.close_screen();
-                }
-                Ok(true)
-            }
-            Key::Ctrl(c) => {
-                let letter = Self::ctrl_letter(c).unwrap_or(c);
-                if letter == 'o' || letter == 'l' {
-                    self.close_screen();
-                }
-                Ok(true)
-            }
-            Key::Esc => {
-                self.close_screen();
-                Ok(true)
-            }
-            Key::Char(c) => {
-                self.input.insert(c);
-                self.sel = 0;
-                self.window_start = 0;
-                Ok(true)
-            }
-            Key::Backspace => {
-                self.input.backspace();
-                self.sel = 0;
-                self.window_start = 0;
-                Ok(true)
-            }
-            Key::Up => {
-                self.sel = self.sel.saturating_sub(1);
-                Ok(true)
-            }
-            Key::Down => {
-                let n = self.catalog_item_count();
-                if n > 0 && self.sel + 1 < n {
-                    self.sel += 1;
-                }
-                Ok(true)
-            }
-            Key::PageUp => {
-                self.sel = self.sel.saturating_sub(8);
-                Ok(true)
-            }
-            Key::PageDown => {
-                let n = self.catalog_item_count();
-                self.sel = (self.sel + 8).min(n.saturating_sub(1));
-                Ok(true)
-            }
-            Key::Left | Key::Right | Key::Tab => Ok(true),
-            Key::Enter => {
-                self.catalog_activate();
-                Ok(true)
-            }
-            Key::Paste(bytes) => {
-                for c in String::from_utf8_lossy(&bytes).chars() {
-                    if c == '\n' || c == '\r' {
-                        continue;
-                    }
-                    self.input.insert(c);
-                }
-                self.sel = 0;
-                self.window_start = 0;
-                Ok(true)
-            }
-            _ => Ok(true),
-        }
-    }
-
-    fn close_screen(&mut self) {
-        self.screen = Screen::None;
-        self.input.take();
-        self.exit_alt_pending = true;
-        self.streamed.clear();
-    }
-
-    fn enter_alt(&mut self, term: &mut Terminal) {
-        if self.alt_active {
-            return;
-        }
-        let out = term.out();
-        let _ = out.write_all(term::enter_alt().as_bytes());
-        let _ = out.write_all(term::clear_display().as_bytes());
-        let _ = out.flush();
-        self.alt_active = true;
-    }
-
-    fn leave_alt(&mut self, term: &mut Terminal) {
-        if !self.alt_active {
-            return;
-        }
-        let out = term.out();
-        let _ = out.write_all(term::leave_alt().as_bytes());
-        let _ = out.flush();
-        self.alt_active = false;
-    }
-
-    /// Consume an Esc press: true when it completes a double-Esc within
-    /// REWIND_ESC_MS of the previous one.
-    fn double_esc(&mut self) -> bool {
-        let now = Instant::now();
-        let within = self
-            .esc_armed_ms
-            .map(|t| now.duration_since(t).as_millis() < REWIND_ESC_MS)
-            .unwrap_or(false);
-        self.esc_armed_ms = None;
-        within
-    }
-
-    fn busy_for_rewind(&self) -> bool {
-        self.running || self.compacting
-    }
-
-    fn ctrl_c(&mut self) {
-        let now = Instant::now();
-        let within = self
-            .ctrl_c_armed_ms
-            .map(|t| now.duration_since(t).as_millis() < 3000)
-            .unwrap_or(false);
-        if within {
-            if self.running {
-                self.cancel.store(true, Ordering::Relaxed);
-                crate::tools::kill_children();
-            }
-            self.want_quit = true;
-        } else {
-            self.ctrl_c_armed_ms = Some(now);
-            self.ctrl_c_pending = true;
-            if self.running {
-                self.cancel.store(true, Ordering::Relaxed);
-                crate::tools::kill_children();
-            }
-            if !self.input.buf.is_empty() {
-                self.input.buf.clear();
-                self.input.cursor = 0;
-            }
-        }
-    }
-
-    fn handle_ctrl(&mut self, c: char) -> bool {
-        match c {
-            'a' => self.input.home(),
-            'e' => self.input.end(),
-            'b' => self.input.move_left(),
-            'f' => self.input.move_right(),
-            'p' => self.input.history_prev(),
-            'n' => self.input.history_next(),
-            'w' => self.input.delete_word_left(),
-            'u' => {
-                let chars: Vec<char> = self.input.buf.chars().collect();
-                self.input.buf = chars[self.input.cursor..].iter().collect();
-                self.input.cursor = 0;
-            }
-            'k' => {
-                let chars: Vec<char> = self.input.buf.chars().collect();
-                self.input.buf = chars[..self.input.cursor].iter().collect();
-            }
-            'd' => {
-                if !self.running && self.input.buf.is_empty() {
-                    return false;
-                }
-                if self.input.cursor < self.input.buf.chars().count() {
-                    self.input.delete();
-                }
-            }
-            'l' => {
-                self.painted_once = false;
-            }
-            _ => {}
-        }
-        true
-    }
-
-    fn steer(&mut self) {
-        let v = self.input.take();
-        if v.trim().is_empty() {
-            return;
-        }
-        match &self.steer_tx {
-            Some(tx) if tx.send(v.clone()).is_ok() => {
-                self.entries.push(Entry::User(v));
-            }
-            _ => {
-                // The run just ended (worker dropped the steer receiver). Keep
-                // the draft in the input instead of stranding it in the
-                // transcript; the next Enter submits normally.
-                self.input.buf = v;
-                self.entries
-                    .push(Entry::Notice("agent finished; press enter to send".into()));
-            }
-        }
-    }
-
-    fn submit(&mut self) {
-        if self.compacting {
-            self.entries.push(Entry::Notice("compacting…".into()));
-            return;
-        }
-        let v = self.input.take();
-        if v.is_empty() {
-            return;
-        }
-        if let Some(rest) = v.strip_prefix('/') {
-            self.slash(rest);
-            return;
-        }
-        if self.running {
-            return;
-        }
-        self.entries.push(Entry::User(v.clone()));
-        self.input.history.push(v.clone());
-        self.msgs.push(Message {
-            role: "user".into(),
-            content: v,
-            tool_calls: Vec::new(),
-            tool_call_id: String::new(),
-        });
-        self.start_turn();
-    }
-
-    /// Append the new messages from a finished run to the session entries,
-    /// save, and schedule compaction when the context is over budget or the
-    /// run failed with a context overflow error (retrying once after).
-    fn persist_session(
-        &mut self,
-        messages: &[Message],
-        usage: Usage,
-        err: Option<&str>,
-        resume_after_compaction: bool,
-    ) {
-        let new_msgs = messages.get(self.session_context_len..).unwrap_or_default();
-        let mut appended = Vec::with_capacity(new_msgs.len() + 1);
-        for message in new_msgs {
-            appended.push(session::Entry::Message {
-                message: message.clone(),
-            });
-        }
-        if usage.input > 0 || usage.output > 0 {
-            appended.push(session::Entry::Usage {
-                input: usage.input,
-                output: usage.output,
-                cached_input: self.live_cached_in,
-                context_input: self.live_in,
-                context_output: self.live_out,
-            });
-        }
-        if let Err(e) = session::append_live(&self.cfg.session_dir, &appended) {
-            self.entries
-                .push(Entry::Notice(format!("error: save session: {e}")));
-            return;
-        }
-        self.session_context_len += new_msgs.len();
-
-        if resume_after_compaction && !self.compacting {
-            self.retry_after_compact = true;
-            self.start_compaction();
-            return;
-        }
-        let overflow = err.map(session::is_overflow_error).unwrap_or(false);
-        if overflow && !self.overflow_retried && !self.compacting {
-            self.overflow_retried = true;
-            self.retry_after_compact = true;
-            self.start_compaction();
-            return;
-        }
-        if overflow || self.compacting {
-            return;
-        }
-        let threshold = self
-            .cfg
-            .context_window
-            .map(|window| window.saturating_sub(16384));
-        if let Some(threshold) = threshold
-            && self.live_in > 0
-            && self.live_in.saturating_add(self.live_out) > threshold
-        {
-            self.start_compaction();
-        }
-    }
-
-    fn start_compaction(&mut self) {
-        let entries = session::load_live(&self.cfg.session_dir);
-        self.compacting = true;
-        self.entries.push(Entry::Notice("compacting…".into()));
-        let provider = OpenAI::new(self.cfg.base.clone(), self.cfg.api_key.clone());
-        let model = self.cfg.model.clone();
-        let (ctx_tx, ctx_rx) = std::sync::mpsc::channel();
-        self.compact_rx = Some(ctx_rx);
-        std::thread::spawn(move || {
-            let result = session::compact(&provider, &model, &entries).map(
-                |(summary, tokens_before, retained)| (summary, tokens_before, retained, entries),
-            );
-            let _ = ctx_tx.send(result);
-        });
-    }
-
-    fn finish_compaction(
-        &mut self,
-        summary: String,
-        tokens_before: usize,
-        retained: Vec<Message>,
-        mut entries: Vec<session::Entry>,
-    ) {
-        self.compacting = false;
-        let entry = session::Entry::Compaction {
-            summary,
-            tokens_before,
-            timestamp: session::now_ms(),
-            retained,
-        };
-        // Append-only: the summary entry joins the existing entries; the
-        // context projection drops what it supersedes.
-        if let Err(e) = session::append_live(&self.cfg.session_dir, std::slice::from_ref(&entry)) {
-            self.entries
-                .push(Entry::Notice(format!("error: save session: {e}")));
-            return;
-        }
-        entries.push(entry);
-        self.msgs = session::context_messages(&entries);
-        self.session_context_len = self.msgs.len();
-        self.live_in = 0;
-        self.live_out = 0;
-        self.live_cached_in = 0;
-        self.entries.push(Entry::Notice("compacted".into()));
-        if self.retry_after_compact {
-            self.retry_after_compact = false;
-            self.start_turn();
-        }
-    }
-
-    fn start_turn(&mut self) {
-        if self.compacting {
-            return;
-        }
-        session::trim_trailing_tool_messages(&mut self.msgs);
-        let msgs = self.msgs.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.tx = Some(tx.clone());
-        self.rx = Some(rx);
-        let (steer_tx, steer_rx) = std::sync::mpsc::channel();
-        self.steer_tx = Some(steer_tx);
-        self.running = true;
-        self.cancel = Arc::new(AtomicBool::new(false));
-        self.ctrl_c_pending = false;
-        self.ctrl_c_armed_ms = None;
-        self.turn_start = Instant::now();
-        self.activity = Activity::Thinking;
-        self.cur_text = None;
-        let cancel = self.cancel.clone();
-        let provider = OpenAI::new(self.cfg.base.clone(), self.cfg.api_key.clone());
-        let model = self.cfg.model.clone();
-        let system = self.cfg.system.clone();
-        let dir = self.cfg.dir.clone();
-        let tools = build_tools(&dir);
-        let threshold = self
-            .cfg
-            .context_window
-            .map(|window| window.saturating_sub(16384));
-        std::thread::spawn(move || {
-            let end = {
-                let mut sink = TuiSink {
-                    tx: &tx,
-                    steer: steer_rx,
-                    threshold,
-                };
-                run::run_stream(
-                    &provider,
-                    &RunOptions {
-                        model: &model,
-                        system: &system,
-                        tools: &tools,
-                        max_turns: usize::MAX,
-                    },
-                    &msgs,
-                    &cancel,
-                    &mut sink,
-                )
-            };
-            let (err, cancelled, compact) = match end.outcome {
-                Outcome::Done => (None, false, false),
-                Outcome::MaxTurns => (Some("stopped: max turns reached".into()), false, false),
-                Outcome::Cancelled => (None, true, false),
-                Outcome::Compact => (None, false, true),
-                Outcome::Failed(e) => (Some(e), false, false),
-            };
-            let _ = tx.send(TurnEvent::End {
-                messages: end.messages,
-                usage: end.usage,
-                err,
-                cancelled,
-                compact,
-            });
-        });
-    }
-
-    fn drain_events(&mut self) -> bool {
-        let mut any = false;
-        let mut cur = self.cur_text;
-        if let Some(rx) = self.rx.take() {
-            let mut deferred = None;
-            loop {
-                let ev = match deferred.take() {
-                    Some(ev) => ev,
-                    None => match rx.try_recv() {
-                        Ok(ev) => ev,
-                        Err(_) => break,
-                    },
-                };
-                any = true;
-                match ev {
-                    TurnEvent::AssistantDelta(mut delta) => {
-                        loop {
-                            match rx.try_recv() {
-                                Ok(TurnEvent::AssistantDelta(next)) => delta.push_str(&next),
-                                Ok(TurnEvent::Tokens {
-                                    input,
-                                    output,
-                                    cached_input,
-                                }) => {
-                                    if input > 0 {
-                                        self.live_in = input;
-                                        self.live_cached_in = cached_input;
-                                    }
-                                    self.live_out = output;
-                                }
-                                Ok(next) => {
-                                    deferred = Some(next);
-                                    break;
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        self.flush_tools();
-                        if self.md.is_none() {
-                            let pending = Rc::new(RefCell::new(Vec::new()));
-                            let p2 = pending.clone();
-                            let mut md = Markdown::new();
-                            md.set_on_block(move |b, out| {
-                                p2.borrow_mut().push((std::mem::take(out), b));
-                            });
-                            self.md = Some(md);
-                            self.md_pending = Some(pending);
-                        }
-                        let pending = self.md_pending.as_ref().unwrap().clone();
-                        self.md.as_mut().unwrap().push(&delta);
-                        for (drained, block) in pending.borrow_mut().drain(..) {
-                            if let Some(i) = cur.take() {
-                                self.entries[i] = Entry::Text(drained);
-                            } else if !drained.is_empty() {
-                                self.entries.push(Entry::Text(drained));
-                            }
-                            self.push_block(block);
-                            cur = None;
-                        }
-                        let text = self.md.as_ref().unwrap().current_text();
-                        if let Some(i) = cur {
-                            if !text.is_empty() {
-                                self.entries[i] = Entry::Text(text);
-                            }
-                        } else if !text.is_empty() {
-                            self.entries.push(Entry::Text(text));
-                            cur = Some(self.entries.len() - 1);
-                        }
-                    }
-                    TurnEvent::AssistantDone => {
-                        self.flush_tools();
-                        if let Some(mut md) = self.md.take() {
-                            let pending = self.md_pending.take();
-                            let tail = md.finish();
-                            if let Some(pending) = pending {
-                                for (drained, block) in pending.borrow_mut().drain(..) {
-                                    if !drained.is_empty() {
-                                        self.entries.push(Entry::Text(drained));
-                                    }
-                                    self.push_block(block);
-                                }
-                            }
-                            if !tail.is_empty() {
-                                if let Some(i) = cur.take() {
-                                    self.entries[i] = Entry::Text(tail);
-                                } else {
-                                    self.entries.push(Entry::Text(tail));
-                                }
-                            }
-                        }
-                        cur = None;
-                        self.activity = Activity::Thinking;
-                    }
-                    TurnEvent::ToolStart { label, .. } => {
-                        self.tool_running = Some(label.clone());
-                        self.tool_live = None;
-                    }
-                    TurnEvent::ToolDelta(text) => {
-                        self.tool_live = Some(text);
-                    }
-                    TurnEvent::ToolResult { label, .. } => {
-                        self.tool_running = None;
-                        self.tool_live = None;
-                        self.pending_tools.push(label);
-                        self.activity = Activity::Thinking;
-                    }
-                    TurnEvent::Tokens {
-                        input,
-                        output,
-                        cached_input,
-                    } => {
-                        if input > 0 {
-                            self.live_in = input;
-                            self.live_cached_in = cached_input;
-                        }
-                        self.live_out = output;
-                    }
-                    TurnEvent::Notice(text) => {
-                        self.flush_tools();
-                        self.entries.push(Entry::Notice(text));
-                    }
-                    TurnEvent::End {
-                        messages,
-                        usage,
-                        err,
-                        cancelled,
-                        compact,
-                    } => {
-                        self.running = false;
-                        self.tool_running = None;
-                        self.tool_live = None;
-                        self.sess_in += usage.input;
-                        self.sess_out += usage.output;
-                        if let Some(mut md) = self.md.take() {
-                            let pending = self.md_pending.take();
-                            let tail = md.finish();
-                            if let Some(pending) = pending {
-                                for (drained, block) in pending.borrow_mut().drain(..) {
-                                    if let Some(i) = cur.take() {
-                                        self.entries[i] = Entry::Text(drained);
-                                    } else if !drained.is_empty() {
-                                        self.entries.push(Entry::Text(drained));
-                                    }
-                                    self.push_block(block);
-                                    cur = None;
-                                }
-                            }
-                            if !tail.is_empty() {
-                                if let Some(i) = cur.take() {
-                                    self.entries[i] = Entry::Text(tail);
-                                } else {
-                                    self.entries.push(Entry::Text(tail));
-                                }
-                            }
-                        }
-                        cur = None;
-                        self.cur_text = None;
-                        self.msgs = messages.clone();
-                        self.flush_tools();
-                        if cancelled {
-                            self.entries.push(Entry::Notice("interrupted".into()));
-                        } else if err.is_none() {
-                            self.entries.push(Entry::Summary {
-                                secs: self.turn_start.elapsed().as_secs(),
-                                input: usage.input,
-                                output: usage.output,
-                            });
-                        }
-                        if let Some(err) = err {
-                            self.entries.push(Entry::Notice(format!("error: {err}")));
-                            self.persist_session(&messages, usage, Some(&err), compact);
-                        } else {
-                            self.persist_session(&messages, usage, None, compact);
-                        }
-                        self.activity = Activity::Idle;
-                    }
-                }
-            }
-            self.rx = Some(rx);
-        }
-        self.cur_text = cur;
-        if let Some(rx) = self.compact_rx.take() {
-            match rx.try_recv() {
-                Ok(Ok((summary, tokens_before, retained, entries))) => {
-                    self.finish_compaction(summary, tokens_before, retained, entries);
-                }
-                Ok(Err(e)) => {
-                    self.compacting = false;
-                    self.retry_after_compact = false;
-                    self.entries
-                        .push(Entry::Notice(format!("compaction failed: {e}")));
-                }
-                Err(_) => self.compact_rx = Some(rx),
-            }
-        }
-        any
-    }
-
-    fn flush_tools(&mut self) {
-        if self.pending_tools.is_empty() {
-            return;
-        }
-        let calls = std::mem::take(&mut self.pending_tools);
-        self.entries.push(Entry::Tool { calls });
-    }
-
-    fn push_block(&mut self, block: Block) {
-        match block {
-            Block::Code { language, code } => {
-                self.entries.push(Entry::Code(markdown::render_code_block(
-                    language.as_bytes(),
-                    code.as_bytes(),
-                )));
-            }
-            Block::Table(t) => self.entries.push(Entry::Table(t)),
-            Block::Rule => self.entries.push(Entry::Rule),
-        }
-    }
-
-    fn slash(&mut self, cmd: &str) {
-        let command = app::parse_command(cmd);
-        if self.running
-            && matches!(
-                command,
-                Some(Command::New | Command::Resume | Command::Rewind | Command::Compact)
-            )
-        {
-            self.entries.push(Entry::Notice(
-                "agent is running; ctrl+c interrupts it first".into(),
-            ));
-            return;
-        }
-        match command {
-            Some(Command::Help) => self.open_screen(Screen::Help),
-            Some(Command::New) => self.fresh_session(),
-            Some(Command::Resume) => self.open_screen(Screen::Resume),
-            Some(Command::Rewind) => self.open_screen(Screen::Rewind),
-            Some(Command::Compact) => {
-                if self.compacting {
-                    self.entries
-                        .push(Entry::Notice("already compacting…".into()));
-                } else {
-                    if self.session_context_len < 4 {
-                        self.entries.push(Entry::Notice(format!(
-                            "{DIM}session too small to compact{RESET}"
-                        )));
-                    } else {
-                        self.start_compaction();
-                    }
-                }
-            }
-            Some(Command::Copy) => self.copy_last(),
-            Some(Command::Quit) => {
-                self.want_quit = true;
-            }
-            None => {
-                let name = cmd.split_whitespace().next().unwrap_or_default();
-                self.entries.push(Entry::Notice(format!(
-                    "{DIM}unknown command: /{name}{RESET}"
-                )));
-            }
-        }
-    }
-
-    fn fresh_session(&mut self) {
-        match self.resume_id.take() {
-            Some(id) => {
-                if !session::continue_archived_live(&self.cfg.session_dir, &id).unwrap_or(false) {
-                    let entries = session::load_live(&self.cfg.session_dir);
-                    let _ = session::continue_archived(&self.cfg.session_dir, &id, &entries);
-                }
-            }
-            None => {
-                session::archive_live(&self.cfg.session_dir);
-            }
-        }
-        self.entries.clear();
-        self.transcript_cache.clear();
-        self.transcript_cache_entries = 0;
-        self.entries.push(Entry::Welcome);
-        self.msgs.clear();
-        self.session_context_len = 0;
-        self.pending_tools.clear();
-        self.sess_in = 0;
-        self.sess_out = 0;
-        self.live_in = 0;
-        self.live_out = 0;
-        self.live_cached_in = 0;
-        self.input.history.clear();
-        self.activity = Activity::Idle;
-        self.running = false;
-        self.cur_text = None;
-        self.md = None;
-        self.md_pending = None;
-        self.streamed.clear();
-    }
-
-    fn copy_last(&mut self) {
-        let Some(text) = app::last_assistant_response(&self.msgs) else {
-            self.entries.push(Entry::Notice(format!(
-                "{DIM}no assistant response to copy{RESET}"
-            )));
-            return;
-        };
-        let b64 = b64_encode(text.as_bytes());
-        print!("\x1b]52;c;{b64}\x1b\\");
-        let _ = std::io::stdout().flush();
-        self.entries
-            .push(Entry::Notice(format!("{DIM}copied last response{RESET}")));
-    }
-
-    fn resume_by_id(&mut self, id: &str) {
-        let dir = self.cfg.session_dir.clone();
-        let loaded = app::load_session(&dir, id);
-        match loaded {
-            Some((id, msgs)) => {
-                if self.load_messages(msgs) {
-                    self.resume_id = Some(id.clone());
-                    session::set_resume_id(&dir, &id);
-                }
-            }
-            None => {
-                self.entries
-                    .push(Entry::Notice(format!("{DIM}no such session: {id}{RESET}")));
-            }
-        }
-    }
-
-    fn load_messages(&mut self, entries: Vec<session::Entry>) -> bool {
-        self.msgs = session::context_messages(&entries);
-        let usage = app::session_usage(&entries);
-        self.sess_in = usage.input;
-        self.sess_out = usage.output;
-        self.live_in = usage.context_input;
-        self.live_out = 0;
-        self.live_cached_in = usage.cached_input;
-        self.entries.clear();
-        self.transcript_cache.clear();
-        self.transcript_cache_entries = 0;
-        self.entries.push(Entry::Welcome);
-        let mut tools: Vec<String> = Vec::new();
-        for m in &self.msgs {
-            match m.role.as_str() {
-                "user" => {
-                    if !tools.is_empty() {
-                        self.entries.push(Entry::Tool {
-                            calls: std::mem::take(&mut tools),
-                        });
-                    }
-                    self.entries.push(Entry::User(m.content.clone()));
-                }
-                "assistant" => {
-                    if !m.content.is_empty() {
-                        if !tools.is_empty() {
-                            self.entries.push(Entry::Tool {
-                                calls: std::mem::take(&mut tools),
-                            });
-                        }
-                        self.entries
-                            .push(Entry::Text(markdown::Markdown::render(&m.content)));
-                    }
-                    for c in &m.tool_calls {
-                        tools.push(app::tool_label(c, false));
-                    }
-                }
-                _ => {}
-            }
-        }
-        if !tools.is_empty() {
-            self.entries.push(Entry::Tool { calls: tools });
-        }
-        self.pending_tools.clear();
-        self.streamed.clear();
-        self.overflow_retried = false;
-        self.reprint = true;
-        if let Err(e) = session::save_live(&self.cfg.session_dir, &entries) {
-            self.entries
-                .push(Entry::Notice(format!("error: save session: {e}")));
-            return false;
-        }
-        self.session_context_len = self.msgs.len();
-        true
-    }
-
-    fn open_screen(&mut self, screen: Screen) {
-        match screen {
-            Screen::Resume => {
-                self.sessions = session::list_sessions(&self.cfg.session_dir);
-            }
-            Screen::Rewind => {
-                self.rewind_items = self.build_rewind_items();
-            }
-            _ => {}
-        }
-        self.screen = screen;
-        self.input.take();
-        self.sel = 0;
-        self.window_start = 0;
-        if screen == Screen::Rewind {
-            // Start on the most recent message: rewinding usually means
-            // going back just a turn or two.
-            self.sel = self.filtered_rewind_items().len().saturating_sub(1);
-        }
-        self.last_frame.clear();
-    }
-
-    fn build_rewind_items(&self) -> Vec<RewindItem> {
-        app::rewind_items(&self.msgs)
-    }
-
-    fn filtered_rewind_items(&self) -> Vec<RewindItem> {
-        app::filter_rewind_items(&self.rewind_items, self.input.buf())
-    }
-
-    /// Drop everything from message `idx` onward, in memory and on disk.
-    /// The session file is append-only with compaction markers, so the
-    /// truncated transcript is rewritten as a flat message list; a later
-    /// compaction will re-summarize as usual.
-    fn rewind_to(&mut self, idx: usize) {
-        let entries = app::rewind_entries(&self.msgs, idx);
-        self.load_messages(entries);
-        let n = self.msgs.len();
-        self.entries.push(Entry::Notice(format!(
-            "{DIM}rewound · {n} message{} remaining{RESET}",
-            if n == 1 { "" } else { "s" }
-        )));
-    }
-
-    fn catalog_item_count(&self) -> usize {
-        match self.screen {
-            Screen::Help => self.help_items().len(),
-            Screen::Resume => self.filtered_sessions().len(),
-            Screen::Rewind => self.filtered_rewind_items().len(),
-            _ => 0,
-        }
-    }
-
-    fn help_items(&self) -> Vec<SlashItem> {
-        app::command_search(self.input.buf())
-            .iter()
-            .map(SlashItem::builtin)
-            .collect()
-    }
-
-    fn filtered_sessions(&self) -> Vec<&SessionMeta> {
-        let q = self.input.buf().trim().to_lowercase();
-        self.sessions
-            .iter()
-            .filter(|s| q.is_empty() || s.title.to_lowercase().contains(&q))
-            .collect()
-    }
-
-    fn catalog_activate(&mut self) {
-        match self.screen {
-            Screen::Help => {
-                let items = self.help_items();
-                if let Some(spec) = items.get(self.sel) {
-                    let cmd = spec.command.clone();
-                    self.close_screen();
-                    if let Some(rest) = cmd.strip_prefix('/') {
-                        self.slash(rest);
-                    }
-                }
-            }
-            Screen::Resume => {
-                let s = self.filtered_sessions().get(self.sel).cloned().cloned();
-                if let Some(s) = s {
-                    // Flush the session being continued so switching targets
-                    // does not drop its transcript.
-                    if let Some(prev) = self.resume_id.take()
-                        && !session::continue_archived_live(&self.cfg.session_dir, &prev)
-                            .unwrap_or(false)
-                    {
-                        let entries = session::load_live(&self.cfg.session_dir);
-                        let _ = session::continue_archived(&self.cfg.session_dir, &prev, &entries);
-                    }
-                    let msgs = session::load_session(&s.path);
-                    let title = s.title.clone();
-                    self.close_screen();
-                    if self.load_messages(msgs) {
-                        self.resume_id = Some(s.id.clone());
-                        session::set_resume_id(&self.cfg.session_dir, &s.id);
-                        self.entries
-                            .push(Entry::Notice(format!("{DIM}resumed: {title}{RESET}")));
-                    }
-                }
-            }
-            Screen::Rewind => {
-                let item = self.filtered_rewind_items().get(self.sel).cloned();
-                if let Some(it) = item {
-                    let idx = it.message_index;
-                    self.close_screen();
-                    self.rewind_to(idx);
-                }
-            }
-            Screen::None => {}
-        }
-    }
-
-    fn catalog_rows(&mut self, rows: u16, cols: u16) -> Vec<String> {
-        let width = cols as usize;
-        let mut out = Vec::new();
-        let (composer_rows, _, _) = self.input.render_with("┃ ", width);
-        let composer = composer_rows.first().cloned().unwrap_or_default();
-        out.push(format!("{HINT}{composer}{RESET}"));
-        out.push(format!("{DIVIDER}{}{RESET}", "\u{2500}".repeat(width)));
-        let q = self.input.buf().trim().to_lowercase();
-        let sel = self.sel;
-        let dir = self.cfg.dir.clone();
-        let screen = self.screen;
-        match screen {
-            Screen::Help => {
-                let items = self.help_items();
-                out.push(format!("{SELECTED}Commands {}{RESET}", items.len()));
-                push_catalog_items(
-                    &mut self.window_start,
-                    sel,
-                    &mut out,
-                    items.len(),
-                    rows,
-                    |i| {
-                        let s = &items[i];
-                        let style = if i == sel { SELECTED } else { DIM };
-                        let mut r = format!("{style}  {}{RESET}", s.help);
-                        let desc_col = width * 2 / 3;
-                        let pad = desc_col.saturating_sub(visible_width(&r));
-                        r.push_str(&" ".repeat(pad));
-                        r.push_str(&format!(
-                            "{DIM}{}{RESET}",
-                            clip(&s.description, width.saturating_sub(desc_col))
-                        ));
-                        r
-                    },
-                );
-            }
-            Screen::Resume => {
-                let items: Vec<(String, i64, usize)> = self
-                    .sessions
-                    .iter()
-                    .filter(|s| q.is_empty() || s.title.to_lowercase().contains(&q))
-                    .map(|s| (s.title.clone(), s.updated, s.turns))
-                    .collect();
-                out.push(format!("{SELECTED}Sessions {}{RESET}", items.len()));
-                push_catalog_items(
-                    &mut self.window_start,
-                    sel,
-                    &mut out,
-                    items.len(),
-                    rows,
-                    |i| {
-                        let (title, updated, turns) = &items[i];
-                        let age = age_str(*updated);
-                        let meta = format!(
-                            "{} · {} · {} turn{}",
-                            workspace_label(&dir),
-                            age,
-                            turns,
-                            if *turns == 1 { "" } else { "s" }
-                        );
-                        let desc_col = width * 2 / 3;
-                        let style = if i == sel { SELECTED } else { DIM };
-                        let mut r = format!(
-                            "{style}  {}{RESET}",
-                            clip(title, desc_col.saturating_sub(4))
-                        );
-                        let pad = desc_col.saturating_sub(visible_width(&r));
-                        r.push_str(&" ".repeat(pad));
-                        r.push_str(&format!("{DIM}{meta}{RESET}"));
-                        r
-                    },
-                );
-            }
-            Screen::Rewind => {
-                let items = self.filtered_rewind_items();
-                out.push(format!("{SELECTED}Rewind {}{RESET}", items.len()));
-                push_catalog_items(
-                    &mut self.window_start,
-                    sel,
-                    &mut out,
-                    items.len(),
-                    rows,
-                    |i| {
-                        let it = &items[i];
-                        let desc_col = width * 2 / 3;
-                        let style = if i == sel { SELECTED } else { DIM };
-                        let mut r = format!(
-                            "{style}  {}{RESET}",
-                            clip(&it.preview, desc_col.saturating_sub(4))
-                        );
-                        let pad = desc_col.saturating_sub(visible_width(&r));
-                        r.push_str(&" ".repeat(pad));
-                        r.push_str(&format!(
-                            "{DIM}{}{RESET}",
-                            if it.role == "user" {
-                                "you"
-                            } else {
-                                "assistant"
-                            }
-                        ));
-                        r
-                    },
-                );
-            }
-            Screen::None => {}
-        }
-        let hint = match screen {
-            Screen::Help => "↑↓ Navigate     Enter Open     Esc Close",
-            Screen::Resume => "↑↓ Navigate     Enter Open     Esc Close",
-            Screen::Rewind => "↑↓ Navigate     Enter Rewind     Esc Close",
-            Screen::None => "",
-        };
-        out.push(format!("{DIM}{hint}{RESET}"));
-        out
-    }
-
-    // ---------- rendering ----------
-
-    fn paint(&mut self, term: &mut Terminal) {
-        let (rows, cols) = term.size();
-        let resized = rows != self.rows || cols != self.cols;
-        self.rows = rows;
-        self.cols = cols;
-        if self.screen != Screen::None {
-            self.enter_alt(term);
-            self.paint_catalog(term, resized);
-            return;
-        }
-        self.paint_inline(term, resized);
-    }
-
-    fn render_transcript(&mut self) -> (Vec<String>, usize) {
-        let width = (self.cols as usize).max(1);
-        let stable_entries = self.entries.len().saturating_sub(1);
-        if self.transcript_cache_width != width || self.transcript_cache_entries > stable_entries {
-            self.transcript_cache.clear();
-            self.transcript_cache_entries = 0;
-            self.transcript_cache_width = width;
-        }
-        for entry in &self.entries[self.transcript_cache_entries..stable_entries] {
-            render_entry(entry, width, &mut self.transcript_cache);
-        }
-        self.transcript_cache_entries = stable_entries;
-        let mut rows = std::mem::take(&mut self.transcript_cache);
-        let cached_rows = rows.len();
-        if let Some(entry) = self.entries.last() {
-            render_entry(entry, width, &mut rows);
-        }
-        (rows, cached_rows)
-    }
-
-    fn activity_rows(&self) -> Vec<String> {
-        if let Some(label) = &self.tool_running {
-            let now = self.turn_start.elapsed();
-            let half = (now.as_millis() as i64 / 500) % 2 == 0;
-            let marker = if half { "●" } else { " " };
-            let mut rows = vec![format!("{ACTIVITY}{marker} {label}{RESET}")];
-            if let Some(live) = &self.tool_live {
-                let width = self.cols.saturating_sub(4) as usize;
-                let count = live.chars().count();
-                let mut text: String = live.chars().take(width).collect();
-                if count > width {
-                    text.push('…');
-                }
-                rows.push(format!("{DIM}  {text}{RESET}"));
-            }
-            return rows;
-        }
-        if self.activity != Activity::Thinking {
-            return Vec::new();
-        }
-        let now = self.turn_start.elapsed();
-        let secs = now.as_secs();
-        let half = (now.as_millis() as i64 / 500) % 2 == 0;
-        let head = if half {
-            format!("{ACTIVITY}• Thinking ({secs}s)")
-        } else {
-            format!(" {ACTIVITY} Thinking ({secs}s)")
-        };
-        vec![format!(
-            "{head}{DIM} (↑{} ↓{}){RESET}",
-            tok(self.live_in),
-            tok(self.live_out)
-        )]
-    }
-
-    fn paint_inline(&mut self, term: &mut Terminal, resized: bool) {
-        let out = term.out();
-        if !self.painted_once {
-            let _ = out.write_all(term::clear_display().as_bytes());
-            self.painted_once = true;
-            self.streamed.clear();
-        }
-        let (mut content, cached_rows) = self.render_transcript();
-        self.sync_picker();
-        let (chrome, cursor_row, cursor_col) = self.chrome_rows();
-        let rows = (self.rows as usize).max(1);
-        let capacity = rows.saturating_sub(chrome.len()).max(1);
-        if std::mem::take(&mut self.reprint) {
-            if content.len() > capacity {
-                Self::clear_rows(out, self.streamed.len().min(capacity) + 1, rows);
-                for line in &content {
-                    let _ = write!(out, "{}", term::move_to(rows as u16, 1));
-                    let _ = writeln!(out, "{line}");
-                }
-                self.streamed = content.clone();
-                self.last_capacity = capacity;
-                self.last_chrome = None;
-            } else {
-                self.repaint_tail(out, &content, capacity);
-                self.streamed = content.clone();
-                self.last_capacity = capacity;
-            }
-        } else if capacity != self.last_capacity {
-            self.repaint_tail(out, &content, capacity);
-            self.streamed = content.to_vec();
-            self.last_capacity = capacity;
-        } else {
-            self.update_content(out, &content, rows, capacity);
-        }
-        let vis = content.len().min(capacity);
-        self.last_input_row = (vis + 1) as u16;
-        let same_chrome = !resized
-            && self
-                .last_chrome
-                .as_ref()
-                .map(|(v, c, r, col)| {
-                    *v == vis && c == &chrome && *r == cursor_row && *col == cursor_col
-                })
-                .unwrap_or(false);
-        if !same_chrome {
-            for row in (vis + 1)..=rows {
-                let _ = write!(out, "{}", term::move_to(row as u16, 1));
-                let _ = out.write_all(term::clear_eol().as_bytes());
-            }
-            for (i, line) in chrome.iter().enumerate() {
-                let _ = write!(out, "{}", term::move_to((vis + 1 + i) as u16, 1));
-                let _ = out.write_all(line.as_bytes());
-            }
-            let _ = write!(
-                out,
-                "{}",
-                term::move_to((vis + 1 + cursor_row) as u16, cursor_col as u16)
-            );
-            let _ = out.write_all(term::cursor_visible().as_bytes());
-            self.last_chrome = Some((vis, chrome, cursor_row, cursor_col));
-        }
-        let _ = out.flush();
-        content.truncate(cached_rows);
-        self.transcript_cache = content;
-    }
-
-    fn clear_rows(out: &mut std::io::Stdout, start: usize, end: usize) {
-        for row in start..=end {
-            let _ = write!(out, "{}", term::move_to(row as u16, 1));
-            let _ = out.write_all(term::clear_eol().as_bytes());
-        }
-    }
-
-    fn update_content(
-        &mut self,
-        out: &mut std::io::Stdout,
-        new: &[String],
-        rows: usize,
-        capacity: usize,
-    ) {
-        let old = &self.streamed;
-        if new == old {
-            return;
-        }
-        let old_vis = old.len().min(capacity);
-        let new_vis = new.len().min(capacity);
-        let old_scrolled = old.len().saturating_sub(old_vis);
-        let new_scrolled = new.len().saturating_sub(new_vis);
-        let jump = new_scrolled.saturating_sub(old_scrolled);
-        let mut d = 0;
-        while d < old.len() && d < new.len() && old[d] == new[d] {
-            d += 1;
-        }
-        if jump > capacity && old.len().saturating_sub(d) <= 2 {
-            Self::clear_rows(out, old_vis + 1, rows);
-            for line in &new[d..] {
-                let _ = write!(out, "{}", term::move_to(rows as u16, 1));
-                let _ = writeln!(out, "{}", line);
-            }
-            // Scrolling the screen shifted the chrome rows too; force a
-            // chrome repaint below.
-            self.last_chrome = None;
-            self.streamed = new.to_vec();
-            return;
-        }
-        // Patch path: all differences inside the visible window and the
-        // content did not shrink below the previous scroll point.
-        if new_scrolled >= old_scrolled {
-            let mut all_in_window = true;
-            let mut changed = false;
-            for i in 0..new.len().max(old.len()) {
-                if old.get(i) != new.get(i) {
-                    changed = true;
-                    if i < new_scrolled {
-                        all_in_window = false;
-                        break;
-                    }
-                }
-            }
-            if changed && all_in_window {
-                if new_scrolled > old_scrolled {
-                    if new_scrolled > old.len() {
-                        self.repaint_tail(out, new, capacity);
-                        self.streamed = new.to_vec();
-                        return;
-                    }
-                    Self::clear_rows(out, old_vis + 1, rows);
-                    for _ in 0..(new_scrolled - old_scrolled) {
-                        let _ = write!(out, "{}", term::move_to(rows as u16, 1));
-                        let _ = out.write_all(b"\n");
-                    }
-                    // The newlines scrolled the chrome rows up as well;
-                    // force a chrome repaint below.
-                    self.last_chrome = None;
-                }
-                for i in 0..new.len() {
-                    if old.get(i) != new.get(i) {
-                        let row = (i - new_scrolled + 1) as u16;
-                        let _ = write!(out, "{}", term::move_to(row, 1));
-                        let _ = out.write_all(term::clear_eol().as_bytes());
-                        let _ = out.write_all(new[i].as_bytes());
-                    }
-                }
-                for i in new.len()..old.len() {
-                    if i >= new_scrolled {
-                        let row = (i - new_scrolled + 1) as u16;
-                        let _ = write!(out, "{}", term::move_to(row, 1));
-                        let _ = out.write_all(term::clear_eol().as_bytes());
-                    }
-                }
-                self.streamed = new.to_vec();
-                return;
-            }
-        }
-        self.repaint_tail(out, new, capacity);
-        self.streamed = new.to_vec();
-    }
-
-    fn repaint_tail(&self, out: &mut std::io::Stdout, new: &[String], capacity: usize) {
-        let start = new.len().saturating_sub(capacity);
-        for i in 0..capacity {
-            let _ = write!(out, "{}", term::move_to((i + 1) as u16, 1));
-            let _ = out.write_all(term::clear_eol().as_bytes());
-            if let Some(r) = new.get(start + i) {
-                let _ = out.write_all(r.as_bytes());
-            }
-        }
-    }
-
-    fn hint_line(&self, scroll_hint: Option<&str>) -> String {
-        if self.ctrl_c_pending {
-            return format!("{DIM}press ctrl+c again to exit{RESET}");
-        }
-        let mut segs: Vec<String> = Vec::new();
-        if self.cfg.api_key.is_empty() {
-            segs.push(format!("{DIM}no api key: set OPENAI_API_KEY{RESET}"));
-        }
-        segs.push(self.model_display.clone());
-        if let Some(window) = self.cfg.context_window
-            && window > 0
-        {
-            let percent = self.live_in.saturating_mul(100) / window;
-            if self.cols <= 60 {
-                segs.push(format!("{percent}%"));
-            } else {
-                segs.push(format!(
-                    "{}/{} ({percent}%)",
-                    tok(self.live_in),
-                    tok(window)
-                ));
-            }
-        }
-        if self.cols > 60 {
-            segs.push(format!("↑{} ↓{}", tok(self.sess_in), tok(self.sess_out)));
-        }
-        if let Some(extra) = scroll_hint {
-            segs.push(extra.to_string());
-        }
-        format!("{DIM}{}{RESET}", segs.join(" · "))
-    }
-
-    fn composer_prefix(&self) -> String {
-        format!("{USER_RAIL}┃{RESET} ")
-    }
-
-    fn chrome_rows(&self) -> (Vec<String>, usize, usize) {
-        self.chrome_rows_with_hint(None)
-    }
-
-    fn chrome_rows_with_hint(&self, scroll_hint: Option<&str>) -> (Vec<String>, usize, usize) {
-        let (input_rows, cursor_row, cursor_col) = self
-            .input
-            .render_with(&self.composer_prefix(), self.cols as usize);
-        let cap = (self.rows as usize / 2).max(4);
-        let mut vis_start = input_rows.len().saturating_sub(cap);
-        if cursor_row < vis_start {
-            vis_start = cursor_row;
-        }
-        let mut rows = self.activity_rows();
-        let vis_cursor_row = rows.len() + cursor_row - vis_start;
-        rows.extend_from_slice(&input_rows[vis_start..]);
-        if let Some(p) = &self.picker {
-            let width = self.cols as usize;
-            rows.push(picker_divider(width));
-            match p.kind {
-                PickerKind::Slash => {
-                    rows.push(slash_header(p, width));
-                    rows.push(String::new());
-                    let n = p.slash_matches.len();
-                    for idx in p.win..(p.win + PICKER_VISIBLE).min(n) {
-                        rows.push(slash_row(&p.slash_matches[idx], idx == p.sel, width));
-                    }
-                }
-                PickerKind::Files => {
-                    let n = p.file_matches.len();
-                    for idx in p.win..(p.win + PICKER_VISIBLE).min(n) {
-                        rows.push(file_row(
-                            &p.file_matches[idx],
-                            &p.query,
-                            idx == p.sel,
-                            width,
-                        ));
-                    }
-                }
-            }
-            rows.push(picker_divider(width));
-        }
-        if self.cols > 60 {
-            rows.push(String::new());
-        }
-        rows.push(self.hint_line(scroll_hint));
-        (rows, vis_cursor_row, cursor_col)
-    }
-
-    fn paint_catalog(&mut self, term: &mut Terminal, resized: bool) {
-        self.enter_alt(term);
-        if resized {
-            self.last_frame.clear();
-        }
-        let out = term.out();
-        if self.last_frame.is_empty() {
-            let _ = out.write_all(term::clear_display().as_bytes());
-        }
-        let frame = self.catalog_rows(self.rows, self.cols);
-        self.emit_diff(out, &frame);
-        let _ = out.write_all(term::cursor_hidden().as_bytes());
-        let _ = out.flush();
-    }
-
-    fn emit_diff(&mut self, out: &mut std::io::Stdout, frame: &[String]) {
-        for (i, row) in frame.iter().enumerate() {
-            let prev = self.last_frame.get(i).map(|s| s.as_str()).unwrap_or("");
-            if prev != row {
-                let _ = write!(out, "{}", term::move_to((i + 1) as u16, 1));
-                let _ = out.write_all(term::clear_eol().as_bytes());
-                let _ = out.write_all(row.as_bytes());
-            }
-        }
-        if self.last_frame.len() > frame.len() {
-            for i in frame.len()..self.last_frame.len() {
-                let _ = write!(out, "{}", term::move_to((i + 1) as u16, 1));
-                let _ = out.write_all(term::clear_eol().as_bytes());
-            }
-        }
-        self.last_frame = frame.to_vec();
-    }
-
-    fn picker_enter(&mut self) {
-        let Some(p) = self.picker.take() else { return };
-        self.picker_dismissed = None;
-        match p.kind {
-            PickerKind::Slash => {
-                if let Some(spec) = p.slash_matches.get(p.sel) {
-                    let cmd = spec.command.trim_start_matches('/');
-                    self.input.take();
-                    self.slash(cmd);
-                }
-            }
-            PickerKind::Files => {
-                if let Some(path) = p.file_matches.get(p.sel) {
-                    let s = p.token_start + 1;
-                    let e = p.token_end;
-                    self.input.replace_range(s, e, path);
-                    if !path.ends_with('/') {
-                        self.picker_dismissed = Some(PickerKind::Files);
-                    }
-                }
-            }
-        }
-    }
-
-    fn picker_tab(&mut self) {
-        let Some(p) = &self.picker else { return };
-        match p.kind {
-            PickerKind::Slash => {
-                if let Some(spec) = p.slash_matches.get(p.sel) {
-                    let s = p.token_start;
-                    let e = p.token_end;
-                    let cmd = spec.command.to_string();
-                    self.input.replace_range(s, e, &cmd);
-                }
-            }
-            PickerKind::Files => {
-                self.picker_enter();
-            }
-        }
-    }
-
-    fn picker_move(&mut self, up: bool) {
-        let Some(p) = &mut self.picker else { return };
-        let n = match p.kind {
-            PickerKind::Slash => p.slash_matches.len(),
-            PickerKind::Files => p.file_matches.len(),
-        };
-        if n == 0 {
-            return;
-        }
-        if up {
-            p.sel = (p.sel + n - 1) % n;
-        } else {
-            p.sel = (p.sel + 1) % n;
-        }
-        if p.sel < p.win {
-            p.win = p.sel;
-        }
-        if p.sel >= p.win + PICKER_VISIBLE {
-            p.win = p.sel - PICKER_VISIBLE + 1;
-        }
-    }
-
-    fn picker_dismiss(&mut self) {
-        if let Some(p) = &self.picker {
-            self.picker_dismissed = Some(p.kind);
-        }
-        self.picker = None;
-    }
-
-    fn sync_picker(&mut self) {
-        if self.screen != Screen::None {
-            self.picker = None;
-            return;
-        }
-        let trigger = self.picker_trigger();
-        match trigger {
-            None => {
-                self.picker = None;
-                self.picker_dismissed = None;
-            }
-            Some((kind, query, token_start, token_end)) => {
-                if self.picker_dismissed == Some(kind) {
-                    self.picker = None;
-                    return;
-                }
-                let same = self
-                    .picker
-                    .as_ref()
-                    .map(|p| p.kind == kind && p.query == query)
-                    .unwrap_or(false);
-                if same {
-                    if let Some(p) = &mut self.picker {
-                        p.token_start = token_start;
-                        p.token_end = token_end;
-                    }
-                    return;
-                }
-                let mut p = Picker {
-                    kind,
-                    token_start,
-                    token_end,
-                    query,
-                    sel: 0,
-                    win: 0,
-                    slash_matches: Vec::new(),
-                    file_matches: Vec::new(),
-                };
-                match p.kind {
-                    PickerKind::Slash => {
-                        p.slash_matches = app::command_matches(&p.query)
-                            .iter()
-                            .map(SlashItem::builtin)
-                            .collect()
-                    }
-                    PickerKind::Files => {
-                        p.file_matches = app::file_matches(&p.query, &self.cfg.dir)
-                    }
-                }
-                self.picker = Some(p);
-            }
-        }
-    }
-
-    fn picker_trigger(&self) -> Option<(PickerKind, String, usize, usize)> {
-        let input = self.input.buf();
-        let chars: Vec<char> = input.chars().collect();
-        let cursor = self.input.cursor.min(chars.len());
-        let mut i = cursor;
-        while i > 0 {
-            let c = chars[i - 1];
-            if c == '@' {
-                let at = i - 1;
-                if at == 0 || is_file_boundary(chars[at - 1]) {
-                    let q: String = chars[i..cursor].iter().collect();
-                    return Some((PickerKind::Files, q, at, cursor));
-                }
-            }
-            if is_picker_term(c) {
-                break;
-            }
-            i -= 1;
-        }
-        let mut j = cursor;
-        while j > 0 && !is_picker_term(chars[j - 1]) {
-            j -= 1;
-        }
-        if j < cursor
-            && chars.get(j) == Some(&'/')
-            && j + 1 < cursor
-            && chars[..j].iter().any(|c| !c.is_whitespace())
-        {
-            let q: String = chars[j + 1..cursor].iter().collect();
-            return Some((PickerKind::Slash, q, j, cursor));
-        }
-        let start = input.len() - input.trim_start_matches([' ', '\t', '\r', '\n']).len();
-        if chars.get(start) == Some(&'/') {
-            let q: String = chars[start + 1..cursor].iter().collect();
-            if !q.chars().any(is_picker_term) {
-                return Some((PickerKind::Slash, q, start, cursor));
-            }
-        }
-        None
-    }
-}
-
-fn push_catalog_items(
-    window_start: &mut usize,
-    sel: usize,
-    out: &mut Vec<String>,
-    count: usize,
-    rows: u16,
-    row_fn: impl Fn(usize) -> String,
-) {
-    let header = 3usize;
-    let hint = 1usize;
-    let available = (rows as usize).saturating_sub(header + hint).max(1);
-    let sel = sel.min(count.saturating_sub(1));
-    let mut start = *window_start;
-    if sel < start {
-        start = sel;
-    }
-    if sel >= start + available {
-        start = sel + 1 - available;
-    }
-    *window_start = start;
-    for i in start..(start + available).min(count) {
-        out.push(row_fn(i));
-    }
-}
-
-#[derive(Default)]
-struct Input {
-    buf: String,
-    cursor: usize,
-    history: Vec<String>,
-    hist_idx: Option<usize>,
-    preferred_col: Option<usize>,
-}
-impl Input {
-    fn buf(&self) -> &str {
-        &self.buf
-    }
-
-    fn take(&mut self) -> String {
-        let v = std::mem::take(&mut self.buf);
-        self.cursor = 0;
-        self.preferred_col = None;
-        self.hist_idx = None;
-        v
-    }
-
-    fn byte_index(&self, index: usize) -> usize {
-        self.buf
-            .char_indices()
-            .nth(index)
-            .map_or(self.buf.len(), |(index, _)| index)
-    }
-
-    fn insert(&mut self, c: char) {
-        self.buf.insert(self.byte_index(self.cursor), c);
-        self.cursor += 1;
-        self.preferred_col = None;
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            self.buf.remove(self.byte_index(self.cursor));
-        }
-        self.preferred_col = None;
-    }
-
-    fn delete(&mut self) {
-        if self.cursor < self.buf.chars().count() {
-            self.buf.remove(self.byte_index(self.cursor));
-        }
-        self.preferred_col = None;
-    }
-
-    fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-        self.preferred_col = None;
-    }
-
-    fn move_right(&mut self) {
-        if self.cursor < self.buf.chars().count() {
-            self.cursor += 1;
-        }
-        self.preferred_col = None;
-    }
-
-    fn move_word_left(&mut self) {
-        let chars: Vec<char> = self.buf.chars().collect();
-        let mut i = self.cursor;
-        while i > 0 && chars[i - 1] == ' ' {
-            i -= 1;
-        }
-        while i > 0 && chars[i - 1] != ' ' {
-            i -= 1;
-        }
-        self.cursor = i;
-    }
-
-    fn move_word_right(&mut self) {
-        let chars: Vec<char> = self.buf.chars().collect();
-        let n = chars.len();
-        let mut i = self.cursor;
-        while i < n && chars[i] == ' ' {
-            i += 1;
-        }
-        while i < n && chars[i] != ' ' {
-            i += 1;
-        }
-        self.cursor = i;
-    }
-
-    fn home(&mut self) {
-        let (s, _) = self.line_bounds();
-        self.cursor = s;
-        self.preferred_col = None;
-    }
-
-    fn end(&mut self) {
-        let (_, e) = self.line_bounds();
-        self.cursor = e;
-        self.preferred_col = None;
-    }
-
-    fn doc_home(&mut self) {
-        self.cursor = 0;
-        self.preferred_col = None;
-    }
-
-    fn doc_end(&mut self) {
-        self.cursor = self.buf.chars().count();
-        self.preferred_col = None;
-    }
-
-    fn cursor_line_col(&self) -> (usize, usize) {
-        let chars: Vec<char> = self.buf.chars().collect();
-        let mut line = 0;
-        let mut col = 0;
-        for (i, &c) in chars.iter().enumerate() {
-            if i >= self.cursor {
-                break;
-            }
-            if c == '\n' {
-                line += 1;
-                col = 0;
-            } else {
-                col += 1;
-            }
-        }
-        (line, col)
-    }
-
-    fn line_bounds(&self) -> (usize, usize) {
-        let chars: Vec<char> = self.buf.chars().collect();
-        let n = chars.len();
-        let cur = self.cursor.min(n);
-        let mut start = 0;
-        for (i, &c) in chars[..cur].iter().enumerate() {
-            if c == '\n' {
-                start = i + 1;
-            }
-        }
-        let mut end = chars.len();
-        for (i, &c) in chars[cur..].iter().enumerate() {
-            if c == '\n' {
-                end = cur + i;
-                break;
-            }
-        }
-        (start, end)
-    }
-
-    fn move_line_up(&mut self) {
-        let (line, col) = self.cursor_line_col();
-        if line == 0 {
-            return;
-        }
-        if self.preferred_col.is_none() {
-            self.preferred_col = Some(col);
-        }
-        let (start, _) = self.line_bounds();
-        let chars: Vec<char> = self.buf.chars().collect();
-        let sep = start.saturating_sub(1);
-        let mut prev_start = 0;
-        for i in (0..sep).rev() {
-            if chars[i] == '\n' {
-                prev_start = i + 1;
-                break;
-            }
-        }
-        let prev_len = sep.saturating_sub(prev_start);
-        let target = self.preferred_col.unwrap_or(col).min(prev_len);
-        self.cursor = prev_start + target;
-    }
-
-    fn move_line_down(&mut self) {
-        let (_, col) = self.cursor_line_col();
-        if self.preferred_col.is_none() {
-            self.preferred_col = Some(col);
-        }
-        let (_, end) = self.line_bounds();
-        let chars: Vec<char> = self.buf.chars().collect();
-        if end >= chars.len() || chars[end] != '\n' {
-            return;
-        }
-        let next_start = end + 1;
-        let mut next_end = chars.len();
-        for (i, &c) in chars[next_start..].iter().enumerate() {
-            if c == '\n' {
-                next_end = next_start + i;
-                break;
-            }
-        }
-        let next_len = next_end - next_start;
-        let target = self.preferred_col.unwrap_or(col).min(next_len);
-        self.cursor = next_start + target;
-    }
-
-    fn replace_range(&mut self, start: usize, end: usize, rep: &str) {
-        let chars: Vec<char> = self.buf.chars().collect();
-        let mut out: String = chars[..start].iter().collect();
-        out.push_str(rep);
-        out.extend(chars[end..].iter());
-        self.buf = out;
-        self.cursor = start + rep.chars().count();
-        self.preferred_col = None;
-    }
-
-    fn history_prev(&mut self) {
-        if self.history.is_empty() {
-            return;
-        }
-        let idx = match self.hist_idx {
-            Some(i) if i > 0 => i - 1,
-            Some(_) => return,
-            None => self.history.len() - 1,
-        };
-        self.hist_idx = Some(idx);
-        self.buf = self.history[idx].clone();
-        self.cursor = self.buf.chars().count();
-    }
-
-    fn history_next(&mut self) {
-        match self.hist_idx {
-            Some(i) if i + 1 < self.history.len() => {
-                self.hist_idx = Some(i + 1);
-                self.buf = self.history[i + 1].clone();
-                self.cursor = self.buf.chars().count();
-            }
-            Some(_) => {
-                self.hist_idx = None;
-                self.buf.clear();
-                self.cursor = 0;
-            }
-            None => {}
-        }
-    }
-
-    fn esc(&mut self) {
-        self.hist_idx = None;
-    }
-
-    fn paste(&mut self, bytes: &[u8]) {
-        let s = String::from_utf8_lossy(bytes);
-        for c in s.chars() {
-            if c == '\r' {
-                self.insert('\n');
-                continue;
-            }
-            self.insert(c);
-        }
-    }
-
-    fn delete_word_left(&mut self) {
-        let chars: Vec<char> = self.buf.chars().collect();
-        let mut i = self.cursor;
-        while i > 0 && chars[i - 1] == ' ' {
-            i -= 1;
-        }
-        while i > 0 && chars[i - 1] != ' ' {
-            i -= 1;
-        }
-        self.buf = chars[..i]
-            .iter()
-            .chain(chars[self.cursor..].iter())
-            .collect();
-        self.cursor = i;
-    }
-
-    fn render_with(&self, prefix: &str, width: usize) -> (Vec<String>, usize, usize) {
-        let pwidth = visible_width(prefix);
-        let avail = width.saturating_sub(pwidth).max(1);
-        let (line_idx, col_in_line) = self.cursor_line_col();
-        let mut rows = Vec::new();
-        let mut cursor_row = 0usize;
-        let mut cursor_col = 1usize;
-        for (i, line) in self.buf.split('\n').enumerate() {
-            let chars: Vec<char> = line.chars().collect();
-            let wrapped = wrap_chars(&chars, avail);
-            if i == line_idx {
-                let (sub, colw) = line_display_pos(&chars, col_in_line, avail);
-                cursor_row = rows.len() + sub;
-                cursor_col = pwidth + 1 + colw;
-            }
-            for r in wrapped {
-                rows.push(format!("{prefix}{}", r.iter().collect::<String>()));
-            }
-        }
-        if rows.is_empty() {
-            rows.push(prefix.to_string());
-        }
-        (rows, cursor_row, cursor_col)
-    }
-}
-
-fn wrap_chars(chars: &[char], width: usize) -> Vec<Vec<char>> {
-    if width == 0 {
-        return vec![chars.to_vec()];
-    }
-    let mut rows = Vec::new();
-    let mut cur = Vec::new();
-    let mut w = 0usize;
-    for &c in chars {
-        let cw = char_width(c);
-        if w + cw > width && !cur.is_empty() {
-            rows.push(std::mem::take(&mut cur));
-            w = 0;
-        }
-        cur.push(c);
-        w += cw;
-    }
-    rows.push(cur);
-    rows
-}
-
-fn line_display_pos(chars: &[char], char_idx: usize, avail: usize) -> (usize, usize) {
-    let a = avail.max(1);
-    let w: usize = chars[..char_idx].iter().map(|c| char_width(*c)).sum();
-    if char_idx == chars.len() && !chars.is_empty() {
-        let total: usize = chars.iter().map(|c| char_width(*c)).sum();
-        let sub = total / a;
-        let sub = if total.is_multiple_of(a) {
-            sub.saturating_sub(1)
-        } else {
-            sub
-        };
-        (sub, total - sub * a)
-    } else {
-        (w / a, w % a)
-    }
-}
-
-fn is_picker_term(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\n' | '\r')
-}
-
-fn is_file_boundary(c: char) -> bool {
-    is_picker_term(c) || matches!(c, '(' | '[' | '{' | '<' | '\'' | '"' | '`')
-}
-
-fn picker_divider(width: usize) -> String {
-    format!("{DIVIDER}{}{RESET}", "\u{2500}".repeat(width))
-}
-
-fn slash_header(p: &Picker, width: usize) -> String {
-    let n = p.slash_matches.len();
-    let mut h = format!("{DIM}Commands {n}");
-    if p.query.is_empty() {
-        h.push_str(" · Type to filter");
-    }
-    h.push_str(RESET);
-    if n > PICKER_VISIBLE {
-        let end = (p.win + PICKER_VISIBLE).min(n);
-        let ind = format!("{}–{}", p.win + 1, end);
-        let pad = width.saturating_sub(visible_width(&h) + visible_width(&ind));
-        if pad > 0 {
-            h.push_str(&format!("{DIM}{}{ind}{RESET}", " ".repeat(pad)));
-        }
-    }
-    h
-}
-
-fn truncate_wide(s: &str, width: usize) -> String {
-    if visible_width(s) <= width {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    let mut w = 0usize;
-    for c in s.chars() {
-        let cw = char_width(c);
-        if w + cw > width.saturating_sub(1) {
-            out.push('\u{2026}');
-            break;
-        }
-        out.push(c);
-        w += cw;
-    }
-    out
-}
-
-fn slash_row(spec: &SlashItem, sel: bool, width: usize) -> String {
-    let cmd_col = 24usize;
-    let cmd_part = format!("  {}", spec.command);
-    let pad = cmd_col.saturating_sub(visible_width(&cmd_part));
-    let cat = format!("  {}", spec.category);
-    let desc_avail = width
-        .saturating_sub(cmd_col + visible_width(&cat) + 1)
-        .max(1);
-    let desc = truncate_wide(&spec.description, desc_avail);
-    let left = format!("{cmd_part}{}", " ".repeat(pad));
-    let gap = width
-        .saturating_sub(cmd_col + visible_width(&desc) + visible_width(&cat))
-        .max(1);
-    if sel {
-        format!(
-            "{BOLD}{USER_RAIL}{left}{RESET}{DIM}{desc}{RESET}{}{cat}{RESET}",
-            " ".repeat(gap)
-        )
-    } else {
-        format!("{DIM}{left}{desc}{}{cat}{RESET}", " ".repeat(gap))
-    }
-}
-
-fn file_row(path: &str, query: &str, sel: bool, width: usize) -> String {
-    let mut chars: Vec<char> = path.chars().collect();
-    if chars.len() > 100 {
-        chars.truncate(100);
-    }
-    let mut idx = 0usize;
-    let q: Vec<char> = query.chars().collect();
-    if !q.is_empty() {
-        let path_str: String = chars.iter().collect();
-        if let Some(p) = path_str.to_lowercase().find(&query.to_lowercase()) {
-            idx = path_str[..p].chars().count();
-        }
-    }
-    let mut hit_end = (idx + q.len()).min(chars.len());
-    if path.ends_with('/') && idx + q.len() == chars.len().saturating_sub(1) {
-        hit_end = chars.len();
-    }
-    let head: String = chars[..idx].iter().collect();
-    let hit: String = chars[idx..hit_end].iter().collect();
-    let tail: String = chars[hit_end..].iter().collect();
-    let body = format!("  {head}");
-    let avail = width.saturating_sub(visible_width(&body) + 1);
-    let tail = truncate_wide(&tail, avail);
-    if sel {
-        format!("  {BOLD}{USER_RAIL}{head}\x1b[48;5;239m{hit}\x1b[49m{tail}{RESET}")
-    } else {
-        format!("  {DIM}{head}{BOLD}{hit}{RESET}{DIM}{tail}{RESET}")
-    }
-}
-
-fn visible_width(s: &str) -> usize {
-    let bytes = s.as_bytes();
-    let mut w = 0usize;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            i = ansi_seq_end(bytes, i);
-            continue;
-        }
-        let len = utf8_len(bytes[i]);
-        let ch = &s[i..i + len];
-        w += char_width(ch.chars().next().unwrap_or(' '));
-        i += len;
-    }
-    w
-}
-
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![String::new()];
-    }
-    let mut rows = Vec::new();
-    for line in text.split('\n') {
-        let mut cur = String::new();
-        let mut w = 0usize;
-        for c in line.chars() {
-            let cw = char_width(c);
-            if w + cw > width && !cur.is_empty() {
-                rows.push(std::mem::take(&mut cur));
-                w = 0;
-            }
-            cur.push(c);
-            w += cw;
-        }
-        rows.push(cur);
-    }
-    rows
-}
-
-fn char_width(c: char) -> usize {
-    if c.is_ascii() {
-        1
-    } else {
-        let cp = c as u32;
-        if (0x1100..=0x115f).contains(&cp)
-            || (0x2e80..=0xa4cf).contains(&cp)
-            || (0xac00..=0xd7a3).contains(&cp)
-            || (0xf900..=0xfaff).contains(&cp)
-            || (0xfe30..=0xfe4f).contains(&cp)
-            || (0xff00..=0xff60).contains(&cp)
-            || (0x1f300..=0x1f64f).contains(&cp)
-            || (0x1f900..=0x1f9ff).contains(&cp)
-            || (0x20000..=0x2fffd).contains(&cp)
-        {
-            2
-        } else {
-            1
-        }
-    }
-}
-
-fn ansi_seq_end(bytes: &[u8], start: usize) -> usize {
-    if start >= bytes.len() || bytes[start] != 0x1b {
-        return start + 1;
-    }
-    let mut i = start + 1;
-    if i < bytes.len() && bytes[i] == b'[' {
-        i += 1;
-        while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-            i += 1;
-        }
-        return (i + 1).min(bytes.len());
-    }
-    if i < bytes.len() && bytes[i] == b']' {
-        i += 1;
-        while i < bytes.len() {
-            if bytes[i] == 0x07 {
-                return i + 1;
-            }
-            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-                return i + 2;
-            }
-            i += 1;
-        }
-        return bytes.len();
-    }
-    start + 1
-}
-
-fn sgr_kind(seq: &str) -> Option<&'static str> {
-    if !seq.starts_with("\x1b[") || !seq.ends_with('m') {
-        return None;
-    }
-    let body = &seq[2..seq.len() - 1];
-    Some(match body {
-        "0" => "reset",
-        "1" => "bold",
-        "2" => "dim",
-        "3" => "italic",
-        "4" => "underline",
-        "9" => "strike",
-        "22" => "bold-off",
-        "23" => "italic-off",
-        "24" => "underline-off",
-        "29" => "strike-off",
-        "39" => "fg-off",
-        _ if body.starts_with("38;") => "fg",
-        _ => "other",
-    })
-}
-
-fn render_entry(entry: &Entry, width: usize, rows: &mut Vec<String>) {
-    match entry {
-        Entry::Welcome => rows.push(format!(
-            "{WELCOME_APP}axe{RESET}{DIM} v{VERSION} · Run /help for commands{RESET}"
-        )),
-        Entry::User(text) => {
-            for line in wrap_text(text, width.saturating_sub(2)) {
-                rows.push(format!("{USER_RAIL}┃{RESET} {BOLD}{line}{RESET}"));
-            }
-        }
-        Entry::Text(text) | Entry::Code(text) | Entry::Table(text) => {
-            rows.extend(wrap_gutter(text, width, 2));
-        }
-        Entry::Rule => rows.push(format!(
-            "{DIM}{}{RESET}",
-            "\u{2500}".repeat(markdown::ansi::HORIZONTAL_RULE_WIDTH)
-        )),
-        Entry::Tool { calls } => {
-            let count = calls.len();
-            rows.push(format!(
-                "{USER_RAIL}●{RESET} {DIM}{count} tool call{}{RESET}",
-                if count == 1 { "" } else { "s" }
-            ));
-            let last = count.saturating_sub(1);
-            for (index, label) in calls.iter().enumerate() {
-                let branch = if index == last { "└" } else { "├" };
-                rows.push(format!("{DIM}{branch} {label}{RESET}"));
-            }
-        }
-        Entry::Notice(text) => rows.push(text.clone()),
-        Entry::Summary {
-            secs,
-            input,
-            output,
-        } => rows.push(format!(
-            "{DIM}  {} (↑{} ↓{}){RESET}",
-            format_dur(*secs),
-            tok(*input),
-            tok(*output)
-        )),
-    }
-    rows.push(String::new());
-}
-
-fn wrap_gutter(text: &str, width: usize, gutter: usize) -> Vec<String> {
-    let pad = " ".repeat(gutter);
-    wrap_ansi(text, width.saturating_sub(gutter).max(1))
-        .into_iter()
-        .map(|r| if r.is_empty() { r } else { format!("{pad}{r}") })
-        .collect()
-}
-
-pub fn wrap_ansi(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![String::new()];
-    }
-    let mut rows: Vec<String> = Vec::new();
-    let text = text.strip_suffix('\n').unwrap_or(text);
-    for part in text.split('\n') {
-        let part = part.strip_suffix('\r').unwrap_or(part);
-        if part.is_empty() {
-            rows.push(String::new());
-            continue;
-        }
-        wrap_ansi_line(&mut rows, part.to_string(), width);
-    }
-    rows
-}
-
-fn wrap_ansi_line(rows: &mut Vec<String>, text: String, width: usize) {
-    let mut cur = String::new();
-    let mut cur_width = 0usize;
-    let mut active: Vec<&'static str> = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            let end = ansi_seq_end(bytes, i);
-            let seq = &text[i..end];
-            if let Some(kind) = sgr_kind(seq) {
-                match kind {
-                    "reset" => active.clear(),
-                    "bold" | "dim" | "italic" | "underline" | "strike" | "fg" => {
-                        if !active.contains(&kind) {
-                            active.push(kind);
-                        }
-                    }
-                    "bold-off" => active.retain(|k| *k != "bold"),
-                    "italic-off" => active.retain(|k| *k != "italic"),
-                    "underline-off" => active.retain(|k| *k != "underline"),
-                    "strike-off" => active.retain(|k| *k != "strike"),
-                    "fg-off" => active.retain(|k| *k != "fg"),
-                    _ => {}
-                }
-            }
-            cur.push_str(seq);
-            i = end;
-            continue;
-        }
-        let len = utf8_len(bytes[i]);
-        let ch = &text[i..i + len];
-        let w = char_width(ch.chars().next().unwrap_or(' '));
-        if cur_width + w > width && cur_width > 0 {
-            rows.push(std::mem::take(&mut cur));
-            for kind in &active {
-                cur.push_str(sgr_for(kind));
-            }
-            cur_width = 0;
-        }
-        cur.push_str(ch);
-        cur_width += w;
-        i += len;
-    }
-    rows.push(cur);
-}
-
-fn sgr_for(kind: &str) -> &'static str {
-    match kind {
-        "bold" => "\x1b[1m",
-        "dim" => "\x1b[2m",
-        "italic" => "\x1b[3m",
-        "underline" => "\x1b[4m",
-        "strike" => "\x1b[9m",
-        "fg" => "\x1b[38;5;250m",
-        _ => "",
-    }
-}
-
-fn utf8_len(first: u8) -> usize {
-    if first < 0x80 {
-        1
-    } else if first >> 5 == 0b110 {
-        2
-    } else if first >> 4 == 0b1110 {
-        3
-    } else if first >> 3 == 0b11110 {
-        4
-    } else {
-        1
-    }
-}
-
-fn compact_model_label(model: &str) -> String {
-    let bare = model.rsplit('/').next().unwrap_or(model);
-    if let Some(rest) = bare.strip_prefix("claude-") {
-        for (prefix, label) in [
-            ("opus-", "opus "),
-            ("sonnet-", "sonnet "),
-            ("haiku-", "haiku "),
-        ] {
-            if let Some(tail) = rest.strip_prefix(prefix) {
-                return format!("{label}{tail}");
-            }
-        }
-        return rest.to_string();
-    }
-    bare.to_string()
-}
-
-fn clip(s: &str, n: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= n {
-        return s.to_string();
-    }
-    let head: String = chars.into_iter().take(n).collect();
-    format!("{head}…")
-}
-
-fn format_dur(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {:02}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
-    }
-}
-
-fn tok(n: usize) -> String {
-    if n < 1000 {
-        return n.to_string();
-    }
-    format!("{:.1}k", n as f64 / 1000.0)
-}
-
-fn age_str(updated_ms: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let delta = (now - updated_ms).max(0) as u64;
-    let min = 60_000u64;
-    let hour = 3_600_000u64;
-    let day = 86_400_000u64;
-    if delta < min {
-        "now".into()
-    } else if delta < hour {
-        format!("{}m", delta / min)
-    } else if delta < day {
-        format!("{}h", delta / hour)
-    } else {
-        format!("{}d", delta / day)
-    }
-}
-
-fn workspace_label(dir: &str) -> String {
-    let d = if dir.is_empty() { "." } else { dir };
-    std::path::Path::new(d)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| d.to_string())
-}
-
-fn b64_encode(data: &[u8]) -> String {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        out.push(T[(b[0] >> 2) as usize] as char);
-        out.push(T[(((b[0] & 3) << 4) | (b[1] >> 4)) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            T[(((b[1] & 15) << 2) | (b[2] >> 6)) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            T[(b[2] & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 pub fn build_tools(dir: &str) -> Vec<Tool> {
@@ -2860,55 +46,1667 @@ pub fn build_tools(dir: &str) -> Vec<Tool> {
     ]
 }
 
-fn tool_kind(call: &ToolCall) -> String {
-    match call.name.as_str() {
-        "bash" => "command".into(),
-        "read" => "read".into(),
-        "write" => "write".into(),
-        "edit" => "edit".into(),
-        _ => "command".into(),
+enum Entry {
+    User(String),
+    Assistant {
+        source: String,
+        rendered: Vec<Line<'static>>,
+    },
+    Tool(Vec<String>),
+    Notice(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerKind {
+    Commands,
+    Files,
+}
+
+struct Picker {
+    kind: PickerKind,
+    start: usize,
+    end: usize,
+    items: Vec<String>,
+    selected: usize,
+}
+
+enum TurnEvent {
+    AssistantDelta(String),
+    ToolStart(String),
+    ToolDelta(String),
+    ToolResult(String),
+    Tokens(Usage),
+    Compacted(Result<(String, usize, Vec<Message>, Vec<session::Entry>), String>),
+    End {
+        messages: Vec<Message>,
+        usage: Usage,
+        error: Option<String>,
+        compact: bool,
+    },
+}
+
+struct App {
+    cfg: TuiConfig,
+    entries: Vec<Entry>,
+    messages: Vec<Message>,
+    input: String,
+    cursor: usize,
+    scroll: u16,
+    max_scroll: u16,
+    page_size: u16,
+    follow: bool,
+    running: bool,
+    compacting: bool,
+    cancel: Arc<AtomicBool>,
+    events: Option<Receiver<TurnEvent>>,
+    steer: Option<Sender<String>>,
+    retry_after_compact: bool,
+    overflow_retried: bool,
+    input_tokens: usize,
+    output_tokens: usize,
+    session_input: usize,
+    session_output: usize,
+    turn_started: Instant,
+    tool_running: Option<String>,
+    tool_live: Option<String>,
+    history: Vec<String>,
+    history_index: Option<usize>,
+    want_quit: bool,
+    ctrl_c_armed: Option<Instant>,
+    picker: Option<Picker>,
+    help_open: bool,
+    help_selected: usize,
+    resume_open: bool,
+    resume_selected: usize,
+    sessions: Vec<session::SessionMeta>,
+    catalog_query: String,
+    rewind_open: bool,
+    rewind_selected: usize,
+    rewind_items: Vec<app::RewindItem>,
+    esc_armed: Option<Instant>,
+    resume_id: Option<String>,
+}
+
+struct TerminalRestore {
+    enhanced_keyboard: bool,
+}
+
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        if self.enhanced_keyboard {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
 }
 
-struct TuiSink<'a> {
-    tx: &'a Sender<TurnEvent>,
+pub fn run(cfg: TuiConfig) -> Result<(), String> {
+    enable_raw_mode().map_err(|error| error.to_string())?;
+    let enhanced_keyboard = matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    );
+    let restore = TerminalRestore { enhanced_keyboard };
+    let mut stdout = io::stdout();
+    if enhanced_keyboard {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            )
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )
+    .map_err(|error| error.to_string())?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).map_err(|error| error.to_string())?;
+    let result = run_app(&mut terminal, cfg);
+    drop(restore);
+    result
+}
+
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    cfg: TuiConfig,
+) -> Result<(), String> {
+    session::archive_live(&cfg.session_dir);
+    let mut app = App {
+        cfg,
+        entries: Vec::new(),
+        messages: Vec::new(),
+        input: String::new(),
+        cursor: 0,
+        scroll: 0,
+        max_scroll: 0,
+        page_size: 1,
+        follow: true,
+        running: false,
+        compacting: false,
+        cancel: Arc::new(AtomicBool::new(false)),
+        events: None,
+        steer: None,
+        retry_after_compact: false,
+        overflow_retried: false,
+        input_tokens: 0,
+        output_tokens: 0,
+        session_input: 0,
+        session_output: 0,
+        turn_started: Instant::now(),
+        tool_running: None,
+        tool_live: None,
+        history: Vec::new(),
+        history_index: None,
+        want_quit: false,
+        ctrl_c_armed: None,
+        picker: None,
+        help_open: false,
+        help_selected: 0,
+        resume_open: false,
+        resume_selected: 0,
+        sessions: Vec::new(),
+        catalog_query: String::new(),
+        rewind_open: false,
+        rewind_selected: 0,
+        rewind_items: Vec::new(),
+        esc_armed: None,
+        resume_id: None,
+    };
+    if let Some(id) = app.cfg.resume.clone() {
+        if id.is_empty() {
+            app.open_resume();
+        } else {
+            app.resume(&id);
+        }
+    }
+    loop {
+        app.drain_events();
+        if app.want_quit {
+            app.on_exit();
+            return Ok(());
+        }
+        terminal
+            .draw(|frame| app.draw(frame))
+            .map_err(|error| error.to_string())?;
+        if !event::poll(Duration::from_millis(30)).map_err(|error| error.to_string())? {
+            continue;
+        }
+        match event::read().map_err(|error| error.to_string())? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if app.handle_key(key) {
+                    app.on_exit();
+                    return Ok(());
+                }
+            }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => app.scroll_up(3),
+                MouseEventKind::ScrollDown => app.scroll_down(3),
+                _ => {}
+            },
+            Event::Paste(text) => app.paste(&text),
+            _ => {}
+        }
+    }
+}
+
+impl App {
+    fn on_exit(&mut self) {
+        match self.resume_id.take() {
+            Some(id) => {
+                if !session::continue_archived_live(&self.cfg.session_dir, &id).unwrap_or(false) {
+                    let entries = session::load_live(&self.cfg.session_dir);
+                    let _ = session::continue_archived(&self.cfg.session_dir, &id, &entries);
+                }
+            }
+            None => {
+                session::archive_live(&self.cfg.session_dir);
+            }
+        }
+    }
+
+    fn draw(&mut self, frame: &mut ratatui::Frame) {
+        if self.help_open {
+            self.draw_help(frame);
+            return;
+        }
+        if self.resume_open {
+            self.draw_resume(frame);
+            return;
+        }
+        if self.rewind_open {
+            self.draw_rewind(frame);
+            return;
+        }
+        self.sync_picker();
+        let width = frame.area().width.max(1);
+        let input_width = width.saturating_sub(2).max(1) as usize;
+        let input_lines = self.input.split('\n').fold(0usize, |count, line| {
+            count + line.chars().count().max(1).div_ceil(input_width)
+        });
+        let input_height =
+            input_lines.clamp(1, frame.area().height.saturating_div(2) as usize) as u16;
+        let activity_height = if self.tool_live.is_some() {
+            2
+        } else {
+            u16::from(self.running || self.compacting)
+        };
+        let picker_height = self
+            .picker
+            .as_ref()
+            .map_or(0, |picker| picker.items.len().min(6) as u16 + 2);
+        let areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(activity_height),
+                Constraint::Length(input_height),
+                Constraint::Length(picker_height),
+                Constraint::Length(1),
+            ])
+            .split(frame.area());
+        let transcript_width = areas[0].width.max(1) as usize;
+        let transcript = self.transcript(transcript_width);
+        let line_count = transcript
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.chars().count())
+                    .sum::<usize>()
+                    .max(1)
+                    .div_ceil(transcript_width)
+            })
+            .sum::<usize>() as u16;
+        self.page_size = areas[0].height.max(1);
+        self.max_scroll = line_count.saturating_sub(self.page_size);
+        if self.follow {
+            self.scroll = self.max_scroll;
+        } else {
+            self.scroll = self.scroll.min(self.max_scroll);
+        }
+        let transcript = Paragraph::new(transcript)
+            .wrap(Wrap { trim: false })
+            .scroll((self.scroll, 0));
+        frame.render_widget(transcript, areas[0]);
+        if self.running || self.compacting {
+            let elapsed = self.turn_started.elapsed().as_secs();
+            let activity = if self.compacting {
+                "• Compacting".to_string()
+            } else if let Some(tool) = &self.tool_running {
+                format!("● {tool}")
+            } else {
+                format!(
+                    "• Thinking ({elapsed}s) (↑{} ↓{})",
+                    format_tokens(self.input_tokens),
+                    format_tokens(self.output_tokens)
+                )
+            };
+            let mut lines = vec![Line::from(activity)];
+            if let Some(output) = &self.tool_live {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", output.lines().last().unwrap_or_default()),
+                    Style::default(),
+                )));
+            }
+            frame.render_widget(Paragraph::new(lines).style(Style::default()), areas[1]);
+        }
+        let input = Paragraph::new(self.input_text()).wrap(Wrap { trim: false });
+        frame.render_widget(input, areas[2]);
+        if let Some(picker) = &self.picker {
+            let mut lines = vec![Line::from(Span::styled(
+                "─".repeat(width as usize),
+                Style::default(),
+            ))];
+            let start = picker.selected.saturating_sub(5);
+            for (index, item) in picker.items.iter().enumerate().skip(start).take(6) {
+                let style = if index == picker.selected {
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(format!("  {item}"), style)));
+            }
+            lines.push(Line::from(Span::styled(
+                "─".repeat(width as usize),
+                Style::default(),
+            )));
+            frame.render_widget(Paragraph::new(lines), areas[3]);
+        }
+        let mut status = if self.ctrl_c_armed.is_some() {
+            "press ctrl+c again to exit".to_string()
+        } else {
+            let mut parts = vec![self.cfg.model.clone()];
+            if let Some(window) = self.cfg.context_window
+                && window > 0
+            {
+                let percent = self.input_tokens.saturating_mul(100) / window;
+                if width <= 60 {
+                    parts.push(format!("{percent}%"));
+                } else {
+                    parts.push(format!(
+                        "{}/{} ({percent}%)",
+                        format_tokens(self.input_tokens),
+                        format_tokens(window)
+                    ));
+                }
+            }
+            if width > 60 {
+                parts.push(format!(
+                    "↑{} ↓{}",
+                    format_tokens(self.session_input),
+                    format_tokens(self.session_output)
+                ));
+            }
+            parts.join(" · ")
+        };
+        if !self.follow {
+            status.push_str(&format!(" · {}/{}", self.scroll, self.max_scroll));
+        }
+        frame.render_widget(Paragraph::new(status).style(Style::default()), areas[4]);
+        let (cursor_row, cursor_col) = self.cursor_position(input_width);
+        let visible_start = input_lines.saturating_sub(input_height as usize);
+        let cursor_row = cursor_row.saturating_sub(visible_start);
+        frame.set_cursor_position((
+            areas[2].x + 2 + cursor_col as u16,
+            areas[2].y + cursor_row as u16,
+        ));
+    }
+
+    fn filtered_sessions(&self) -> Vec<&session::SessionMeta> {
+        let query = self.catalog_query.to_lowercase();
+        self.sessions
+            .iter()
+            .filter(|session| {
+                query.is_empty()
+                    || session.title.to_lowercase().contains(&query)
+                    || session.id.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    fn filtered_rewind_items(&self) -> Vec<app::RewindItem> {
+        app::filter_rewind_items(&self.rewind_items, &self.catalog_query)
+    }
+
+    fn draw_help(&self, frame: &mut ratatui::Frame) {
+        let commands = app::command_search(&self.catalog_query);
+        let area = frame.area();
+        let visible = area.height.saturating_sub(4) as usize;
+        let start = self.help_selected.saturating_sub(visible.saturating_sub(1));
+        let mut lines = vec![
+            Line::from(Span::styled(
+                format!("Help {}", commands.len()),
+                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            )),
+            Line::default(),
+        ];
+        for (index, command) in commands.iter().enumerate().skip(start).take(visible) {
+            let style = if index == self.help_selected {
+                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let row = if area.width <= 60 {
+                format!("  {:<12} {}", command.help, command.description)
+            } else {
+                format!(
+                    "  {:<12} {:<44} {}",
+                    command.help, command.description, command.category
+                )
+            };
+            lines.push(Line::from(Span::styled(row, style)));
+        }
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Search: {}     ↑↓ Navigate     Enter Open     Esc Close",
+                self.catalog_query
+            ),
+            Style::default(),
+        )));
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn open_resume(&mut self) {
+        self.sessions = session::list_sessions(&self.cfg.session_dir);
+        self.catalog_query.clear();
+        self.resume_selected = 0;
+        self.resume_open = true;
+        self.picker = None;
+    }
+
+    fn draw_resume(&self, frame: &mut ratatui::Frame) {
+        let sessions = self.filtered_sessions();
+        let area = frame.area();
+        let visible = area.height.saturating_sub(4) as usize;
+        let start = self
+            .resume_selected
+            .saturating_sub(visible.saturating_sub(1));
+        let mut lines = vec![
+            Line::from(Span::styled(
+                format!("Resume {}", sessions.len()),
+                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            )),
+            Line::default(),
+        ];
+        for (index, session) in sessions.iter().enumerate().skip(start).take(visible) {
+            let style = if index == self.resume_selected {
+                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let row = if area.width <= 60 {
+                format!("  {}", session.title)
+            } else {
+                format!(
+                    "  {:<44} {} turns · {}",
+                    session.title,
+                    session.turns,
+                    age(session.updated)
+                )
+            };
+            lines.push(Line::from(Span::styled(row, style)));
+        }
+        if sessions.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No saved sessions",
+                Style::default(),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Search: {}     ↑↓ Navigate     Enter Resume     Esc Close",
+                self.catalog_query
+            ),
+            Style::default(),
+        )));
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn open_rewind(&mut self) {
+        self.rewind_items = app::rewind_items(&self.messages);
+        self.catalog_query.clear();
+        self.rewind_selected = self.rewind_items.len().saturating_sub(1);
+        self.rewind_open = true;
+        self.picker = None;
+    }
+
+    fn draw_rewind(&self, frame: &mut ratatui::Frame) {
+        let items = self.filtered_rewind_items();
+        let area = frame.area();
+        let visible = area.height.saturating_sub(4) as usize;
+        let start = self
+            .rewind_selected
+            .saturating_sub(visible.saturating_sub(1));
+        let mut lines = vec![
+            Line::from(Span::styled(
+                format!("Rewind {}", items.len()),
+                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            )),
+            Line::default(),
+        ];
+        for (index, item) in items.iter().enumerate().skip(start).take(visible) {
+            let style = if index == self.rewind_selected {
+                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let role = if item.role == "user" {
+                "you"
+            } else {
+                "assistant"
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  {:<52} {role}", item.preview),
+                style,
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Search: {}     ↑↓ Navigate     Enter Rewind     Esc Close",
+                self.catalog_query
+            ),
+            Style::default(),
+        )));
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn resume(&mut self, id: &str) {
+        if let Some(previous) = self.resume_id.take()
+            && !session::continue_archived_live(&self.cfg.session_dir, &previous).unwrap_or(false)
+        {
+            let entries = session::load_live(&self.cfg.session_dir);
+            let _ = session::continue_archived(&self.cfg.session_dir, &previous, &entries);
+        }
+        let Some((id, entries)) = app::load_session(&self.cfg.session_dir, id) else {
+            self.entries
+                .push(Entry::Notice(format!("no such session: {id}")));
+            return;
+        };
+        self.resume_id = Some(id.clone());
+        session::set_resume_id(&self.cfg.session_dir, &id);
+        let transcript = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                session::Entry::Message { message } => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.messages = session::context_messages(&entries);
+        let usage = app::session_usage(&entries);
+        self.input_tokens = usage.context_input;
+        self.output_tokens = 0;
+        self.session_input = usage.input;
+        self.session_output = usage.output;
+        self.rebuild_transcript_from(&transcript);
+        if let Err(error) = session::save_live(&self.cfg.session_dir, &entries) {
+            self.entries
+                .push(Entry::Notice(format!("error: save session: {error}")));
+        }
+    }
+
+    fn rebuild_transcript(&mut self) {
+        let messages = self.messages.clone();
+        self.rebuild_transcript_from(&messages);
+    }
+
+    fn rebuild_transcript_from(&mut self, messages: &[Message]) {
+        self.entries.clear();
+        for message in messages {
+            match message.role.as_str() {
+                "user" => self.entries.push(Entry::User(message.content.clone())),
+                "assistant" => {
+                    if !message.content.is_empty() {
+                        self.entries.push(assistant_entry(message.content.clone()));
+                    }
+                    for call in &message.tool_calls {
+                        let label = app::tool_label(call, false);
+                        if let Some(Entry::Tool(calls)) = self.entries.last_mut() {
+                            calls.push(label);
+                        } else {
+                            self.entries.push(Entry::Tool(vec![label]));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn transcript(&self, width: usize) -> Text<'static> {
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    "axe",
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                ),
+                Span::styled(
+                    format!(" v{VERSION} · Run /help for commands"),
+                    Style::default(),
+                ),
+            ]),
+            Line::default(),
+        ];
+        for entry in &self.entries {
+            match entry {
+                Entry::User(text) => {
+                    for line in text.lines() {
+                        lines.push(Line::from(vec![
+                            Span::styled("┃ ", Style::default()),
+                            Span::styled(
+                                line.to_string(),
+                                Style::default().add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    }
+                }
+                Entry::Assistant { rendered, .. } => {
+                    for line in rendered {
+                        lines.extend(wrap_markdown_line(line, width));
+                    }
+                }
+                Entry::Tool(calls) => {
+                    let style = Style::default().add_modifier(Modifier::DIM);
+                    if calls.len() == 1 {
+                        lines.push(Line::from(vec![
+                            Span::styled("● ", style),
+                            Span::styled(calls[0].clone(), style),
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::styled("● ", style),
+                            Span::styled(format!("{} tool calls", calls.len()), style),
+                        ]));
+                        for (index, call) in calls.iter().enumerate() {
+                            let branch = if index + 1 == calls.len() {
+                                "└"
+                            } else {
+                                "├"
+                            };
+                            lines.push(Line::from(Span::styled(format!("{branch} {call}"), style)));
+                        }
+                    }
+                }
+                Entry::Notice(text) => {
+                    lines.push(Line::from(Span::styled(text.clone(), Style::default())))
+                }
+            }
+            lines.push(Line::default());
+        }
+        Text::from(lines)
+    }
+
+    fn input_text(&self) -> Text<'_> {
+        let mut lines = Vec::new();
+        for line in self.input.split('\n') {
+            lines.push(Line::from(vec![
+                Span::styled("┃ ", Style::default()),
+                Span::raw(line),
+            ]));
+        }
+        Text::from(lines)
+    }
+
+    fn cursor_position(&self, width: usize) -> (usize, usize) {
+        let before = &self.input[..self.cursor];
+        let mut row = 0;
+        let mut col = 0;
+        for character in before.chars() {
+            if character == '\n' {
+                row += 1;
+                col = 0;
+                continue;
+            }
+            if col == width {
+                row += 1;
+                col = 0;
+            }
+            col += 1;
+        }
+        (row, col)
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if self.rewind_open {
+            match key.code {
+                KeyCode::Esc => self.rewind_open = false,
+                KeyCode::Up => {
+                    self.rewind_selected = self.rewind_selected.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.rewind_selected = (self.rewind_selected + 1)
+                        .min(self.filtered_rewind_items().len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    if let Some(index) = self
+                        .filtered_rewind_items()
+                        .get(self.rewind_selected)
+                        .map(|item| item.message_index)
+                    {
+                        self.rewind_open = false;
+                        self.rewind_to(index);
+                    }
+                }
+                _ if self.edit_catalog_query(key) => self.rewind_selected = 0,
+                _ => {}
+            }
+            return false;
+        }
+        if self.resume_open {
+            match key.code {
+                KeyCode::Esc => self.resume_open = false,
+                KeyCode::Up => {
+                    self.resume_selected = self.resume_selected.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.resume_selected = (self.resume_selected + 1)
+                        .min(self.filtered_sessions().len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    if let Some(id) = self
+                        .filtered_sessions()
+                        .get(self.resume_selected)
+                        .map(|session| session.id.clone())
+                    {
+                        self.resume_open = false;
+                        self.resume(&id);
+                    }
+                }
+                _ if self.edit_catalog_query(key) => self.resume_selected = 0,
+                _ => {}
+            }
+            return false;
+        }
+        if self.help_open {
+            match key.code {
+                KeyCode::Esc => self.help_open = false,
+                KeyCode::Up => {
+                    self.help_selected = self.help_selected.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.help_selected = (self.help_selected + 1).min(
+                        app::command_search(&self.catalog_query)
+                            .len()
+                            .saturating_sub(1),
+                    );
+                }
+                KeyCode::Enter => {
+                    if let Some(command) = app::command_search(&self.catalog_query)
+                        .get(self.help_selected)
+                        .map(|command| command.command)
+                    {
+                        self.help_open = false;
+                        self.run_command(command);
+                    }
+                }
+                _ if self.edit_catalog_query(key) => self.help_selected = 0,
+                _ => {}
+            }
+            return false;
+        }
+        if key.code == KeyCode::Enter
+            && key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+        {
+            self.insert('\n');
+            self.picker = None;
+            return false;
+        }
+        if self.picker.is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    self.move_picker(true);
+                    return false;
+                }
+                KeyCode::Down => {
+                    self.move_picker(false);
+                    return false;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    self.select_picker();
+                    return false;
+                }
+                KeyCode::Esc => {
+                    self.picker = None;
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Char('a') => {
+                    self.cursor = 0;
+                    return false;
+                }
+                KeyCode::Char('e') => {
+                    self.cursor = self.input.len();
+                    return false;
+                }
+                KeyCode::Char('w') => {
+                    self.delete_word_left();
+                    return false;
+                }
+                KeyCode::Char('u') => {
+                    let start = self.line_start();
+                    self.input.drain(start..self.cursor);
+                    self.cursor = start;
+                    return false;
+                }
+                KeyCode::Left => {
+                    self.move_word_left();
+                    return false;
+                }
+                KeyCode::Right => {
+                    self.move_word_right();
+                    return false;
+                }
+                KeyCode::Home => {
+                    self.cursor = 0;
+                    return false;
+                }
+                KeyCode::End => {
+                    self.cursor = self.input.len();
+                    return false;
+                }
+                KeyCode::Char('c') => {
+                    if self.running {
+                        self.cancel.store(true, Ordering::Relaxed);
+                    } else if self
+                        .ctrl_c_armed
+                        .is_some_and(|armed| armed.elapsed() < Duration::from_millis(800))
+                    {
+                        return true;
+                    } else if self.input.is_empty() {
+                        self.ctrl_c_armed = Some(Instant::now());
+                    } else {
+                        self.input.clear();
+                        self.cursor = 0;
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        match key.code {
+            KeyCode::Enter => self.submit(),
+            KeyCode::Char(character) => self.insert(character),
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete(),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => self.move_word_left(),
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => self.move_word_right(),
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
+            KeyCode::Home => self.cursor = self.line_start(),
+            KeyCode::End => self.cursor = self.line_end(),
+            KeyCode::Up if self.input.contains('\n') => self.move_line_up(),
+            KeyCode::Down if self.input.contains('\n') => self.move_line_down(),
+            KeyCode::Up => self.history_previous(),
+            KeyCode::Down => self.history_next(),
+            KeyCode::PageUp => self.scroll_up(self.page_size.saturating_sub(1)),
+            KeyCode::PageDown => self.scroll_down(self.page_size.saturating_sub(1)),
+            KeyCode::Esc => {
+                if self
+                    .esc_armed
+                    .is_some_and(|armed| armed.elapsed() < Duration::from_millis(800))
+                {
+                    self.esc_armed = None;
+                    self.open_rewind();
+                } else {
+                    self.esc_armed = Some(Instant::now());
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn edit_catalog_query(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.catalog_query.push(character);
+                true
+            }
+            KeyCode::Backspace => {
+                self.catalog_query.pop();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn sync_picker(&mut self) {
+        if self.input.starts_with('/') && !self.input[..self.cursor].contains(char::is_whitespace) {
+            let items = app::command_matches(&self.input[1..self.cursor])
+                .into_iter()
+                .map(|spec| spec.command.to_string())
+                .collect::<Vec<_>>();
+            let selected = self
+                .picker
+                .as_ref()
+                .filter(|picker| picker.kind == PickerKind::Commands)
+                .map_or(0, |picker| {
+                    picker.selected.min(items.len().saturating_sub(1))
+                });
+            self.picker = (!items.is_empty()).then_some(Picker {
+                kind: PickerKind::Commands,
+                start: 0,
+                end: self.cursor,
+                items,
+                selected,
+            });
+            return;
+        }
+        let start = self.input[..self.cursor]
+            .rfind(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '(' | '[' | '{' | '<' | '\'' | '"' | '`')
+            })
+            .map_or(0, |index| index + 1);
+        if self.input[start..self.cursor].starts_with('@') {
+            let items = app::file_matches(&self.input[start + 1..self.cursor], &self.cfg.dir);
+            let selected = self
+                .picker
+                .as_ref()
+                .filter(|picker| picker.kind == PickerKind::Files)
+                .map_or(0, |picker| {
+                    picker.selected.min(items.len().saturating_sub(1))
+                });
+            self.picker = (!items.is_empty()).then_some(Picker {
+                kind: PickerKind::Files,
+                start,
+                end: self.cursor,
+                items,
+                selected,
+            });
+            return;
+        }
+        self.picker = None;
+    }
+
+    fn move_picker(&mut self, up: bool) {
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let count = picker.items.len();
+        if up {
+            picker.selected = (picker.selected + count - 1) % count;
+        } else {
+            picker.selected = (picker.selected + 1) % count;
+        }
+    }
+
+    fn select_picker(&mut self) {
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        let Some(item) = picker.items.get(picker.selected) else {
+            return;
+        };
+        let value = if picker.kind == PickerKind::Files {
+            format!("@{item}")
+        } else {
+            item.clone()
+        };
+        self.input.replace_range(picker.start..picker.end, &value);
+        self.cursor = picker.start + value.len();
+        if picker.kind == PickerKind::Commands {
+            self.submit();
+        }
+    }
+
+    fn scroll_up(&mut self, rows: u16) {
+        self.follow = false;
+        self.scroll = self.scroll.saturating_sub(rows);
+    }
+
+    fn scroll_down(&mut self, rows: u16) {
+        self.scroll = self.scroll.saturating_add(rows).min(self.max_scroll);
+        self.follow = self.scroll == self.max_scroll;
+    }
+
+    fn paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.input.insert_str(self.cursor, &text);
+        self.cursor += text.len();
+    }
+
+    fn history_previous(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let index = self
+            .history_index
+            .map_or(self.history.len() - 1, |index| index.saturating_sub(1));
+        self.history_index = Some(index);
+        self.input = self.history[index].clone();
+        self.cursor = self.input.len();
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 == self.history.len() {
+            self.history_index = None;
+            self.input.clear();
+        } else {
+            self.history_index = Some(index + 1);
+            self.input = self.history[index + 1].clone();
+        }
+        self.cursor = self.input.len();
+    }
+
+    fn insert(&mut self, character: char) {
+        self.input.insert(self.cursor, character);
+        self.cursor += character.len_utf8();
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let start = self.input[..self.cursor]
+            .char_indices()
+            .next_back()
+            .unwrap()
+            .0;
+        self.input.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor == self.input.len() {
+            return;
+        }
+        let end = self.cursor + self.input[self.cursor..].chars().next().unwrap().len_utf8();
+        self.input.drain(self.cursor..end);
+    }
+
+    fn move_left(&mut self) {
+        if let Some((index, _)) = self.input[..self.cursor].char_indices().next_back() {
+            self.cursor = index;
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(character) = self.input[self.cursor..].chars().next() {
+            self.cursor += character.len_utf8();
+        }
+    }
+
+    fn move_word_left(&mut self) {
+        while self.cursor > 0 {
+            let (index, character) = self.input[..self.cursor]
+                .char_indices()
+                .next_back()
+                .unwrap();
+            if !character.is_whitespace() {
+                break;
+            }
+            self.cursor = index;
+        }
+        while self.cursor > 0 {
+            let (index, character) = self.input[..self.cursor]
+                .char_indices()
+                .next_back()
+                .unwrap();
+            if character.is_whitespace() {
+                break;
+            }
+            self.cursor = index;
+        }
+    }
+
+    fn move_word_right(&mut self) {
+        while let Some(character) = self.input[self.cursor..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            self.cursor += character.len_utf8();
+        }
+        while let Some(character) = self.input[self.cursor..].chars().next() {
+            if character.is_whitespace() {
+                break;
+            }
+            self.cursor += character.len_utf8();
+        }
+    }
+
+    fn delete_word_left(&mut self) {
+        let end = self.cursor;
+        self.move_word_left();
+        self.input.drain(self.cursor..end);
+    }
+
+    fn move_line_up(&mut self) {
+        let start = self.line_start();
+        if start == 0 {
+            return;
+        }
+        let column = self.input[start..self.cursor].chars().count();
+        let previous_end = start - 1;
+        let previous_start = self.input[..previous_end]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        self.cursor = byte_at_column(&self.input, previous_start, previous_end, column);
+    }
+
+    fn move_line_down(&mut self) {
+        let end = self.line_end();
+        if end == self.input.len() {
+            return;
+        }
+        let column = self.input[self.line_start()..self.cursor].chars().count();
+        let next_start = end + 1;
+        let next_end = self.input[next_start..]
+            .find('\n')
+            .map_or(self.input.len(), |index| next_start + index);
+        self.cursor = byte_at_column(&self.input, next_start, next_end, column);
+    }
+
+    fn line_start(&self) -> usize {
+        self.input[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1)
+    }
+
+    fn line_end(&self) -> usize {
+        self.input[self.cursor..]
+            .find('\n')
+            .map_or(self.input.len(), |index| self.cursor + index)
+    }
+
+    fn submit(&mut self) {
+        if self.input.trim().is_empty() {
+            return;
+        }
+        if self.input.starts_with('/') {
+            let command = std::mem::take(&mut self.input);
+            self.cursor = 0;
+            self.run_command(&command);
+            return;
+        }
+        let content = std::mem::take(&mut self.input);
+        self.cursor = 0;
+        self.history_index = None;
+        self.history.push(content.clone());
+        self.entries.push(Entry::User(content.clone()));
+        if self.running {
+            if let Some(steer) = &self.steer {
+                let _ = steer.send(content);
+            }
+            return;
+        }
+        self.messages.push(Message {
+            role: "user".into(),
+            content,
+            tool_calls: Vec::new(),
+            tool_call_id: String::new(),
+        });
+        let entry = session::Entry::Message {
+            message: self.messages.last().unwrap().clone(),
+        };
+        if let Err(error) = session::append_live(&self.cfg.session_dir, &[entry]) {
+            self.entries
+                .push(Entry::Notice(format!("error: save session: {error}")));
+        }
+        self.follow = true;
+        self.start_turn();
+    }
+
+    fn run_command(&mut self, input: &str) {
+        let argument = input.split_once(' ').map(|(_, argument)| argument.trim());
+        let command = app::parse_command(input);
+        if self.running
+            && matches!(
+                command,
+                Some(
+                    app::Command::New
+                        | app::Command::Resume
+                        | app::Command::Rewind
+                        | app::Command::Compact
+                )
+            )
+        {
+            self.entries.push(Entry::Notice(
+                "agent is running; ctrl+c interrupts it first".into(),
+            ));
+            return;
+        }
+        match command {
+            Some(app::Command::Quit) => self.want_quit = true,
+            Some(app::Command::Help) => {
+                self.catalog_query.clear();
+                self.help_open = true;
+                self.help_selected = 0;
+                self.picker = None;
+            }
+            Some(app::Command::New) => {
+                session::archive_live(&self.cfg.session_dir);
+                self.clear_session();
+            }
+            Some(app::Command::Resume) => match argument {
+                Some(id) if !id.is_empty() => self.resume(id),
+                _ => self.open_resume(),
+            },
+            Some(app::Command::Rewind) => self.open_rewind(),
+            Some(app::Command::Compact) => self.start_compaction(),
+            Some(app::Command::Copy) => self.copy_last(),
+            None => self
+                .entries
+                .push(Entry::Notice(format!("unknown command: {input}"))),
+        }
+    }
+
+    fn clear_session(&mut self) {
+        self.entries.clear();
+        self.messages.clear();
+        self.input_tokens = 0;
+        self.output_tokens = 0;
+        self.session_input = 0;
+        self.session_output = 0;
+        self.history.clear();
+        self.history_index = None;
+        self.follow = true;
+    }
+
+    fn rewind_to(&mut self, index: usize) {
+        let entries = app::rewind_entries(&self.messages, index);
+        if let Err(error) = session::save_live(&self.cfg.session_dir, &entries) {
+            self.entries
+                .push(Entry::Notice(format!("error: save session: {error}")));
+            return;
+        }
+        self.messages = session::context_messages(&entries);
+        self.input_tokens = 0;
+        self.output_tokens = 0;
+        self.session_input = 0;
+        self.session_output = 0;
+        self.rebuild_transcript();
+        self.entries.push(Entry::Notice(format!(
+            "rewound · {} messages remaining",
+            self.messages.len()
+        )));
+    }
+
+    fn copy_last(&mut self) {
+        let Some(text) = app::last_assistant_response(&self.messages) else {
+            self.entries
+                .push(Entry::Notice("no assistant response to copy".into()));
+            return;
+        };
+        let encoded = b64_encode(text.as_bytes());
+        print!("\u{1b}]52;c;{encoded}\u{1b}\\");
+        let _ = io::stdout().flush();
+        self.entries
+            .push(Entry::Notice("copied last response".into()));
+    }
+
+    fn start_compaction(&mut self) {
+        if self.compacting {
+            self.entries
+                .push(Entry::Notice("already compacting".into()));
+            return;
+        }
+        if self.messages.len() < 4 {
+            self.entries
+                .push(Entry::Notice("session too small to compact".into()));
+            return;
+        }
+        let provider = OpenAI::new(self.cfg.base.clone(), self.cfg.api_key.clone());
+        let model = self.cfg.model.clone();
+        let entries = session::load_live(&self.cfg.session_dir);
+        let (sender, receiver) = mpsc::channel();
+        self.events = Some(receiver);
+        self.compacting = true;
+        self.turn_started = Instant::now();
+        std::thread::spawn(move || {
+            let result = session::compact(&provider, &model, &entries).map(
+                |(summary, tokens_before, retained)| (summary, tokens_before, retained, entries),
+            );
+            let _ = sender.send(TurnEvent::Compacted(result));
+        });
+    }
+
+    fn start_turn(&mut self) {
+        let messages = self.messages.clone();
+        let provider = OpenAI::new(self.cfg.base.clone(), self.cfg.api_key.clone());
+        let model = self.cfg.model.clone();
+        let system = self.cfg.system.clone();
+        let tools = build_tools(&self.cfg.dir);
+        let threshold = self
+            .cfg
+            .context_window
+            .map(|window| window.saturating_sub(16384));
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = cancel.clone();
+        let (sender, receiver) = mpsc::channel();
+        let (steer, steer_receiver) = mpsc::channel();
+        self.events = Some(receiver);
+        self.steer = Some(steer);
+        self.running = true;
+        self.turn_started = Instant::now();
+        std::thread::spawn(move || {
+            let end = {
+                let mut sink = RatatuiSink {
+                    sender: &sender,
+                    steer: steer_receiver,
+                    threshold,
+                };
+                run::run_stream(
+                    &provider,
+                    &RunOptions {
+                        model: &model,
+                        system: &system,
+                        tools: &tools,
+                        max_turns: usize::MAX,
+                    },
+                    &messages,
+                    &cancel,
+                    &mut sink,
+                )
+            };
+            let compact = matches!(end.outcome, Outcome::Compact);
+            let error = match end.outcome {
+                Outcome::Done | Outcome::Cancelled | Outcome::Compact => None,
+                Outcome::MaxTurns => Some("stopped: max turns reached".into()),
+                Outcome::Failed(error) => Some(error),
+            };
+            let _ = sender.send(TurnEvent::End {
+                messages: end.messages,
+                usage: end.usage,
+                error,
+                compact,
+            });
+        });
+    }
+
+    fn drain_events(&mut self) {
+        let Some(receiver) = self.events.take() else {
+            return;
+        };
+        let mut compact_after = false;
+        let mut turn_after = false;
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                TurnEvent::AssistantDelta(delta) => {
+                    if let Some(Entry::Assistant { source, rendered }) = self.entries.last_mut() {
+                        source.push_str(&delta);
+                        *rendered = render_markdown(source);
+                    } else {
+                        self.entries.push(assistant_entry(delta));
+                    }
+                }
+                TurnEvent::ToolStart(label) => {
+                    self.tool_running = Some(label);
+                    self.tool_live = None;
+                }
+                TurnEvent::ToolDelta(output) => self.tool_live = Some(output),
+                TurnEvent::ToolResult(label) => {
+                    self.tool_running = None;
+                    self.tool_live = None;
+                    if let Some(Entry::Tool(calls)) = self.entries.last_mut() {
+                        calls.push(label);
+                    } else {
+                        self.entries.push(Entry::Tool(vec![label]));
+                    }
+                }
+                TurnEvent::Tokens(usage) => {
+                    if usage.input > 0 {
+                        self.input_tokens = usage.input;
+                    }
+                    self.output_tokens = usage.output;
+                }
+                TurnEvent::Compacted(result) => {
+                    self.compacting = false;
+                    match result {
+                        Ok((summary, tokens_before, retained, mut entries)) => {
+                            let entry = session::Entry::Compaction {
+                                summary,
+                                tokens_before,
+                                timestamp: session::now_ms(),
+                                retained,
+                            };
+                            if let Err(error) = session::append_live(
+                                &self.cfg.session_dir,
+                                std::slice::from_ref(&entry),
+                            ) {
+                                self.entries
+                                    .push(Entry::Notice(format!("error: save session: {error}")));
+                                continue;
+                            }
+                            entries.push(entry);
+                            self.messages = session::context_messages(&entries);
+                            self.input_tokens = 0;
+                            self.output_tokens = 0;
+                            self.rebuild_transcript();
+                            self.entries.push(Entry::Notice("compacted".into()));
+                            turn_after = self.retry_after_compact;
+                            self.retry_after_compact = false;
+                        }
+                        Err(error) => self
+                            .entries
+                            .push(Entry::Notice(format!("compaction failed: {error}"))),
+                    }
+                }
+                TurnEvent::End {
+                    messages,
+                    usage,
+                    error,
+                    compact,
+                } => {
+                    let entries: Vec<_> = messages[self.messages.len()..]
+                        .iter()
+                        .cloned()
+                        .map(|message| session::Entry::Message { message })
+                        .collect();
+                    if let Err(error) = session::append_live(&self.cfg.session_dir, &entries) {
+                        self.entries
+                            .push(Entry::Notice(format!("error: save session: {error}")));
+                    }
+                    self.messages = messages;
+                    self.session_input += usage.input;
+                    self.session_output += usage.output;
+                    self.running = false;
+                    self.steer = None;
+                    compact_after = compact
+                        || error.as_deref().is_some_and(session::is_overflow_error)
+                            && !self.overflow_retried;
+                    if compact_after {
+                        self.retry_after_compact = true;
+                        self.overflow_retried = true;
+                    } else if let Some(error) = error {
+                        self.entries.push(Entry::Notice(format!("error: {error}")));
+                    }
+                }
+            }
+        }
+        if compact_after {
+            self.start_compaction();
+        } else if turn_after {
+            self.start_turn();
+        } else if self.running || self.compacting {
+            self.events = Some(receiver);
+        }
+    }
+}
+
+fn assistant_entry(source: String) -> Entry {
+    let rendered = render_markdown(&source);
+    Entry::Assistant { source, rendered }
+}
+
+fn render_markdown(markdown: &str) -> Vec<Line<'static>> {
+    tui_markdown::from_str(markdown)
+        .lines
+        .into_iter()
+        .map(|line| {
+            let mut spans = line
+                .spans
+                .into_iter()
+                .map(|span| {
+                    let style = if span.style.fg.is_some() {
+                        span.style
+                    } else if span.style.add_modifier.contains(Modifier::BOLD) {
+                        span.style.fg(Color::Cyan)
+                    } else if span.style.add_modifier.contains(Modifier::ITALIC) {
+                        span.style.fg(Color::Magenta)
+                    } else {
+                        span.style
+                    };
+                    Span::styled(span.content.into_owned(), style)
+                })
+                .collect::<Vec<_>>();
+            if !spans.is_empty() {
+                spans.insert(0, Span::raw("  "));
+            }
+            Line::from(spans).style(line.style)
+        })
+        .collect()
+}
+
+fn wrap_markdown_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let characters = line
+        .spans
+        .iter()
+        .flat_map(|span| {
+            span.content
+                .chars()
+                .map(move |character| (character, span.style))
+        })
+        .collect::<Vec<_>>();
+    if characters.len() <= width || width == 0 {
+        return vec![line.clone()];
+    }
+    let marker_width = line.spans.get(1).map_or(0, |span| {
+        let marker = span.content.as_ref();
+        let trimmed = marker.trim_start();
+        if marker.ends_with("- ") || marker.ends_with("] ") {
+            marker.chars().count()
+        } else if trimmed.split_once(". ").is_some_and(|(number, rest)| {
+            rest.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+        }) {
+            marker.chars().count()
+        } else {
+            0
+        }
+    });
+    let continuation_width = 2 + marker_width;
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut first = true;
+    while start < characters.len() {
+        let indent = if first {
+            0
+        } else {
+            continuation_width.min(width.saturating_sub(1))
+        };
+        let capacity = width.saturating_sub(indent).max(1);
+        let limit = (start + capacity).min(characters.len());
+        let mut end = limit;
+        if limit < characters.len() {
+            if let Some(offset) = characters[start..limit]
+                .iter()
+                .rposition(|(character, _)| character.is_whitespace())
+            {
+                end = start + offset;
+            }
+            if end == start {
+                end = limit;
+            }
+        }
+        let mut spans = Vec::new();
+        if indent > 0 {
+            spans.push(Span::raw(" ".repeat(indent)));
+        }
+        for (character, style) in &characters[start..end] {
+            if spans.last().is_some_and(|span| span.style == *style) {
+                spans.last_mut().unwrap().content.to_mut().push(*character);
+            } else {
+                spans.push(Span::styled(character.to_string(), *style));
+            }
+        }
+        lines.push(Line::from(spans).style(line.style));
+        start = end;
+        while start < characters.len() && characters[start].0.is_whitespace() {
+            start += 1;
+        }
+        first = false;
+    }
+    lines
+}
+
+fn format_tokens(tokens: usize) -> String {
+    if tokens < 1000 {
+        tokens.to_string()
+    } else if tokens < 10_000 {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    } else {
+        format!("{}k", tokens / 1000)
+    }
+}
+
+fn age(updated: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+    let elapsed = (now - updated).max(0) as u64;
+    if elapsed < 60_000 {
+        "now".into()
+    } else if elapsed < 3_600_000 {
+        format!("{}m", elapsed / 60_000)
+    } else if elapsed < 86_400_000 {
+        format!("{}h", elapsed / 3_600_000)
+    } else {
+        format!("{}d", elapsed / 86_400_000)
+    }
+}
+
+fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize {
+    text[start..end]
+        .char_indices()
+        .nth(column)
+        .map_or(end, |(index, _)| start + index)
+}
+
+fn b64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::new();
+    for chunk in data.chunks(3) {
+        let bytes = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        output.push(TABLE[(bytes[0] >> 2) as usize] as char);
+        output.push(TABLE[(((bytes[0] & 3) << 4) | (bytes[1] >> 4)) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            TABLE[(((bytes[1] & 15) << 2) | (bytes[2] >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[(bytes[2] & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
+struct RatatuiSink<'a> {
+    sender: &'a Sender<TurnEvent>,
     steer: Receiver<String>,
     threshold: Option<usize>,
 }
 
-impl Sink for TuiSink<'_> {
+impl Sink for RatatuiSink<'_> {
     fn assistant_delta(&mut self, text: &str) {
-        let _ = self.tx.send(TurnEvent::AssistantDelta(text.to_string()));
-    }
-
-    fn assistant_done(&mut self) {
-        let _ = self.tx.send(TurnEvent::AssistantDone);
+        let _ = self.sender.send(TurnEvent::AssistantDelta(text.into()));
     }
 
     fn tool_start(&mut self, call: &ToolCall) {
-        let _ = self.tx.send(TurnEvent::ToolStart {
-            label: app::tool_label(call, true),
-            kind: tool_kind(call),
-        });
+        let _ = self
+            .sender
+            .send(TurnEvent::ToolStart(app::tool_label(call, true)));
     }
 
     fn tool_delta(&mut self, _call: &ToolCall, text: &str) {
-        let _ = self.tx.send(TurnEvent::ToolDelta(text.to_string()));
+        let _ = self.sender.send(TurnEvent::ToolDelta(text.into()));
     }
 
     fn tool_result(&mut self, call: &ToolCall) {
-        let _ = self.tx.send(TurnEvent::ToolResult {
-            label: app::tool_label(call, false),
-            kind: tool_kind(call),
-        });
+        let _ = self
+            .sender
+            .send(TurnEvent::ToolResult(app::tool_label(call, false)));
     }
 
     fn tokens(&mut self, input: usize, output: usize, cached_input: usize) {
-        let _ = self.tx.send(TurnEvent::Tokens {
+        let _ = self.sender.send(TurnEvent::Tokens(Usage {
             input,
             output,
             cached_input,
-        });
+        }));
     }
 
     fn should_compact(&mut self, input: usize, output: usize) -> bool {
@@ -2924,356 +1722,55 @@ impl Sink for TuiSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
 
     #[test]
-    fn input_edits_unicode() {
-        let mut input = Input::default();
-        input.paste("App — Plan → done".as_bytes());
-        input.move_left();
-        input.backspace();
-        input.delete();
-        input.insert('!');
-        assert_eq!(input.buf(), "App — Plan → do!");
-    }
-
-    #[test]
-    fn slash_compact_small_session_shows_notice() {
-        let dir = std::env::temp_dir().join(format!("axe-compact-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = TuiConfig {
-            base: "http://127.0.0.1:1/v1".into(),
-            model: "m".into(),
-            system: String::new(),
-            dir: String::new(),
-            axe_root: dir.to_str().unwrap().to_string(),
-            session_dir: dir.to_str().unwrap().to_string(),
-            api_key: "k".into(),
-            resume: None,
-            context_window: None,
+    fn markdown_render_is_owned_and_visible() {
+        let rendered = {
+            let source = "# Heading\n\n**bold**".to_string();
+            render_markdown(&source)
         };
-        let mut tui = Tui::new(cfg);
-        tui.slash("compact");
-        assert!(!tui.compacting, "small session must not start compaction");
-        assert!(
-            tui.entries
-                .iter()
-                .any(|e| matches!(e, Entry::Notice(n) if n.contains("too small")))
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn exit_appends_pending_messages_before_archive() {
-        let dir = std::env::temp_dir().join(format!("axe-exit-tui-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let d = dir.to_str().unwrap();
-        let cfg = TuiConfig {
-            base: "http://127.0.0.1:1/v1".into(),
-            model: "m".into(),
-            system: String::new(),
-            dir: String::new(),
-            axe_root: d.to_string(),
-            session_dir: d.to_string(),
-            api_key: "k".into(),
-            resume: None,
-            context_window: None,
-        };
-        let first = Message {
-            role: "user".into(),
-            content: "one".into(),
-            tool_calls: Vec::new(),
-            tool_call_id: String::new(),
-        };
-        let second = Message {
-            role: "assistant".into(),
-            content: "two".into(),
-            tool_calls: Vec::new(),
-            tool_call_id: String::new(),
-        };
-        session::save_live(
-            d,
-            &[session::Entry::Message {
-                message: first.clone(),
-            }],
-        )
-        .unwrap();
-        let mut tui = Tui::new(cfg);
-        tui.msgs = vec![first, second];
-        tui.session_context_len = 1;
-        tui.on_exit();
-        let archived = session::list_sessions(d);
-        assert_eq!(archived.len(), 1);
-        assert_eq!(
-            session::context_messages(&session::load_session(&archived[0].path)),
-            tui.msgs
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn persist_session_appends_only_new_messages() {
-        let dir = std::env::temp_dir().join(format!("axe-persist-tui-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let d = dir.to_str().unwrap();
-        let cfg = TuiConfig {
-            base: "http://127.0.0.1:1/v1".into(),
-            model: "m".into(),
-            system: String::new(),
-            dir: String::new(),
-            axe_root: d.to_string(),
-            session_dir: d.to_string(),
-            api_key: "k".into(),
-            resume: None,
-            context_window: None,
-        };
-        let message = |role: &str, content: &str| Message {
-            role: role.into(),
-            content: content.into(),
-            tool_calls: Vec::new(),
-            tool_call_id: String::new(),
-        };
-        let mut tui = Tui::new(cfg);
-        let mut messages = vec![message("user", "one"), message("assistant", "first")];
-        tui.persist_session(&messages, Usage::default(), None, false);
-        messages.push(message("user", "two"));
-        messages.push(message("assistant", "second"));
-        tui.persist_session(&messages, Usage::default(), None, false);
-        assert_eq!(session::context_messages(&session::load_live(d)), messages);
-        assert_eq!(tui.session_context_len, 4);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn steering_response_renders_after_tool() {
-        let dir = std::env::temp_dir().join(format!("axe-steer-tui-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = TuiConfig {
-            base: "http://127.0.0.1:1/v1".into(),
-            model: "m".into(),
-            system: String::new(),
-            dir: String::new(),
-            axe_root: dir.to_str().unwrap().to_string(),
-            session_dir: dir.to_str().unwrap().to_string(),
-            api_key: "k".into(),
-            resume: None,
-            context_window: None,
-        };
-        let mut tui = Tui::new(cfg);
-        let (tx, rx) = std::sync::mpsc::channel::<TurnEvent>();
-        tui.rx = Some(rx);
-        let (steer_tx, _steer_rx) = std::sync::mpsc::channel::<String>();
-        tui.steer_tx = Some(steer_tx);
-
-        let send = |ev: TurnEvent| {
-            tx.send(ev).unwrap();
-        };
-        send(TurnEvent::AssistantDelta("initial ".into()));
-        send(TurnEvent::Tokens {
-            input: 10,
-            output: 1,
-            cached_input: 5,
-        });
-        send(TurnEvent::AssistantDelta("answer".into()));
-        send(TurnEvent::AssistantDone);
-        send(TurnEvent::ToolStart {
-            label: "Running sleep".into(),
-            kind: "command".into(),
-        });
-        send(TurnEvent::ToolDelta("partial".into()));
-        assert!(tui.drain_events());
-
-        tui.input.buf = "continue".into();
-        tui.steer();
-        assert!(
-            tui.entries
-                .iter()
-                .any(|e| matches!(e, Entry::User(u) if u == "continue"))
-        );
-
-        send(TurnEvent::ToolResult {
-            label: "Ran sleep".into(),
-            kind: "command".into(),
-        });
-        send(TurnEvent::AssistantDelta("steered ".into()));
-        send(TurnEvent::AssistantDelta("reply".into()));
-        send(TurnEvent::AssistantDone);
-        assert!(tui.drain_events());
-
-        let user_idx = tui
-            .entries
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 4));
+        Paragraph::new(Text::from(rendered)).render(buffer.area, &mut buffer);
+        let screen = buffer
+            .content
             .iter()
-            .position(|e| matches!(e, Entry::User(u) if u == "continue"))
-            .expect("steer user entry");
-        let after: Vec<&String> = tui.entries[user_idx + 1..]
-            .iter()
-            .filter_map(|e| match e {
-                Entry::Text(t) => Some(t),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            after.iter().any(|t| t.contains("steered reply")),
-            "response not rendered after steer: {after:?}"
-        );
-        std::fs::remove_dir_all(&dir).ok();
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Heading"));
+        assert!(screen.contains("bold"));
     }
 
     #[test]
-    fn worker_steer_events_reach_transcript() {
-        use crate::run::{self, RunOptions};
-        use std::cell::RefCell;
-        use std::collections::VecDeque;
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
-        use std::sync::mpsc;
+    fn markdown_wrap_keeps_indentation() {
+        let normal = render_markdown("alpha beta gamma");
+        let normal = wrap_markdown_line(&normal[0], 12);
+        assert_eq!(line_text(&normal[1]), "  beta gamma");
 
-        struct SeqProvider {
-            responses: RefCell<VecDeque<crate::Response>>,
-            started: mpsc::Sender<()>,
-        }
-        impl crate::Provider for SeqProvider {
-            fn complete(&self, _req: &crate::Request) -> Result<crate::Response, crate::Error> {
-                Ok(self
-                    .responses
-                    .borrow_mut()
-                    .pop_front()
-                    .expect("no fake response"))
-            }
-            fn stream(
-                &self,
-                _req: &crate::Request,
-                _cancel: &Arc<AtomicBool>,
-            ) -> crate::StreamHandle {
-                let (tx, rx) = mpsc::channel();
-                let resp = self.complete(_req).expect("no fake response");
-                let _ = self.started.send(());
-                let thread = std::thread::spawn(move || {
-                    if !resp.message.content.is_empty() {
-                        let _ = tx.send(crate::StreamEvent::Content(resp.message.content.clone()));
-                    }
-                    for c in &resp.message.tool_calls {
-                        let _ = tx.send(crate::StreamEvent::ToolCall(c.clone()));
-                    }
-                    let _ = tx.send(crate::StreamEvent::Done);
-                    Ok(resp)
-                });
-                crate::StreamHandle::new(rx, thread)
-            }
-        }
+        let list = render_markdown("- alpha beta gamma");
+        let list = wrap_markdown_line(&list[0], 12);
+        assert_eq!(line_text(&list[1]), "    beta");
+    }
 
-        let dir = std::env::temp_dir().join(format!("axe-worker-steer-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = TuiConfig {
-            base: "http://127.0.0.1:1/v1".into(),
-            model: "m".into(),
-            system: String::new(),
-            dir: String::new(),
-            axe_root: dir.to_str().unwrap().to_string(),
-            session_dir: dir.to_str().unwrap().to_string(),
-            api_key: "k".into(),
-            resume: None,
-            context_window: None,
-        };
-        let mut tui = Tui::new(cfg);
-        tui.entries.clear();
-        tui.entries.push(Entry::User("go".into()));
-        tui.msgs = vec![crate::Message {
-            role: "user".into(),
-            content: "go".into(),
-            tool_calls: Vec::new(),
-            tool_call_id: String::new(),
-        }];
-
-        let bash_tool = crate::tools::bash("");
-        let (started_tx, started_rx) = mpsc::channel();
-        let p = SeqProvider {
-            responses: RefCell::new(VecDeque::from([
-                crate::Response {
-                    message: crate::Message {
-                        role: "assistant".into(),
-                        content: String::new(),
-                        tool_calls: vec![crate::ToolCall {
-                            id: "c1".into(),
-                            name: "bash".into(),
-                            arguments: r#"{"command":"sleep 0.2"}"#.into(),
-                        }],
-                        tool_call_id: String::new(),
-                    },
-                    usage: crate::Usage::default(),
-                    stop_reason: String::new(),
-                },
-                crate::Response {
-                    message: crate::Message {
-                        role: "assistant".into(),
-                        content: "steered answer".into(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: String::new(),
-                    },
-                    usage: crate::Usage::default(),
-                    stop_reason: String::new(),
-                },
-            ])),
-            started: started_tx,
-        };
-
-        let (tx, rx) = mpsc::channel::<TurnEvent>();
-        let (steer_tx, steer_rx) = mpsc::channel::<String>();
-        tui.steer_tx = Some(steer_tx.clone());
-        let cancel = Arc::new(AtomicBool::new(false));
-        let msgs = tui.msgs.clone();
-        let worker = std::thread::spawn(move || {
-            let opts = RunOptions {
-                model: "m",
-                system: "",
-                tools: &[bash_tool],
-                max_turns: 5,
-            };
-            let mut sink = TuiSink {
-                tx: &tx,
-                steer: steer_rx,
-                threshold: None,
-            };
-            let end = run::run_stream(&p, &opts, &msgs, &cancel, &mut sink);
-            let (err, cancelled, compact) = match end.outcome {
-                run::Outcome::Done => (None, false, false),
-                run::Outcome::MaxTurns => (Some("stopped: max turns reached".into()), false, false),
-                run::Outcome::Cancelled => (None, true, false),
-                run::Outcome::Compact => (None, false, true),
-                run::Outcome::Failed(e) => (Some(e), false, false),
-            };
-            let _ = tx.send(TurnEvent::End {
-                messages: end.messages,
-                usage: end.usage,
-                err,
-                cancelled,
-                compact,
-            });
-        });
-        started_rx.recv().unwrap();
-        tui.input.buf = "continue".into();
-        tui.steer();
-        let _ = worker.join();
-
-        tui.rx = Some(rx);
-        tui.drain_events();
-        assert!(
-            tui.entries
-                .iter()
-                .any(|e| matches!(e, Entry::User(u) if u == "continue")),
-            "steer user entry missing"
-        );
-        let texts: Vec<String> = tui
-            .entries
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
             .iter()
-            .filter_map(|e| match e {
-                Entry::Text(t) => Some(t.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            texts.iter().any(|t| t.contains("steered answer")),
-            "steered response missing from transcript: {texts:?}"
-        );
-        std::fs::remove_dir_all(&dir).ok();
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn format_tokens_shortens_large_values() {
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1.0k");
+        assert_eq!(format_tokens(9_999), "10.0k");
+        assert_eq!(format_tokens(10_000), "10k");
+    }
+
+    #[test]
+    fn byte_column_handles_unicode() {
+        assert_eq!(byte_at_column("a—c", 0, 5, 2), 4);
     }
 }
