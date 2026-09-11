@@ -153,22 +153,15 @@ impl Drop for TerminalRestore {
 
 pub fn run(cfg: TuiConfig) -> Result<(), String> {
     enable_raw_mode().map_err(|error| error.to_string())?;
-    let enhanced_keyboard = matches!(
-        crossterm::terminal::supports_keyboard_enhancement(),
-        Ok(true)
-    );
-    let restore = TerminalRestore { enhanced_keyboard };
+    let restore = TerminalRestore {
+        enhanced_keyboard: true,
+    };
     let mut stdout = io::stdout();
-    if enhanced_keyboard {
-        execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
-            )
-        )
-        .map_err(|error| error.to_string())?;
-    }
+    execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .map_err(|error| error.to_string())?;
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -370,7 +363,7 @@ impl App {
             }
             frame.render_widget(Paragraph::new(lines).style(Style::default()), areas[1]);
         }
-        let input = Paragraph::new(self.input_text()).wrap(Wrap { trim: false });
+        let input = Paragraph::new(self.input_text(input_width));
         frame.render_widget(input, areas[2]);
         if let Some(picker) = &self.picker {
             let mut lines = vec![Line::from(Span::styled(
@@ -426,7 +419,9 @@ impl App {
         let (cursor_row, cursor_col) = self.cursor_position(input_width);
         let cursor_row = self.attachments.len() + cursor_row;
         let visible_start = composer_lines.saturating_sub(input_height as usize);
-        let cursor_row = cursor_row.saturating_sub(visible_start);
+        let cursor_row = cursor_row
+            .saturating_sub(visible_start)
+            .min(input_height.saturating_sub(1) as usize);
         frame.set_cursor_position((
             areas[2].x + 2 + cursor_col as u16,
             areas[2].y + cursor_row as u16,
@@ -729,7 +724,7 @@ impl App {
         Text::from(lines)
     }
 
-    fn input_text(&self) -> Text<'_> {
+    fn input_text(&self, width: usize) -> Text<'static> {
         let mut lines = Vec::new();
         for image in &self.attachments {
             lines.push(Line::from(vec![
@@ -741,10 +736,12 @@ impl App {
             ]));
         }
         for line in self.input.split('\n') {
-            lines.push(Line::from(vec![
-                Span::styled("┃ ", Style::default()),
-                Span::raw(line),
-            ]));
+            for chunk in wrap_input_line(line, width) {
+                lines.push(Line::from(vec![
+                    Span::styled("┃ ", Style::default()),
+                    Span::raw(chunk),
+                ]));
+            }
         }
         Text::from(lines)
     }
@@ -764,6 +761,13 @@ impl App {
                 col = 0;
             }
             col += 1;
+        }
+        if col == width
+            && self.cursor < self.input.len()
+            && !self.input[self.cursor..].starts_with('\n')
+        {
+            row += 1;
+            col = 0;
         }
         (row, col)
     }
@@ -889,6 +893,11 @@ impl App {
                 }
                 KeyCode::Char('w') => {
                     self.delete_word_left();
+                    return false;
+                }
+                KeyCode::Char('j') => {
+                    self.insert('\n');
+                    self.picker = None;
                     return false;
                 }
                 KeyCode::Char('u') => {
@@ -1744,6 +1753,21 @@ fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize 
         .map_or(end, |(index, _)| start + index)
 }
 
+fn wrap_input_line(line: &str, width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for character in line.chars() {
+        current.push(character);
+        if current.chars().count() == width {
+            chunks.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() || chunks.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 /// Terminals quote or backslash-escape a path dropped onto them; undo that so
 /// the path can be read.
 fn dropped_image_path(text: &str) -> Option<String> {
@@ -1871,5 +1895,14 @@ mod tests {
     #[test]
     fn byte_column_handles_unicode() {
         assert_eq!(byte_at_column("a—c", 0, 5, 2), 4);
+    }
+
+    #[test]
+    fn input_wrap_splits_on_width() {
+        assert_eq!(wrap_input_line("", 5), vec![""]);
+        assert_eq!(wrap_input_line("ab", 5), vec!["ab"]);
+        assert_eq!(wrap_input_line("abcde", 5), vec!["abcde"]);
+        assert_eq!(wrap_input_line("abcdef", 5), vec!["abcde", "f"]);
+        assert_eq!(wrap_input_line("abcdefghij", 5), vec!["abcde", "fghij"]);
     }
 }
