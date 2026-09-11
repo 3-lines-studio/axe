@@ -42,12 +42,14 @@ pub(crate) fn atomic_write_with(
     }
     let parent = dir.unwrap_or(std::path::Path::new("."));
     let tag = TAG.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(
-        ".axe-tmp-{}-{tag}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
-            .unwrap_or(0)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let tmp = parent.join(temp_name(
+        std::process::id(),
+        now.as_secs(),
+        now.subsec_nanos(),
+        tag,
     ));
     let permissions = std::fs::symlink_metadata(path)
         .ok()
@@ -70,6 +72,16 @@ pub(crate) fn atomic_write_with(
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+/// Temp-file name for one write. Unique across processes and across calls:
+/// the destination directory can be shared (two axe instances on one project),
+/// so the process id and the per-process call counter both take part. Without
+/// the pid two processes could pick the same name at the same instant, and the
+/// loser's error cleanup would unlink the winner's temp file. `create_new`
+/// still guards the remaining sliver of pid reuse.
+fn temp_name(pid: u32, secs: u64, nanos: u32, tag: u64) -> String {
+    format!(".axe-tmp-{pid}-{}-{tag}", u64::from(nanos) ^ secs)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -419,6 +431,69 @@ mod tests {
                 .unwrap()
                 .flatten()
                 .any(|entry| entry.file_name().to_string_lossy().starts_with(".axe-tmp-"))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn temp_name_distinguishes_processes_and_calls() {
+        // Two processes writing the same directory at the same instant must not
+        // pick the same temp file, or one's error cleanup unlinks the other's.
+        assert_ne!(temp_name(1, 100, 7, 0), temp_name(2, 100, 7, 0));
+        // Successive writes in one process must differ too.
+        assert_ne!(temp_name(1, 100, 7, 0), temp_name(1, 100, 7, 1));
+        assert_ne!(temp_name(1, 100, 7, 0), temp_name(1, 101, 7, 0));
+        assert_ne!(temp_name(1, 100, 7, 0), temp_name(1, 100, 8, 0));
+    }
+
+    #[test]
+    #[ignore]
+    fn atomic_write_concurrent_child() {
+        let path = std::path::PathBuf::from(std::env::var_os("AXE_CONCURRENT_PATH").unwrap());
+        let payload = std::env::var("AXE_CONCURRENT_PAYLOAD").unwrap();
+        atomic_write(&path, payload.as_bytes()).unwrap();
+    }
+
+    /// Concurrent processes targeting one destination must all succeed, and the
+    /// file must end up as exactly one writer's payload: atomic_write never
+    /// interleaves or truncates, and no writer's temp file is stolen.
+    #[test]
+    fn atomic_write_concurrent_processes() {
+        let dir = std::env::temp_dir().join(format!("axe-aw-conc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let payloads: Vec<String> = (0..16)
+            .map(|i| format!("writer-{i}-").repeat(500))
+            .collect();
+        let children: Vec<_> = payloads
+            .iter()
+            .map(|payload| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::atomic_write_concurrent_child",
+                        "--ignored",
+                    ])
+                    .env("AXE_CONCURRENT_PATH", &path)
+                    .env("AXE_CONCURRENT_PAYLOAD", payload)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for mut child in children {
+            assert!(
+                child.wait().unwrap().success(),
+                "a concurrent writer failed"
+            );
+        }
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            payloads.contains(&written),
+            "destination is not any one writer's payload ({} bytes)",
+            written.len()
         );
         std::fs::remove_dir_all(&dir).ok();
     }

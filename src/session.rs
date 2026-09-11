@@ -757,20 +757,36 @@ fn read_sidecar(path: &Path, bytes: u64) -> Option<SessionSidecar> {
 }
 
 /// Rough token estimate for context budgeting: chars/4.
-/// Ensure the transcript does not end with an unanswered tool-call exchange:
-/// providers reject an assistant message whose tool_calls lack matching tool
-/// results. Drops such an exchange (e.g. from a crash mid-batch in an older
-/// session); complete exchanges are kept.
-pub fn trim_trailing_tool_messages(msgs: &mut Vec<Message>) {
-    let Some(pos) = msgs
-        .iter()
-        .rposition(|m| m.role == "assistant" && !m.tool_calls.is_empty())
-    else {
-        return;
-    };
-    let answered = msgs[pos + 1..].iter().filter(|m| m.role == "tool").count();
-    if answered < msgs[pos].tool_calls.len() {
-        msgs.truncate(pos);
+/// Drop tool-call exchanges the transcript never finished: an assistant
+/// message whose `tool_calls` lack matching tool results, together with the
+/// results it did produce. Providers reject such a sequence, and a crash
+/// mid-batch (or a session file written by an older version) can leave one
+/// anywhere in the transcript, not only at the end. Complete exchanges are
+/// kept untouched.
+pub fn drop_incomplete_tool_calls(msgs: &mut Vec<Message>) {
+    let mut i = 0;
+    while i < msgs.len() {
+        if msgs[i].role != "assistant" || msgs[i].tool_calls.is_empty() {
+            i += 1;
+            continue;
+        }
+        let mut end = i + 1;
+        let mut answered = 0;
+        while end < msgs.len() && msgs[end].role == "tool" {
+            if msgs[i]
+                .tool_calls
+                .iter()
+                .any(|call| call.id == msgs[end].tool_call_id)
+            {
+                answered += 1;
+            }
+            end += 1;
+        }
+        if answered < msgs[i].tool_calls.len() {
+            msgs.drain(i..end);
+            continue;
+        }
+        i = end;
     }
 }
 

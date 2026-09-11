@@ -128,7 +128,11 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
             i += 1;
             continue;
         }
-        let Some(stripped) = a.strip_prefix('-') else {
+        if a == "--" {
+            rest = args[i + 1..].to_vec();
+            break;
+        }
+        let Some(stripped) = a.strip_prefix('-').filter(|s| !s.is_empty()) else {
             rest = args[i..].to_vec();
             break;
         };
@@ -176,6 +180,7 @@ fn usage() {
          \x20 -r, --resume  open the session picker\n\
          \x20 --resume last  resume the most recent session\n\
          \x20 --resume ID   resume a saved session by id\n\
+         \x20 --           end of flags: every later argument is part of the prompt\n\
          \n\
          With no prompt and a TTY, starts the interactive transcript TUI\n\
          (fresh session; \"/resume\" reopens saved ones).\n\
@@ -255,6 +260,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
             Some((id, entries)) => {
                 resume_id = Some(id);
                 history = axe::session::context_messages(&entries);
+                axe::session::drop_incomplete_tool_calls(&mut history);
                 session_entries = entries;
             }
             None => {
@@ -297,6 +303,15 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
                 .cloned()
                 .map(|message| axe::session::Entry::Message { message }),
         );
+        if end.usage.input > 0 || end.usage.output > 0 {
+            session_entries.push(axe::session::Entry::Usage {
+                input: end.usage.input,
+                output: end.usage.output,
+                cached_input: end.context.cached_input,
+                context_input: end.context.input,
+                context_output: end.context.output,
+            });
+        }
         match end.outcome {
             Outcome::Failed(error) => {
                 if !overflow_retried && axe::session::is_overflow_error(&error) {
@@ -385,7 +400,7 @@ fn compact_or_fail(
                 retained,
             });
             let mut out = axe::session::context_messages(entries);
-            axe::session::trim_trailing_tool_messages(&mut out);
+            axe::session::drop_incomplete_tool_calls(&mut out);
             out
         }
         Err(e) => fail_oneshot(
@@ -596,6 +611,47 @@ fn fmt_dur(d: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_config() -> FileConfig {
+        FileConfig {
+            api_key: String::new(),
+            model: String::new(),
+            base: String::new(),
+            context_window: None,
+        }
+    }
+
+    #[test]
+    fn parse_args_end_of_flags() {
+        let fc = empty_config();
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // `--` stops flag parsing: a prompt that begins with a dash is passed
+        // through, and the marker itself is consumed.
+        let (cfg, rest) = parse_args(&args(&["--", "-fix the bug"]), &fc).unwrap();
+        assert_eq!(rest, ["-fix the bug"]);
+        assert!(cfg.dir.is_empty());
+
+        // Flags before `--` still apply.
+        let (cfg, rest) = parse_args(&args(&["-model", "m", "--", "-x"]), &fc).unwrap();
+        assert_eq!(cfg.model, "m");
+        assert_eq!(rest, ["-x"]);
+
+        // A lone `-` is an operand, not a flag.
+        let (_, rest) = parse_args(&args(&["-"]), &fc).unwrap();
+        assert_eq!(rest, ["-"]);
+
+        // `--` with nothing after it yields no prompt.
+        let (_, rest) = parse_args(&args(&["--"]), &fc).unwrap();
+        assert!(rest.is_empty());
+
+        // `--help` after `--` is a prompt, not the help flag.
+        let (_, rest) = parse_args(&args(&["--", "--help"]), &fc).unwrap();
+        assert_eq!(rest, ["--help"]);
+
+        // Unknown flags are still rejected.
+        assert!(parse_args(&args(&["-nope"]), &fc).is_err());
+    }
 
     #[test]
     fn render_args_cases() {

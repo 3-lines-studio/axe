@@ -87,7 +87,12 @@ pub enum Outcome {
 }
 pub struct RunEnd {
     pub messages: Vec<Message>,
+    /// Tokens billed across every request in the run.
     pub usage: Usage,
+    /// Usage of the last request: its input is the context size the provider
+    /// saw, its output the tokens generated in the final turn. Callers
+    /// persist this for the compaction budget and the resume display.
+    pub context: Usage,
     pub outcome: Outcome,
 }
 
@@ -101,6 +106,7 @@ pub fn run_stream<P: Provider>(
     let started = Instant::now();
     let mut h = msgs.to_vec();
     let mut usage = Usage::default();
+    let mut context = Usage::default();
     trace(format!(
         "run start messages={} system_bytes={} tools={}",
         msgs.len(),
@@ -113,6 +119,7 @@ pub fn run_stream<P: Provider>(
             return RunEnd {
                 messages: h,
                 usage,
+                context,
                 outcome: Outcome::Cancelled,
             };
         }
@@ -126,12 +133,14 @@ pub fn run_stream<P: Provider>(
                     return RunEnd {
                         messages: h,
                         usage,
+                        context,
                         outcome: Outcome::Cancelled,
                     };
                 }
                 return RunEnd {
                     messages: h,
                     usage,
+                    context,
                     outcome: Outcome::Failed(e),
                 };
             }
@@ -150,6 +159,7 @@ pub fn run_stream<P: Provider>(
             output: usage.output + resp.usage.output,
             cached_input: usage.cached_input + resp.usage.cached_input,
         };
+        context = resp.usage;
         h.push(resp.message);
         sink.assistant(turn, h.last().unwrap(), resp.usage);
         sink.assistant_done();
@@ -169,6 +179,7 @@ pub fn run_stream<P: Provider>(
             return RunEnd {
                 messages: h,
                 usage,
+                context,
                 outcome: Outcome::Done,
             };
         }
@@ -180,6 +191,7 @@ pub fn run_stream<P: Provider>(
             return RunEnd {
                 messages: h,
                 usage,
+                context,
                 outcome: Outcome::Cancelled,
             };
         }
@@ -190,6 +202,7 @@ pub fn run_stream<P: Provider>(
             return RunEnd {
                 messages: h,
                 usage,
+                context,
                 outcome: Outcome::Compact,
             };
         }
@@ -197,6 +210,7 @@ pub fn run_stream<P: Provider>(
     RunEnd {
         messages: h,
         usage,
+        context,
         outcome: Outcome::MaxTurns,
     }
 }

@@ -379,6 +379,76 @@ fn run_max_turns() {
     }
 }
 
+#[test]
+fn run_end_separates_last_context_usage_from_totals() {
+    let noop = new_tool(
+        "noop",
+        "noop",
+        r#"{"type":"object","properties":{}}"#,
+        |_: serde_json::Value| "ok".into(),
+    );
+    let responses: VecDeque<Response> = [
+        Response {
+            message: call_tool("c1", "noop", "{}"),
+            usage: Usage {
+                input: 10,
+                output: 5,
+                cached_input: 3,
+            },
+            stop_reason: "tool_calls".into(),
+        },
+        Response {
+            message: assistant("done"),
+            usage: Usage {
+                input: 20,
+                output: 8,
+                cached_input: 7,
+            },
+            stop_reason: "stop".into(),
+        },
+    ]
+    .into();
+    let p = Fake {
+        responses: RefCell::new(responses),
+        requests: RefCell::new(Vec::new()),
+    };
+    let end = run::run_stream(
+        &p,
+        &run::RunOptions {
+            model: "",
+            system: "",
+            tools: &[noop],
+            max_turns: 10,
+        },
+        &[user("hi")],
+        &Arc::new(AtomicBool::new(false)),
+        &mut TestSink { on: None },
+    );
+    assert!(
+        matches!(end.outcome, run::Outcome::Done),
+        "{:?}",
+        end.outcome
+    );
+    assert_eq!(
+        end.usage,
+        Usage {
+            input: 30,
+            output: 13,
+            cached_input: 10,
+        },
+        "run totals accumulate across turns"
+    );
+    assert_eq!(
+        end.context,
+        Usage {
+            input: 20,
+            output: 8,
+            cached_input: 7,
+        },
+        "context is the last request, not the sum"
+    );
+}
+
 #[derive(Deserialize)]
 struct NeedsInt {
     n: i64,
@@ -782,7 +852,7 @@ fn run_does_not_retry_after_events_were_emitted() {
 }
 
 #[test]
-fn trim_trailing_tool_messages() {
+fn drop_incomplete_tool_calls() {
     // A complete exchange is kept.
     let mut complete = vec![
         user("go"),
@@ -794,7 +864,7 @@ fn trim_trailing_tool_messages() {
             tool_call_id: "c1".into(),
         },
     ];
-    axe::session::trim_trailing_tool_messages(&mut complete);
+    axe::session::drop_incomplete_tool_calls(&mut complete);
     assert_eq!(complete.len(), 3);
 
     // A partial exchange (2 calls, 1 result) is dropped whole, including
@@ -825,12 +895,32 @@ fn trim_trailing_tool_messages() {
             tool_call_id: "c1".into(),
         },
     ];
-    axe::session::trim_trailing_tool_messages(&mut partial);
+    axe::session::drop_incomplete_tool_calls(&mut partial);
     assert_eq!(partial.len(), 1);
     assert_eq!(partial[0].role, "user");
 
+    // An incomplete exchange in the middle is dropped without discarding
+    // the finished turns around it.
+    let mut middle = vec![
+        user("go"),
+        call_tool("c1", "read", "{}"),
+        Message {
+            role: "tool".into(),
+            content: "one".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: "c1".into(),
+        },
+        call_tool("c2", "read", "{}"),
+        user("continue"),
+        assistant("answer"),
+    ];
+    axe::session::drop_incomplete_tool_calls(&mut middle);
+    let roles: Vec<&str> = middle.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "tool", "user", "assistant"]);
+    assert_eq!(middle[3].content, "continue");
+
     let mut msgs2 = vec![user("go")];
-    axe::session::trim_trailing_tool_messages(&mut msgs2);
+    axe::session::drop_incomplete_tool_calls(&mut msgs2);
     assert_eq!(msgs2.len(), 1);
 }
 
@@ -918,7 +1008,7 @@ fn run_cancel_mid_batch_synthesizes_results() {
 
     // The transcript survives the pre-turn validity trim untouched.
     let mut trimmed = msgs.clone();
-    axe::session::trim_trailing_tool_messages(&mut trimmed);
+    axe::session::drop_incomplete_tool_calls(&mut trimmed);
     assert_eq!(trimmed.len(), msgs.len());
 }
 

@@ -428,6 +428,28 @@ def case(fn):
     return fn
 
 
+def entries_of(path):
+    return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
+
+
+def invalid_transcript(msgs):
+    """Describe the first provider-invalid tool exchange, or None."""
+    pending = set()
+    for m in msgs:
+        role = m.get("role")
+        if role == "assistant":
+            if pending:
+                return "tool_calls %s left unanswered" % sorted(pending)
+            pending = {c["id"] for c in m.get("tool_calls") or []}
+        elif role == "tool":
+            pending.discard(m.get("tool_call_id"))
+        elif role == "user" and pending:
+            return "user message with tool_calls %s unanswered" % sorted(pending)
+    if pending:
+        return "transcript ends with tool_calls %s unanswered" % sorted(pending)
+    return None
+
+
 def body_msg(server, i, role):
     return [m for m in server.requests[i]["json"]["messages"] if m["role"] == role]
 
@@ -573,6 +595,31 @@ def oneshot_bad_flag(h, axe):
 
 
 @case
+def oneshot_end_of_flags(h, axe):
+    # `--` lets a prompt that starts with a dash through.
+    with h.mock(ANSWER_SCENARIO) as srv:
+        p = h.oneshot(axe, ["--", "-fix the bug"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+        check(
+            body_msg(srv, 0, "user")[-1]["content"] == "-fix the bug",
+            "dash prompt not sent: %s" % body_msg(srv, 0, "user"),
+        )
+
+    # Flags before `--` still take effect.
+    with h.mock(ANSWER_SCENARIO) as srv:
+        p = h.oneshot(axe, ["-model", "dash-model", "--", "hi"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+        check(srv.requests[0]["json"]["model"] == "dash-model", "flag before -- lost")
+        check(body_msg(srv, 0, "user")[-1]["content"] == "hi", "prompt after -- lost")
+
+    # A lone dash is a prompt, not a flag.
+    with h.mock(ANSWER_SCENARIO) as srv:
+        p = h.oneshot(axe, ["-"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+        check(body_msg(srv, 0, "user")[-1]["content"] == "-", "bare dash not sent")
+
+
+@case
 def oneshot_help(h, axe):
     p = h.oneshot(axe, ["--help"])
     check(p.returncode == 0, "expected exit 0, got %s" % p.returncode)
@@ -623,6 +670,97 @@ def tui_full_turn(h, axe):
         check("echo hello" in text, "tool call missing: %s" % text)
         check("Done" in text, "answer missing: %s" % text)
         check(len(srv.requests) == 2, "expected 2 requests, got %d" % len(srv.requests))
+
+
+@case
+def usage_persisted(h, axe):
+    with h.mock(TOOL_SCENARIO) as srv:
+        t = h.tui(axe, base=srv.base_url)
+        try:
+            t.expect("Run /help")
+            t.type("check the tool\r")
+            t.expect("Ran echo hello")
+            t.expect("Done")
+            t.type("/quit\r")
+            check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
+        finally:
+            t.close()
+    sessions = list((h.session_root() / "sessions").glob("*.jsonl"))
+    check(len(sessions) == 1, "expected 1 archived session, got %d" % len(sessions))
+    usage = [e for e in entries_of(sessions[0]) if e.get("type") == "usage"]
+    check(len(usage) == 1, "tui: expected 1 usage entry, got %d" % len(usage))
+    check(usage[0]["input"] == 30, "tui: billed input: %s" % usage[0])
+    check(usage[0]["output"] == 13, "tui: billed output: %s" % usage[0])
+    check(usage[0]["context_input"] == 20, "tui: context_input: %s" % usage[0])
+    check(usage[0]["context_output"] == 8, "tui: context_output: %s" % usage[0])
+
+    h.seed_session("111", "old", "prior work")
+    with h.mock(ANSWER_SCENARIO) as srv:
+        p = h.oneshot(axe, ["--resume", "111", "continue"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+    path = h.session_root() / "sessions" / "111.jsonl"
+    usage = [e for e in entries_of(path) if e.get("type") == "usage"]
+    check(len(usage) == 1, "oneshot: expected 1 usage entry, got %d" % len(usage))
+    check(usage[0]["input"] == 20, "oneshot: billed input: %s" % usage[0])
+    check(usage[0]["context_input"] == 20, "oneshot: context_input: %s" % usage[0])
+    check(usage[0]["context_output"] == 8, "oneshot: context_output: %s" % usage[0])
+
+
+@case
+def resume_repairs_unanswered_tool_calls(h, axe):
+    # A crash mid-batch leaves an assistant message whose tool_calls have no
+    # results. Providers reject that, so resume must drop the unfinished
+    # exchange before sending.
+    h.seed_session_msgs(
+        "111",
+        "crashy",
+        [
+            {"Role": "user", "Content": "do work"},
+            {
+                "Role": "assistant",
+                "Content": "",
+                "ToolCalls": [{"ID": "c1", "Name": "bash", "Arguments": '{"command":"echo a"}'}],
+            },
+            {"Role": "tool", "Content": "a\n", "ToolCallID": "c1"},
+            {
+                "Role": "assistant",
+                "Content": "",
+                "ToolCalls": [{"ID": "c2", "Name": "bash", "Arguments": '{"command":"echo b"}'}],
+            },
+        ],
+    )
+    with h.mock(ANSWER_SCENARIO) as srv:
+        p = h.oneshot(axe, ["--resume", "111", "continue"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+    sent = srv.requests[0]["json"]["messages"]
+    check(invalid_transcript(sent) is None, "oneshot: %s" % invalid_transcript(sent))
+    calls = [c["id"] for m in sent for c in m.get("tool_calls") or []]
+    check("c2" not in calls, "dangling call not dropped: %s" % calls)
+    check("c1" in calls, "complete call dropped: %s" % calls)
+    check(sent[-1]["content"] == "continue", "prompt missing: %s" % sent[-1])
+
+    # Resuming the now-extended session stays valid: the repair drops only
+    # the unfinished exchange, never the turns around it.
+    with h.mock(ANSWER_SCENARIO) as srv:
+        p = h.oneshot(axe, ["--resume", "111", "again"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+    sent = srv.requests[0]["json"]["messages"]
+    check(invalid_transcript(sent) is None, "second resume: %s" % invalid_transcript(sent))
+    check(any(m.get("content") == "continue" for m in sent), "earlier turn lost: %s" % sent)
+
+    # The TUI resume path repairs too.
+    with h.mock(ANSWER_SCENARIO) as srv:
+        t = h.tui(axe, ["--resume", "111"], base=srv.base_url)
+        try:
+            t.expect("Run /help")
+            t.type("one more\r")
+            t.expect("Done")
+            t.type("/quit\r")
+            check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
+        finally:
+            t.close()
+    sent = srv.requests[0]["json"]["messages"]
+    check(invalid_transcript(sent) is None, "tui: %s" % invalid_transcript(sent))
 
 
 @case

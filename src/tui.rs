@@ -80,6 +80,7 @@ enum TurnEvent {
     End {
         messages: Vec<Message>,
         usage: Usage,
+        context: Usage,
         error: Option<String>,
         compact: bool,
     },
@@ -605,6 +606,7 @@ impl App {
             })
             .collect::<Vec<_>>();
         self.messages = session::context_messages(&entries);
+        session::drop_incomplete_tool_calls(&mut self.messages);
         let usage = app::session_usage(&entries);
         self.input_tokens = usage.context_input;
         self.output_tokens = 0;
@@ -1394,6 +1396,7 @@ impl App {
             let _ = sender.send(TurnEvent::End {
                 messages: end.messages,
                 usage: end.usage,
+                context: end.context,
                 error,
                 compact,
             });
@@ -1471,14 +1474,24 @@ impl App {
                 TurnEvent::End {
                     messages,
                     usage,
+                    context,
                     error,
                     compact,
                 } => {
-                    let entries: Vec<_> = messages[self.messages.len()..]
+                    let mut entries: Vec<_> = messages[self.messages.len()..]
                         .iter()
                         .cloned()
                         .map(|message| session::Entry::Message { message })
                         .collect();
+                    if usage.input > 0 || usage.output > 0 {
+                        entries.push(session::Entry::Usage {
+                            input: usage.input,
+                            output: usage.output,
+                            cached_input: context.cached_input,
+                            context_input: context.input,
+                            context_output: context.output,
+                        });
+                    }
                     if let Err(error) = session::append_live(&self.cfg.session_dir, &entries) {
                         self.entries
                             .push(Entry::Notice(format!("error: save session: {error}")));
@@ -1560,11 +1573,10 @@ fn wrap_markdown_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> 
     let marker_width = line.spans.get(1).map_or(0, |span| {
         let marker = span.content.as_ref();
         let trimmed = marker.trim_start();
-        if marker.ends_with("- ") || marker.ends_with("] ") {
-            marker.chars().count()
-        } else if trimmed.split_once(". ").is_some_and(|(number, rest)| {
+        let ordered = trimmed.split_once(". ").is_some_and(|(number, rest)| {
             rest.is_empty() && number.chars().all(|c| c.is_ascii_digit())
-        }) {
+        });
+        if marker.ends_with("- ") || marker.ends_with("] ") || ordered {
             marker.chars().count()
         } else {
             0
@@ -1752,6 +1764,19 @@ mod tests {
         let list = render_markdown("- alpha beta gamma");
         let list = wrap_markdown_line(&list[0], 12);
         assert_eq!(line_text(&list[1]), "    beta");
+    }
+
+    #[test]
+    fn markdown_wrap_indents_every_marker_kind() {
+        // Ordered ("1. ") and task-list ("- [x] ") markers carry the same
+        // continuation indent as the bullet marker.
+        let ordered = render_markdown("1. alpha beta gamma");
+        let ordered = wrap_markdown_line(&ordered[0], 12);
+        assert_eq!(line_text(&ordered[1]), "     beta");
+
+        let task = render_markdown("- [x] alpha beta gamma");
+        let task = wrap_markdown_line(&task[0], 16);
+        assert_eq!(line_text(&task[1]), "        beta");
     }
 
     fn line_text(line: &Line<'_>) -> String {
