@@ -7,6 +7,7 @@ use std::os::unix::process::CommandExt;
 
 const MAX_OUTPUT: usize = 16 * 1024;
 const DEFAULT_BASH_TIMEOUT: u64 = 120;
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Strip control characters (except tab/newline/CR) and Unicode format
 /// interlinear annotation marks from tool output before it reaches the model.
@@ -152,6 +153,24 @@ fn wait_for_child(pidfd: Option<&OwnedFd>, timeout: std::time::Duration) {
     }
 }
 
+/// Reap a killed child, giving up after `grace` so an unkillable process
+/// (uninterruptible I/O, frozen cgroup, stopped tracer) can never hang the
+/// tool past its timeout.
+fn reap(child: &mut std::process::Child, grace: std::time::Duration) {
+    let until = std::time::Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {
+                if std::time::Instant::now() >= until {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 pub fn bash(dir: &str) -> Tool {
     let dir = dir.to_string();
     let mut t = new_tool_with_progress(
@@ -202,14 +221,15 @@ pub fn bash(dir: &str) -> Tool {
             let pgid = child.id() as i32;
             if !register_pgid(pgid) {
                 unsafe { libc::kill(-pgid, libc::SIGKILL) };
-                let _ = child.wait();
+                reap(&mut child, KILL_GRACE);
                 return "error: too many live bash processes".to_string();
             }
             let _guard = PgidGuard(pgid);
             let pidfd = child_pidfd(child.id());
             let mut exit: Option<std::process::ExitStatus> = None;
             let mut timed_out = false;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            let started = std::time::Instant::now();
+            let timeout_dur = std::time::Duration::from_secs(timeout);
             let mut last_progress = std::time::Instant::now();
             loop {
                 match child.try_wait() {
@@ -218,19 +238,11 @@ pub fn bash(dir: &str) -> Tool {
                         break;
                     }
                     Ok(None) => {
-                        if std::time::Instant::now() >= deadline {
+                        if started.elapsed() >= timeout_dur {
                             unsafe {
                                 libc::kill(-(child.id() as i32), libc::SIGKILL);
                             }
-                            loop {
-                                match child.try_wait() {
-                                    Ok(Some(_)) => break,
-                                    Ok(None) => {
-                                        std::thread::sleep(std::time::Duration::from_millis(10))
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
+                            reap(&mut child, KILL_GRACE);
                             timed_out = true;
                             break;
                         }
@@ -241,17 +253,16 @@ pub fn bash(dir: &str) -> Tool {
                                 progress(&sanitize(&tail));
                             }
                         }
-                        let now = std::time::Instant::now();
                         let progress_wait = std::time::Duration::from_millis(100)
                             .saturating_sub(last_progress.elapsed());
-                        let timeout_wait = deadline.saturating_duration_since(now);
+                        let timeout_wait = timeout_dur.saturating_sub(started.elapsed());
                         wait_for_child(pidfd.as_ref(), progress_wait.min(timeout_wait));
                     }
                     Err(e) => {
                         unsafe {
                             libc::kill(-(child.id() as i32), libc::SIGKILL);
                         }
-                        let _ = child.wait();
+                        reap(&mut child, KILL_GRACE);
                         let _ = std::fs::remove_file(&out_path);
                         return format!("error: {e}");
                     }
@@ -463,6 +474,22 @@ mod tests {
     }
 
     static BASH_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn reap_gives_up_on_live_child() {
+        use std::os::unix::process::CommandExt;
+        let _lock = BASH_TEST.lock().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        super::reap(&mut child, std::time::Duration::from_millis(200));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+        let _ = child.wait();
+    }
 
     #[test]
     fn bash_truncation_notice() {
