@@ -257,9 +257,9 @@ fn live_agent_finishes_a_repository_task_across_forced_compactions() {
         entries.push(session::Entry::Usage {
             input: end.usage.input,
             output: end.usage.output,
-            cached_input: end.usage.cached_input,
-            context_input: end.usage.input,
-            context_output: end.usage.output,
+            cached_input: end.context.cached_input,
+            context_input: end.context.input,
+            context_output: end.context.output,
         });
         match end.outcome {
             run::Outcome::Done => break,

@@ -326,9 +326,14 @@ fn run_parallel(
     });
     for (idx, call) in calls.iter().enumerate() {
         sink.tool_result(call);
+        // Every spawned thread sends exactly one Done before the scope joins,
+        // so a missing result means the thread panicked. That aborts the
+        // process (release, panic = "immediate-abort") or is re-raised by
+        // thread::scope (test profile) before this loop runs, so the result is
+        // always present.
         let content = outputs[idx]
             .clone()
-            .unwrap_or_else(|| "error: tool thread panicked".into());
+            .expect("scoped tool thread always reports a result");
         push_tool_result(h, call.clone(), content);
         sink.tool(turn, h.last().unwrap());
     }

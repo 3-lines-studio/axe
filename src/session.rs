@@ -471,33 +471,21 @@ pub fn list_sessions(dir: &str) -> Vec<SessionMeta> {
     out
 }
 
-#[derive(Deserialize)]
-struct SummaryLine<'a> {
-    #[serde(rename = "type", borrow)]
-    kind: Option<std::borrow::Cow<'a, str>>,
-    #[serde(borrow)]
-    message: Option<SummaryMessage<'a>>,
-    #[serde(borrow)]
-    summary: Option<std::borrow::Cow<'a, str>>,
-    #[serde(default, borrow)]
-    retained: Vec<SummaryMessage<'a>>,
-}
-
-#[derive(Deserialize)]
-struct SummaryMessage<'a> {
-    #[serde(borrow, alias = "Role")]
-    role: std::borrow::Cow<'a, str>,
-    #[serde(default, borrow, alias = "Content")]
-    content: std::borrow::Cow<'a, str>,
-}
-
+/// Title and turn count for a session file, derived by streaming it one entry
+/// at a time so a large transcript is never held in memory. Shares
+/// `update_sidecar` so the listing agrees with the live and archived sidecars,
+/// and uses the same parser as the load path: a line the session cannot be
+/// loaded from does not count here either.
 fn session_summary(path: &Path) -> (String, usize) {
     use std::io::BufRead;
     let Ok(file) = std::fs::File::open(path) else {
         return ("Untitled session".into(), 0);
     };
-    let mut title = String::new();
-    let mut turns = 0;
+    let mut sidecar = SessionSidecar {
+        title: "Untitled session".into(),
+        turns: 0,
+        bytes: 0,
+    };
     let mut reader = std::io::BufReader::new(file);
     let mut line = Vec::new();
     loop {
@@ -508,41 +496,12 @@ fn session_summary(path: &Path) -> (String, usize) {
         if read == 0 {
             break;
         }
-        let Ok(entry) = serde_json::from_slice::<SummaryLine>(&line) else {
+        let Ok(entry) = serde_json::from_slice::<Entry>(&line) else {
             continue;
         };
-        match entry.kind.as_deref() {
-            Some("message") => {
-                let Some(message) = entry.message else {
-                    continue;
-                };
-                if message.role != "user" {
-                    continue;
-                }
-                if title.is_empty() && !message.content.is_empty() {
-                    title = first_words(&message.content, 8);
-                }
-                turns += 1;
-            }
-            Some("compaction") => {
-                let summary = entry.summary.unwrap_or_default();
-                title = first_words(
-                    &format!("{COMPACTION_PREFIX}{summary}{COMPACTION_SUFFIX}"),
-                    8,
-                );
-                turns = 1 + entry
-                    .retained
-                    .iter()
-                    .filter(|message| message.role == "user")
-                    .count();
-            }
-            _ => {}
-        }
+        update_sidecar(&mut sidecar, std::slice::from_ref(&entry));
     }
-    if title.is_empty() {
-        title = "Untitled session".into();
-    }
-    (title, turns)
+    (sidecar.title, sidecar.turns)
 }
 
 fn title_from_entries(entries: &[Entry]) -> String {
@@ -665,24 +624,18 @@ fn metadata_from_entries(entries: &[Entry], bytes: u64) -> SessionSidecar {
 
 fn update_sidecar(sidecar: &mut SessionSidecar, entries: &[Entry]) {
     for entry in entries {
+        sidecar.turns = next_turns(sidecar.turns, entry);
         match entry {
             Entry::Message { message } if message.role == "user" => {
                 if sidecar.title == "Untitled session" && !message.content.is_empty() {
                     sidecar.title = first_words(&message.content, 8);
                 }
-                sidecar.turns += 1;
             }
-            Entry::Compaction {
-                summary, retained, ..
-            } => {
+            Entry::Compaction { summary, .. } => {
                 sidecar.title = first_words(
                     &format!("{COMPACTION_PREFIX}{summary}{COMPACTION_SUFFIX}"),
                     8,
                 );
-                sidecar.turns = 1 + retained
-                    .iter()
-                    .filter(|message| message.role == "user")
-                    .count();
             }
             _ => {}
         }
@@ -703,21 +656,24 @@ fn read_live_sidecar(dir: &str, bytes: u64) -> Option<SessionSidecar> {
     read_sidecar(&live_sidecar_path(dir), bytes)
 }
 
-fn entry_turns(entries: &[Entry]) -> usize {
-    let mut turns = 0;
-    for entry in entries {
-        match entry {
-            Entry::Message { message } if message.role == "user" => turns += 1,
-            Entry::Compaction { retained, .. } => {
-                turns = 1 + retained
-                    .iter()
-                    .filter(|message| message.role == "user")
-                    .count();
-            }
-            _ => {}
+/// Apply one entry to a running turn count. A user message adds a turn; a
+/// compaction supersedes the count, which restarts at the checkpoint itself
+/// plus the user messages it retains.
+fn next_turns(turns: usize, entry: &Entry) -> usize {
+    match entry {
+        Entry::Message { message } if message.role == "user" => turns + 1,
+        Entry::Compaction { retained, .. } => {
+            1 + retained
+                .iter()
+                .filter(|message| message.role == "user")
+                .count()
         }
+        _ => turns,
     }
-    turns
+}
+
+fn entry_turns(entries: &[Entry]) -> usize {
+    entries.iter().fold(0, next_turns)
 }
 
 fn write_session_sidecar(
@@ -756,7 +712,6 @@ fn read_sidecar(path: &Path, bytes: u64) -> Option<SessionSidecar> {
     Some(sidecar)
 }
 
-/// Rough token estimate for context budgeting: chars/4.
 /// Drop tool-call exchanges the transcript never finished: an assistant
 /// message whose `tool_calls` lack matching tool results, together with the
 /// results it did produce. Providers reject such a sequence, and a crash
@@ -1114,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn session_summary_reads_minimal_fields() {
+    fn session_summary_reads_entries() {
         let dir = std::env::temp_dir().join(format!("axe-summary-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.jsonl");
@@ -1143,6 +1098,57 @@ mod tests {
         .unwrap();
         assert_eq!(session_summary(&path).1, 2);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The listing streams the file when the sidecar is missing or stale, and
+    /// reads the sidecar otherwise. Both must report the same title and turn
+    /// count, which is why they share `update_sidecar`.
+    #[test]
+    fn session_summary_matches_the_sidecar() {
+        let dir = std::env::temp_dir().join(format!("axe-summary-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let cases: Vec<Vec<Entry>> = vec![
+            Vec::new(),
+            vec![Entry::Message {
+                message: message("assistant", "no user turn yet"),
+            }],
+            vec![
+                Entry::Message {
+                    message: message("user", "first question"),
+                },
+                Entry::Message {
+                    message: message("assistant", "answer"),
+                },
+            ],
+            vec![
+                Entry::Message {
+                    message: message("user", "before compaction"),
+                },
+                usage(250_000, 500),
+                Entry::Compaction {
+                    summary: "a summary".into(),
+                    tokens_before: 250_500,
+                    timestamp: 1,
+                    retained: vec![message("user", "recent"), message("assistant", "reply")],
+                },
+                Entry::Message {
+                    message: message("user", "after compaction"),
+                },
+            ],
+        ];
+        for entries in cases {
+            write_entries(&path, &entries).unwrap();
+            let bytes = std::fs::metadata(&path).unwrap().len();
+            let sidecar = metadata_from_entries(&entries, bytes);
+            assert_eq!(
+                session_summary(&path),
+                (sidecar.title, sidecar.turns),
+                "streamed summary disagrees with the sidecar"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
