@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use axe::run::{self, Outcome, RunOptions, Sink};
-use axe::{Message, OpenAI, Tool, ToolCall, Usage};
+use axe::{Image, Message, OpenAI, Tool, ToolCall, Usage};
 use std::io::{IsTerminal, Read};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -15,6 +15,7 @@ struct Config {
     system: String,
     dir: String,
     resume: Option<String>,
+    images: Vec<Image>,
 }
 
 struct FileConfig {
@@ -47,6 +48,10 @@ fn main() {
     }
     let mut prompt = prompt;
     if prompt.is_empty() && std::io::stdin().is_terminal() {
+        if !cfg.images.is_empty() {
+            eprintln!("error: --image needs a prompt; it cannot open the TUI");
+            std::process::exit(2);
+        }
         let tools = axe::tui::build_tools(&cfg.dir);
         let session_dir =
             axe::session::scope_dir(&axe_root(), std::path::Path::new(&work_dir(&cfg)));
@@ -96,6 +101,7 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
         system: String::new(),
         dir: String::new(),
         resume: None,
+        images: Vec::new(),
     };
     let mut rest = Vec::new();
     let mut i = 0;
@@ -142,7 +148,7 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
             None => (stripped.to_string(), None),
         };
         match name.as_str() {
-            "base" | "model" | "system" | "C" => {
+            "base" | "model" | "system" | "C" | "i" | "image" => {
                 let v = match inline {
                     Some(v) => v,
                     None => {
@@ -157,6 +163,7 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
                     "model" => cfg.model = v,
                     "system" => cfg.system = v,
                     "C" => cfg.dir = v,
+                    "i" | "image" => cfg.images.push(axe::image::attach(&v)?),
                     _ => unreachable!(),
                 }
             }
@@ -177,6 +184,7 @@ fn usage() {
          \x20 -model NAME  model name (default \"gpt-4.1-mini\")\n\
          \x20 -system TEXT  system prompt (default: built-in)\n\
          \x20 -C DIR       working directory for tools\n\
+         \x20 -i, --image SOURCE  attach an image to the prompt: a file path or an http(s) URL; repeatable\n\
          \x20 -r, --resume  open the session picker\n\
          \x20 --resume last  resume the most recent session\n\
          \x20 --resume ID   resume a saved session by id\n\
@@ -274,6 +282,8 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
         content: prompt.join(" "),
         tool_calls: Vec::new(),
         tool_call_id: String::new(),
+        reasoning: String::new(),
+        images: cfg.images.clone(),
     });
     session_entries.push(axe::session::Entry::Message {
         message: history.last().unwrap().clone(),
@@ -619,6 +629,24 @@ mod tests {
             base: String::new(),
             context_window: None,
         }
+    }
+
+    #[test]
+    fn parse_args_collects_images() {
+        let fc = empty_config();
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (cfg, _) = parse_args(
+            &args(&[
+                "-i",
+                "https://example.com/a.png",
+                "--image=https://example.com/b.png",
+            ]),
+            &fc,
+        )
+        .unwrap();
+        assert_eq!(cfg.images.len(), 2);
+        assert_eq!(cfg.images[0].url, "https://example.com/a.png");
+        assert_eq!(cfg.images[1].url, "https://example.com/b.png");
     }
 
     #[test]

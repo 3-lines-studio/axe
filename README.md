@@ -46,6 +46,19 @@ Use another OpenAI-compatible endpoint:
 axe --base http://localhost:11434/v1 --model qwen3
 ```
 
+Attach images to a prompt (DeepSeek vision models):
+
+```sh
+axe --image screenshot.png "what is wrong in this screenshot?"
+axe -i https://example.com/chart.png "summarize this chart"
+```
+
+`--image` takes a local file path or an http(s) URL, repeats, and needs a prompt, so it does not open the TUI. JPEG, PNG, GIF, and WebP are supported. Local files are sent inline as base64 data URLs; DeepSeek resizes and caps each image at 1024 tokens server-side, so no client-side resizing is needed.
+
+In the TUI, `/image PATH` attaches the same way and `/image clear` drops the attachments. Dropping a file onto the terminal attaches it too. Attachments show above the input and are sent with the next message.
+
+The agent can pull an image into its own context: reading a JPEG, PNG, GIF, or WebP with the `read` tool returns the image as part of the tool result, so it can inspect a screenshot or chart it found or produced. Reading any other binary file returns an error instead of dumping bytes into the context.
+
 Flags also accept a single dash. Run `axe --help` for the full list. If standard input is not a terminal and no prompt is given, Axe reads the prompt from standard input.
 
 The TUI supports streamed Markdown, tool status, file completion, session resume, rewind, and compaction. Run `/help` in the TUI for its commands. Use `axe --resume` or `axe -r` to open the session picker. One-shot mode requires `--resume last` or `--resume ID`.

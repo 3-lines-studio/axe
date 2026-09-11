@@ -2,7 +2,7 @@
 //! needed for the test).
 
 use axe::openai::StreamEvent;
-use axe::{Message, OpenAI, Provider, Request, ToolCall, new_tool};
+use axe::{Image, Message, OpenAI, Provider, Request, ToolCall, new_tool};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -56,6 +56,12 @@ fn openai_round_trip() {
         assert_eq!(msgs.len(), 5);
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "be brief");
+        let blocks = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "go");
+        assert_eq!(blocks[1]["type"], "image_url");
+        assert_eq!(blocks[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(msgs[2]["reasoning_content"], "because");
         assert_eq!(msgs[2]["tool_calls"][0]["id"], "c9");
         assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "read");
         assert_eq!(
@@ -63,8 +69,16 @@ fn openai_round_trip() {
             r#"{"path":"a.txt"}"#
         );
         assert_eq!(msgs[3]["role"], "tool");
-        assert_eq!(msgs[3]["content"], "hi");
+        let tool_blocks = msgs[3]["content"].as_array().unwrap();
+        assert_eq!(tool_blocks[0]["type"], "text");
+        assert_eq!(tool_blocks[0]["text"], "hi");
+        assert_eq!(tool_blocks[1]["type"], "image_url");
+        assert_eq!(
+            tool_blocks[1]["image_url"]["url"],
+            "data:image/png;base64,BBBB"
+        );
         assert_eq!(msgs[3]["tool_call_id"], "c9");
+        // A tool result without images stays a plain string, including empty.
         assert_eq!(msgs[4]["role"], "tool");
         assert_eq!(msgs[4]["content"], "");
         assert_eq!(msgs[4]["tool_call_id"], "c11");
@@ -75,7 +89,7 @@ fn openai_round_trip() {
             tools[0]["function"]["parameters"],
             serde_json::json!({"x": 1})
         );
-        let resp = br#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c10","type":"function","function":{"name":"read","arguments":"{\"path\":\"b.txt\"}"}}]}}],"usage":{"prompt_tokens":123,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":100}}}"#;
+        let resp = br#"{"choices":[{"message":{"role":"assistant","reasoning_content":"thought","tool_calls":[{"id":"c10","type":"function","function":{"name":"read","arguments":"{\"path\":\"b.txt\"}"}}]}}],"usage":{"prompt_tokens":123,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":100}}}"#;
         let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: ");
         let _ = sock.write_all(resp.len().to_string().as_bytes());
         let _ = sock.write_all(b"\r\nConnection: close\r\n\r\n");
@@ -92,6 +106,11 @@ fn openai_round_trip() {
                 content: "go".into(),
                 tool_calls: Vec::new(),
                 tool_call_id: String::new(),
+                reasoning: String::new(),
+                images: vec![Image {
+                    path: "p.png".into(),
+                    url: "data:image/png;base64,AAAA".into(),
+                }],
             },
             Message {
                 role: "assistant".into(),
@@ -102,18 +121,27 @@ fn openai_round_trip() {
                     arguments: r#"{"path":"a.txt"}"#.into(),
                 }],
                 tool_call_id: String::new(),
+                reasoning: "because".into(),
+                images: Vec::new(),
             },
             Message {
                 role: "tool".into(),
                 content: "hi".into(),
                 tool_calls: Vec::new(),
                 tool_call_id: "c9".into(),
+                reasoning: String::new(),
+                images: vec![Image {
+                    path: "shot.png".into(),
+                    url: "data:image/png;base64,BBBB".into(),
+                }],
             },
             Message {
                 role: "tool".into(),
                 content: String::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: "c11".into(),
+                reasoning: String::new(),
+                images: Vec::new(),
             },
         ],
         tools: &[new_tool(
@@ -127,6 +155,7 @@ fn openai_round_trip() {
     handle.join().unwrap();
 
     assert_eq!(resp.message.role, "assistant");
+    assert_eq!(resp.message.reasoning, "thought");
     assert_eq!(resp.message.tool_calls.len(), 1);
     let c = &resp.message.tool_calls[0];
     assert_eq!(c.id, "c10");
@@ -153,6 +182,8 @@ fn openai_stream_round_trip() {
             }
         }
         let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hard\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a\\\"}\"}}]}}]}\n\n",
@@ -178,6 +209,8 @@ fn openai_stream_round_trip() {
             content: "go".into(),
             tool_calls: Vec::new(),
             tool_call_id: String::new(),
+            reasoning: String::new(),
+            images: Vec::new(),
         }],
         tools: &[],
     };
@@ -190,6 +223,7 @@ fn openai_stream_round_trip() {
     handle.join().unwrap();
 
     assert_eq!(response.message.content, "hi");
+    assert_eq!(response.message.reasoning, "think hard");
     assert_eq!(response.message.tool_calls.len(), 1);
     assert_eq!(response.message.tool_calls[0].arguments, r#"{"path":"a"}"#);
     assert_eq!(response.usage.input, 4);
@@ -241,6 +275,8 @@ fn openai_error_status() {
             content: "go".into(),
             tool_calls: Vec::new(),
             tool_call_id: String::new(),
+            reasoning: String::new(),
+            images: Vec::new(),
         }],
         tools: &[],
     };

@@ -1,6 +1,6 @@
 //! Built-in tools: bash, read, write, edit.
 
-use crate::{Tool, new_tool, new_tool_with_progress};
+use crate::{Tool, ToolOutput, new_tool, new_tool_with_progress};
 use serde::Deserialize;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
@@ -406,9 +406,43 @@ mod tests {
             r#"{{"path":"{}","offset":2.0,"limit":1.0}}"#,
             path.display()
         );
-        let out = (read.run)(&args, &mut |_| {});
+        let out = (read.run)(&args, &mut |_| {}).text;
         assert!(out.starts_with("b"), "got: {out}");
         assert!(!out.contains("invalid arguments"), "got: {out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_attaches_images_and_rejects_binary() {
+        let dir = std::env::temp_dir().join(format!("axe-read-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let read = crate::tools::read();
+
+        // A real PNG signature followed by NUL bytes: the image check must win
+        // over the binary guard so the model can see the picture.
+        let png = dir.join("shot.png");
+        std::fs::write(
+            &png,
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
+        )
+        .unwrap();
+        let out = (read.run)(&format!(r#"{{"path":"{}"}}"#, png.display()), &mut |_| {});
+        assert_eq!(out.images.len(), 1, "text: {}", out.text);
+        assert!(out.images[0].url.starts_with("data:image/png;base64,"));
+        assert!(out.text.contains("shot.png"), "got: {}", out.text);
+
+        // Other binaries get a clear error rather than 16KB of mojibake.
+        let bin = dir.join("thing.bin");
+        std::fs::write(&bin, [0u8, 1, 2, 3, 0, 4]).unwrap();
+        let out = (read.run)(&format!(r#"{{"path":"{}"}}"#, bin.display()), &mut |_| {});
+        assert!(out.images.is_empty());
+        assert!(out.text.contains("binary file"), "got: {}", out.text);
+
+        let txt = dir.join("t.txt");
+        std::fs::write(&txt, "hello\n").unwrap();
+        let out = (read.run)(&format!(r#"{{"path":"{}"}}"#, txt.display()), &mut |_| {});
+        assert!(out.images.is_empty());
+        assert_eq!(out.text, "hello");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -435,7 +469,7 @@ mod tests {
         let _lock = BASH_TEST.lock().unwrap();
         let bash = crate::tools::bash("");
         let args = serde_json::json!({"command": "yes | head -c 20000"}).to_string();
-        let out = (bash.run)(&args, &mut |_| {});
+        let out = (bash.run)(&args, &mut |_| {}).text;
         assert!(
             out.contains("Output truncated to the last 16KB"),
             "got tail: {}",
@@ -472,142 +506,173 @@ struct ReadArgs {
     limit: Option<usize>,
 }
 
-pub fn read() -> Tool {
-    let mut t = new_tool(
-        "read",
-        "Read the contents of a file. Output is truncated to 16KB. Use offset/limit for large files. When you need the full file, continue with the suggested offset.",
-        r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"integer","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"integer","description":"Maximum number of lines to read"}},"required":["path"]}"#,
-        |a: ReadArgs| {
-            use std::io::BufRead;
-            let file = match std::fs::File::open(&a.path) {
-                Ok(file) => file,
-                Err(e) => return format!("error: {e}"),
-            };
-            let start = a.offset.unwrap_or(1).saturating_sub(1);
-            let limit = a.limit.unwrap_or(usize::MAX);
-            let mut reader = std::io::BufReader::new(file);
-            let mut line = Vec::new();
-            let mut output = String::new();
-            let mut total = 0usize;
-            let mut skipped_partial = false;
-            while total < start {
+/// Read a file as text lines, with offset/limit paging and truncation.
+fn read_text(a: &ReadArgs) -> String {
+    use std::io::BufRead;
+    let file = match std::fs::File::open(&a.path) {
+        Ok(file) => file,
+        Err(e) => return format!("error: {e}"),
+    };
+    let start = a.offset.unwrap_or(1).saturating_sub(1);
+    let limit = a.limit.unwrap_or(usize::MAX);
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    let mut output = String::new();
+    let mut total = 0usize;
+    let mut skipped_partial = false;
+    while total < start {
+        let buf = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) => return format!("error: {e}"),
+        };
+        if buf.is_empty() {
+            total += usize::from(skipped_partial);
+            break;
+        }
+        let mut consumed = buf.len();
+        for (index, byte) in buf.iter().enumerate() {
+            if *byte == b'\n' {
+                total += 1;
+                skipped_partial = false;
+                if total == start {
+                    consumed = index + 1;
+                    break;
+                }
+            } else {
+                skipped_partial = true;
+            }
+        }
+        reader.consume(consumed);
+    }
+    let mut shown = 0usize;
+    let mut overflow = false;
+    let mut oversized = None;
+    loop {
+        if shown >= limit || overflow {
+            let mut trailing = false;
+            loop {
                 let buf = match reader.fill_buf() {
                     Ok(buf) => buf,
                     Err(e) => return format!("error: {e}"),
                 };
                 if buf.is_empty() {
-                    total += usize::from(skipped_partial);
                     break;
                 }
-                let mut consumed = buf.len();
-                for (index, byte) in buf.iter().enumerate() {
-                    if *byte == b'\n' {
+                for &byte in buf {
+                    if byte == b'\n' {
                         total += 1;
-                        skipped_partial = false;
-                        if total == start {
-                            consumed = index + 1;
-                            break;
-                        }
+                        trailing = false;
                     } else {
-                        skipped_partial = true;
+                        trailing = true;
                     }
                 }
-                reader.consume(consumed);
+                let len = buf.len();
+                reader.consume(len);
             }
-            let mut shown = 0usize;
-            let mut overflow = false;
-            let mut oversized = None;
-            loop {
-                if shown >= limit || overflow {
-                    let mut trailing = false;
-                    loop {
-                        let buf = match reader.fill_buf() {
-                            Ok(buf) => buf,
-                            Err(e) => return format!("error: {e}"),
-                        };
-                        if buf.is_empty() {
-                            break;
-                        }
-                        for &byte in buf {
-                            if byte == b'\n' {
-                                total += 1;
-                                trailing = false;
-                            } else {
-                                trailing = true;
-                            }
-                        }
-                        let len = buf.len();
-                        reader.consume(len);
-                    }
-                    total += usize::from(trailing);
-                    break;
-                }
-                line.clear();
-                let read = match reader.read_until(b'\n', &mut line) {
-                    Ok(read) => read,
-                    Err(e) => return format!("error: {e}"),
+            total += usize::from(trailing);
+            break;
+        }
+        line.clear();
+        let read = match reader.read_until(b'\n', &mut line) {
+            Ok(read) => read,
+            Err(e) => return format!("error: {e}"),
+        };
+        if read == 0 {
+            break;
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        let index = total;
+        total += 1;
+        if index < start || index >= start.saturating_add(limit) || overflow {
+            continue;
+        }
+        let text = sanitize(&String::from_utf8_lossy(&line));
+        if shown == 0 && text.len() > MAX_OUTPUT {
+            oversized = Some((index + 1, text.len()));
+            overflow = true;
+            continue;
+        }
+        let separator = usize::from(!output.is_empty());
+        if output.len() + separator + text.len() > MAX_OUTPUT {
+            overflow = true;
+            continue;
+        }
+        if separator == 1 {
+            output.push('\n');
+        }
+        output.push_str(&text);
+        shown += 1;
+    }
+    if a.offset.is_some() && start >= total {
+        return format!(
+            "error: offset {} is beyond end of file ({} lines total)",
+            a.offset.unwrap_or(1),
+            total
+        );
+    }
+    if let Some((line, bytes)) = oversized {
+        return format!("[Line {line} is {bytes} bytes, exceeds the {MAX_OUTPUT} limit.]");
+    }
+    let end = start.saturating_add(shown).min(total);
+    if overflow {
+        return format!(
+            "{}\n\n[Showing lines {}-{} of {} ({} limit). Use offset={} to continue.]",
+            output,
+            start + 1,
+            end,
+            total,
+            MAX_OUTPUT,
+            end + 1
+        );
+    }
+    let remaining = total.saturating_sub(start.saturating_add(limit).min(total));
+    if remaining > 0 {
+        output.push_str(&format!(
+            "\n\n[{remaining} more lines in file. Use offset={} to continue.]",
+            start.saturating_add(limit) + 1
+        ));
+    }
+    output
+}
+
+/// A NUL byte in the first block means this is not a text file. Images are
+/// handled before this; anything else would only poison the context.
+fn looks_binary(path: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 8192];
+    let Ok(read) = file.read(&mut head) else {
+        return false;
+    };
+    head[..read].contains(&0)
+}
+
+pub fn read() -> Tool {
+    let mut t = new_tool(
+        "read",
+        "Read the contents of a file. Output is truncated to 16KB. Use offset/limit for large files. When you need the full file, continue with the suggested offset. Reading a JPEG, PNG, GIF, or WebP attaches the image so you can see it.",
+        r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"integer","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"integer","description":"Maximum number of lines to read"}},"required":["path"]}"#,
+        |a: ReadArgs| {
+            if let Some(image) = crate::image::attach_if_image(&a.path) {
+                return ToolOutput {
+                    text: format!("Attached {} for viewing.", a.path),
+                    images: vec![image],
                 };
-                if read == 0 {
-                    break;
-                }
-                if line.last() == Some(&b'\n') {
-                    line.pop();
-                }
-                let index = total;
-                total += 1;
-                if index < start || index >= start.saturating_add(limit) || overflow {
-                    continue;
-                }
-                let text = sanitize(&String::from_utf8_lossy(&line));
-                if shown == 0 && text.len() > MAX_OUTPUT {
-                    oversized = Some((index + 1, text.len()));
-                    overflow = true;
-                    continue;
-                }
-                let separator = usize::from(!output.is_empty());
-                if output.len() + separator + text.len() > MAX_OUTPUT {
-                    overflow = true;
-                    continue;
-                }
-                if separator == 1 {
-                    output.push('\n');
-                }
-                output.push_str(&text);
-                shown += 1;
             }
-            if a.offset.is_some() && start >= total {
-                return format!(
-                    "error: offset {} is beyond end of file ({} lines total)",
-                    a.offset.unwrap_or(1),
-                    total
-                );
-            }
-            if let Some((line, bytes)) = oversized {
-                return format!("[Line {line} is {bytes} bytes, exceeds the {MAX_OUTPUT} limit.]");
-            }
-            let end = start.saturating_add(shown).min(total);
-            if overflow {
-                return format!(
-                    "{}\n\n[Showing lines {}-{} of {} ({} limit). Use offset={} to continue.]",
-                    output,
-                    start + 1,
-                    end,
-                    total,
-                    MAX_OUTPUT,
-                    end + 1
-                );
-            }
-            let remaining = total.saturating_sub(start.saturating_add(limit).min(total));
-            if remaining > 0 {
-                output.push_str(&format!(
-                    "\n\n[{remaining} more lines in file. Use offset={} to continue.]",
-                    start.saturating_add(limit) + 1
+            if looks_binary(&a.path) {
+                return ToolOutput::text(format!(
+                    "error: {} is a binary file; read handles text files and JPEG, PNG, GIF, and WebP images",
+                    a.path
                 ));
             }
-            output
+            ToolOutput::text(read_text(&a))
         },
     );
-    t.snippet = "Read file contents (truncated, use offset to continue)";
+    t.snippet = "Read file contents (truncated, use offset to continue); images are attached so you can see them";
     t
 }
 

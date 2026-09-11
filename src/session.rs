@@ -106,6 +106,8 @@ pub fn context_messages(entries: &[Entry]) -> Vec<Message> {
                     ),
                     tool_calls: Vec::new(),
                     tool_call_id: String::new(),
+                    reasoning: String::new(),
+                    images: Vec::new(),
                 });
                 out.extend(retained.iter().cloned());
             }
@@ -972,6 +974,8 @@ fn request_summary(
         content: prompt,
         tool_calls: Vec::new(),
         tool_call_id: String::new(),
+        reasoning: String::new(),
+        images: Vec::new(),
     };
     let req = Request {
         model,
@@ -1055,6 +1059,8 @@ mod tests {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: String::new(),
+            reasoning: String::new(),
+            images: Vec::new(),
         }
     }
 

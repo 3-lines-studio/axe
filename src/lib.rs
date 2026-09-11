@@ -15,6 +15,7 @@ use std::sync::mpsc;
 pub mod app;
 pub mod curlffi;
 mod http;
+pub mod image;
 pub mod openai;
 pub mod run;
 pub mod session;
@@ -95,6 +96,14 @@ pub struct ToolCall {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Image {
+    #[serde(rename = "Path", default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    #[serde(rename = "URL", default)]
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     #[serde(rename = "Role")]
     pub role: String,
@@ -108,6 +117,14 @@ pub struct Message {
         skip_serializing_if = "String::is_empty"
     )]
     pub tool_call_id: String,
+    #[serde(
+        rename = "Reasoning",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub reasoning: String,
+    #[serde(rename = "Images", default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<Image>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -176,6 +193,29 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// What a tool hands back: text for the transcript, plus images the model
+/// should see. Providers that support vision attach them to the tool result.
+#[derive(Default)]
+pub struct ToolOutput {
+    pub text: String,
+    pub images: Vec<Image>,
+}
+
+impl ToolOutput {
+    pub fn text(text: impl Into<String>) -> Self {
+        ToolOutput {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        ToolOutput::text(text)
+    }
+}
+
 pub struct Tool {
     pub name: &'static str,
     pub description: &'static str,
@@ -186,31 +226,33 @@ pub struct Tool {
     /// parallel (used by file-mutating tools to avoid races).
     pub sequential: bool,
     #[allow(clippy::type_complexity)]
-    pub run: Box<dyn Fn(&str, &mut dyn FnMut(&str)) -> String + Send + Sync>,
+    pub run: Box<dyn Fn(&str, &mut dyn FnMut(&str)) -> ToolOutput + Send + Sync>,
 }
 
-pub fn new_tool<T>(
+pub fn new_tool<T, R>(
     name: &'static str,
     description: &'static str,
     schema: &'static str,
-    run: impl Fn(T) -> String + Send + Sync + 'static,
+    run: impl Fn(T) -> R + Send + Sync + 'static,
 ) -> Tool
 where
     T: DeserializeOwned,
+    R: Into<ToolOutput>,
 {
     new_tool_with_progress(name, description, schema, move |args, _progress| run(args))
 }
 
 /// Like `new_tool`, but the run closure also receives a progress callback it
 /// can call with partial output while working (e.g. live bash output).
-pub fn new_tool_with_progress<T>(
+pub fn new_tool_with_progress<T, R>(
     name: &'static str,
     description: &'static str,
     schema: &'static str,
-    run: impl Fn(T, &mut dyn FnMut(&str)) -> String + Send + Sync + 'static,
+    run: impl Fn(T, &mut dyn FnMut(&str)) -> R + Send + Sync + 'static,
 ) -> Tool
 where
     T: DeserializeOwned,
+    R: Into<ToolOutput>,
 {
     let parameters: Value = serde_json::from_str(schema).unwrap_or(Value::Null);
     let schema = parameters.clone();
@@ -228,8 +270,10 @@ where
             }
             let coerced = serde_json::to_string(&args).unwrap_or_else(|_| raw.to_string());
             match serde_json::from_str::<T>(&coerced) {
-                Ok(args) => run(args, progress),
-                Err(e) => format!("error: invalid arguments for {name}: {e}\nReceived: {raw}"),
+                Ok(args) => run(args, progress).into(),
+                Err(e) => ToolOutput::text(format!(
+                    "error: invalid arguments for {name}: {e}\nReceived: {raw}"
+                )),
             }
         }),
     }

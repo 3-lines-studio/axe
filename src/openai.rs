@@ -53,7 +53,8 @@ impl OpenAI {
         if !req.system.is_empty() {
             msgs.push(OaRequestMessage {
                 role: "system",
-                content: Some(req.system),
+                content: Some(Value::String(req.system.to_string())),
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -78,10 +79,11 @@ impl OpenAI {
             };
             msgs.push(OaRequestMessage {
                 role: &m.role,
-                content: if m.content.is_empty() && m.role != "tool" {
+                content: message_content(m),
+                reasoning_content: if m.reasoning.is_empty() {
                     None
                 } else {
-                    Some(&m.content)
+                    Some(&m.reasoning)
                 },
                 tool_calls,
                 tool_call_id: if m.tool_call_id.is_empty() {
@@ -120,6 +122,28 @@ impl OpenAI {
         ));
         Ok((url, headers, body))
     }
+}
+
+/// OpenAI `content` is a plain string, or a block array when the message
+/// carries images.
+fn message_content(m: &Message) -> Option<Value> {
+    if m.images.is_empty() {
+        if m.content.is_empty() && m.role != "tool" {
+            return None;
+        }
+        return Some(Value::String(m.content.clone()));
+    }
+    let mut parts = Vec::with_capacity(m.images.len() + 1);
+    if !m.content.is_empty() {
+        parts.push(serde_json::json!({"type": "text", "text": m.content}));
+    }
+    for image in &m.images {
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": image.url},
+        }));
+    }
+    Some(Value::Array(parts))
 }
 
 fn run_request(
@@ -244,6 +268,8 @@ fn run_request(
             content: om.content.clone().unwrap_or_default(),
             tool_calls: calls,
             tool_call_id: String::new(),
+            reasoning: om.reasoning_content.clone().unwrap_or_default(),
+            images: Vec::new(),
         },
         usage: Usage {
             input: parsed.usage.prompt_tokens,
@@ -280,6 +306,7 @@ struct StreamAcc {
     /// SSE event buffer (drained as events complete).
     buf: Vec<u8>,
     content: String,
+    reasoning: String,
     calls: Vec<OaToolCallDelta>,
     usage: OaUsage,
     out_tokens: usize,
@@ -311,6 +338,8 @@ struct OaFunctionDelta {
 struct OaDeltaMessage {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OaToolCallDelta>>,
 }
@@ -424,6 +453,9 @@ impl StreamAcc {
         if let Some(fr) = &choice.finish_reason {
             self.finish_reason = Some(fr.clone());
         }
+        if let Some(reasoning) = choice.delta.reasoning_content {
+            self.reasoning.push_str(&reasoning);
+        }
         if let Some(content) = choice.delta.content
             && !content.is_empty()
         {
@@ -501,6 +533,8 @@ impl StreamAcc {
                 content: self.content.clone(),
                 tool_calls: self.tool_calls(),
                 tool_call_id: String::new(),
+                reasoning: self.reasoning.clone(),
+                images: Vec::new(),
             },
             usage: Usage {
                 input: self.usage.prompt_tokens,
@@ -568,7 +602,9 @@ struct OaRequest<'a> {
 struct OaRequestMessage<'a> {
     role: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<&'a str>,
+    content: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OaRequestToolCall<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -607,6 +643,8 @@ struct OaRequestToolFunction<'a> {
 struct OaMessage {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OaToolCall>>,
 }

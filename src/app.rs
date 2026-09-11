@@ -9,6 +9,7 @@ pub enum Command {
     Rewind,
     Compact,
     Copy,
+    Image,
     Quit,
 }
 
@@ -63,6 +64,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "copy the last assistant response",
         category: "Session",
         action: Command::Copy,
+    },
+    CommandSpec {
+        command: "/image",
+        help: "/image PATH",
+        description: "attach an image (file path or URL) to the next message",
+        category: "Session",
+        action: Command::Image,
     },
     CommandSpec {
         command: "/quit",

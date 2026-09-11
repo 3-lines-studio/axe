@@ -9,6 +9,8 @@ fn message(role: &str, content: impl Into<String>) -> Message {
         content: content.into(),
         tool_calls: Vec::new(),
         tool_call_id: String::new(),
+        reasoning: String::new(),
+        images: Vec::new(),
     }
 }
 

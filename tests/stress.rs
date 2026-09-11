@@ -222,13 +222,13 @@ fn fuzz_tools(_rng: &mut Rng, seed: u64, input: &[u8]) {
 
     guard("tool read", seed, || {
         let args = serde_json::json!({"path": path, "offset": 1, "limit": 2}).to_string();
-        let out = (read.run)(&args, &mut |_| {});
+        let out = (read.run)(&args, &mut |_| {}).text;
         assert_sane("tool read", seed, &out);
     });
     guard("tool write", seed, || {
         let content = String::from_utf8_lossy(input);
         let args = serde_json::json!({"path": path, "content": content}).to_string();
-        let out = (write.run)(&args, &mut |_| {});
+        let out = (write.run)(&args, &mut |_| {}).text;
         assert_sane("tool write", seed, &out);
     });
     guard("tool edit", seed, || {
@@ -236,7 +236,7 @@ fn fuzz_tools(_rng: &mut Rng, seed: u64, input: &[u8]) {
         let args =
             serde_json::json!({"path": path, "edits": [{"oldText": needle, "newText": "X"}]})
                 .to_string();
-        let out = (edit.run)(&args, &mut |_| {});
+        let out = (edit.run)(&args, &mut |_| {}).text;
         assert_sane("tool edit", seed, &out);
     });
     let _ = std::fs::remove_dir_all(&dir);
@@ -298,6 +298,8 @@ fn fuzz_sse(_rng: &mut Rng, seed: u64, payloads: &[Vec<u8>]) {
             content: "go".into(),
             tool_calls: Vec::new(),
             tool_call_id: String::new(),
+            reasoning: String::new(),
+            images: Vec::new(),
         }],
         tools: &[],
     };
@@ -412,6 +414,8 @@ fn session_large_roundtrip() {
         content: "x".repeat(180),
         tool_calls: Vec::new(),
         tool_call_id: String::new(),
+        reasoning: String::new(),
+        images: Vec::new(),
     };
     let entries: Vec<axe::session::Entry> = (0..n)
         .map(|_| axe::session::Entry::Message {
@@ -566,7 +570,7 @@ fn edit_multi_edit_and_line_endings() {
         {"oldText": "three", "newText": "THREE"},
     ]})
     .to_string();
-    let out = (edit.run)(&args, &mut |_| {});
+    let out = (edit.run)(&args, &mut |_| {}).text;
     assert!(out.starts_with("Successfully replaced 2 block(s)"), "{out}");
     assert!(out.contains("Diff:"), "{out}");
     assert!(out.contains("-1 one"), "{out}");
@@ -578,14 +582,14 @@ fn edit_multi_edit_and_line_endings() {
     std::fs::write(&path, "a\r\nb\r\n").unwrap();
     let args =
         serde_json::json!({"path": p, "edits": [{"oldText": "b", "newText": "c"}]}).to_string();
-    let out = (edit.run)(&args, &mut |_| {});
+    let out = (edit.run)(&args, &mut |_| {}).text;
     assert!(out.starts_with("Successfully"), "{out}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\r\nc\r\n");
 
     std::fs::write(&path, "x\nx\n").unwrap();
     let args =
         serde_json::json!({"path": p, "edits": [{"oldText": "x", "newText": "y"}]}).to_string();
-    let out = (edit.run)(&args, &mut |_| {});
+    let out = (edit.run)(&args, &mut |_| {}).text;
     assert!(out.contains("occurrences"), "{out}");
 
     std::fs::write(&path, "abcdef\n").unwrap();
@@ -594,13 +598,13 @@ fn edit_multi_edit_and_line_endings() {
         {"oldText": "bcd", "newText": "Y"},
     ]})
     .to_string();
-    let out = (edit.run)(&args, &mut |_| {});
+    let out = (edit.run)(&args, &mut |_| {}).text;
     assert!(out.contains("overlap"), "{out}");
 
     std::fs::write(&path, "abc\n").unwrap();
     let args =
         serde_json::json!({"path": p, "edits": [{"oldText": "abc", "newText": "abc"}]}).to_string();
-    let out = (edit.run)(&args, &mut |_| {});
+    let out = (edit.run)(&args, &mut |_| {}).text;
     assert!(out.contains("No changes"), "{out}");
 
     std::fs::remove_dir_all(&dir).ok();
@@ -616,14 +620,14 @@ fn read_offset_paging() {
     let p = path.to_str().unwrap();
 
     let args = serde_json::json!({"path": p, "offset": 2, "limit": 2}).to_string();
-    let out = (read.run)(&args, &mut |_| {});
+    let out = (read.run)(&args, &mut |_| {}).text;
     assert!(out.starts_with("line2\nline3"), "{out}");
     // The file has exactly 4 lines, so one remains after reading 2-3.
     assert!(out.contains("1 more lines"), "{out}");
     assert!(out.contains("offset=4"), "{out}");
 
     let args = serde_json::json!({"path": p, "offset": 10}).to_string();
-    let out = (read.run)(&args, &mut |_| {});
+    let out = (read.run)(&args, &mut |_| {}).text;
     assert!(out.contains("beyond end of file"), "{out}");
 
     std::fs::remove_dir_all(&dir).ok();
@@ -635,7 +639,7 @@ fn write_creates_parent_dirs() {
     let path = dir.join("sub").join("f.txt");
     let write = axe::tools::write();
     let args = serde_json::json!({"path": path.to_str().unwrap(), "content": "hi"}).to_string();
-    let out = (write.run)(&args, &mut |_| {});
+    let out = (write.run)(&args, &mut |_| {}).text;
     assert!(out.starts_with("wrote"), "{out}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi");
     std::fs::remove_dir_all(&dir).ok();
@@ -646,7 +650,7 @@ fn bash_timeout_kills() {
     let bash = axe::tools::bash("");
     let args = serde_json::json!({"command": "sleep 5", "timeout": 1}).to_string();
     let start = std::time::Instant::now();
-    let out = (bash.run)(&args, &mut |_| {});
+    let out = (bash.run)(&args, &mut |_| {}).text;
     let elapsed = start.elapsed();
     assert!(out.contains("timed out"), "{out}");
     assert!(
@@ -659,7 +663,7 @@ fn bash_timeout_kills() {
 fn bash_rejects_zero_timeout() {
     let bash = axe::tools::bash("");
     let args = serde_json::json!({"command": "echo hi", "timeout": 0}).to_string();
-    let out = (bash.run)(&args, &mut |_| {});
+    let out = (bash.run)(&args, &mut |_| {}).text;
     assert!(out.contains("invalid timeout"), "{out}");
 }
 
@@ -667,12 +671,12 @@ fn bash_rejects_zero_timeout() {
 fn bash_captures_output_and_status() {
     let bash = axe::tools::bash("");
     let args = serde_json::json!({"command": "echo hello"}).to_string();
-    assert_eq!((bash.run)(&args, &mut |_| {}), "hello\n");
+    assert_eq!((bash.run)(&args, &mut |_| {}).text, "hello\n");
     let args = serde_json::json!({"command": "exit 3"}).to_string();
-    let out = (bash.run)(&args, &mut |_| {});
+    let out = (bash.run)(&args, &mut |_| {}).text;
     assert_eq!(out, "error: exit status 3");
     let args = serde_json::json!({"command": "printf 'o' ; printf 'e' >&2"}).to_string();
-    let out = (bash.run)(&args, &mut |_| {});
+    let out = (bash.run)(&args, &mut |_| {}).text;
     assert_eq!(out, "oe");
 }
 
@@ -691,6 +695,8 @@ fn session_compaction_roundtrip() {
             content: "recent".into(),
             tool_calls: Vec::new(),
             tool_call_id: String::new(),
+            reasoning: String::new(),
+            images: Vec::new(),
         }],
     };
     let usage = axe::session::Entry::Usage {
@@ -732,6 +738,8 @@ fn session_compaction_is_append_only() {
         content: content.into(),
         tool_calls: Vec::new(),
         tool_call_id: String::new(),
+        reasoning: String::new(),
+        images: Vec::new(),
     };
     let mut entries = vec![
         axe::session::Entry::Message {

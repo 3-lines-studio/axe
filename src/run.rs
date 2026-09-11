@@ -2,7 +2,9 @@
 //! repeat. It never mutates its input; the transcript it builds is
 //! append-only. Compaction and steering live outside this module.
 
-use crate::{Error, Message, Provider, Request, Response, StreamEvent, Tool, ToolCall, Usage};
+use crate::{
+    Error, Message, Provider, Request, Response, StreamEvent, Tool, ToolCall, ToolOutput, Usage,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -221,6 +223,8 @@ fn user_message(text: String) -> Message {
         content: text,
         tool_calls: Vec::new(),
         tool_call_id: String::new(),
+        reasoning: String::new(),
+        images: Vec::new(),
     }
 }
 
@@ -251,9 +255,11 @@ fn run_tool_batch(
                 // Synthesize a result for every un-executed call so the
                 // transcript stays valid: providers reject an assistant
                 // message whose tool_calls lack matching tool results.
-                "error: tool call not executed: the run was interrupted.".to_string()
+                ToolOutput::text("error: tool call not executed: the run was interrupted.")
             } else if truncated {
-                "error: tool call not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.".to_string()
+                ToolOutput::text(
+                    "error: tool call not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.",
+                )
             } else {
                 exec(tools, &call, sink)
             };
@@ -267,18 +273,20 @@ fn run_tool_batch(
     }
 }
 
-fn push_tool_result(h: &mut Vec<Message>, call: ToolCall, content: String) {
+fn push_tool_result(h: &mut Vec<Message>, call: ToolCall, output: ToolOutput) {
     h.push(Message {
         role: "tool".into(),
-        content,
+        content: output.text,
         tool_calls: Vec::new(),
         tool_call_id: call.id,
+        reasoning: String::new(),
+        images: output.images,
     });
 }
 
 enum ParallelMsg {
     Delta { idx: usize, text: String },
-    Done { idx: usize, output: String },
+    Done { idx: usize, output: ToolOutput },
 }
 
 fn run_parallel(
@@ -293,14 +301,14 @@ fn run_parallel(
         sink.tool_start(call);
     }
     let (ptx, prx) = std::sync::mpsc::channel::<ParallelMsg>();
-    let mut outputs: Vec<Option<String>> = vec![None; calls.len()];
+    let mut outputs: Vec<Option<ToolOutput>> = (0..calls.len()).map(|_| None).collect();
     std::thread::scope(|scope| {
         for (idx, call) in calls.iter().enumerate() {
             let ptx = ptx.clone();
             let cancel = cancel.clone();
             scope.spawn(move || {
                 let output = if cancelled(&cancel) {
-                    "error: tool call not executed: the run was interrupted.".to_string()
+                    ToolOutput::text("error: tool call not executed: the run was interrupted.")
                 } else {
                     run_tool(tools, call, &mut |text| {
                         let _ = ptx.send(ParallelMsg::Delta {
@@ -332,7 +340,7 @@ fn run_parallel(
         // thread::scope (test profile) before this loop runs, so the result is
         // always present.
         let content = outputs[idx]
-            .clone()
+            .take()
             .expect("scoped tool thread always reports a result");
         push_tool_result(h, call.clone(), content);
         sink.tool(turn, h.last().unwrap());
@@ -340,7 +348,7 @@ fn run_parallel(
     !cancelled(cancel)
 }
 
-fn run_tool(tools: &[Tool], call: &ToolCall, progress: &mut dyn FnMut(&str)) -> String {
+fn run_tool(tools: &[Tool], call: &ToolCall, progress: &mut dyn FnMut(&str)) -> ToolOutput {
     let started = Instant::now();
     for t in tools {
         if t.name == call.name {
@@ -350,7 +358,7 @@ fn run_tool(tools: &[Tool], call: &ToolCall, progress: &mut dyn FnMut(&str)) -> 
                 call.name,
                 started.elapsed().as_millis(),
                 call.arguments.len(),
-                output.len()
+                output.text.len()
             ));
             return output;
         }
@@ -360,7 +368,7 @@ fn run_tool(tools: &[Tool], call: &ToolCall, progress: &mut dyn FnMut(&str)) -> 
         call.name,
         started.elapsed().as_millis()
     ));
-    format!("error: unknown tool: {}", call.name)
+    ToolOutput::text(format!("error: unknown tool: {}", call.name))
 }
 
 fn stream<P: Provider>(
@@ -444,7 +452,7 @@ fn stream<P: Provider>(
     }
 }
 
-fn exec(tools: &[Tool], call: &ToolCall, sink: &mut dyn Sink) -> String {
+fn exec(tools: &[Tool], call: &ToolCall, sink: &mut dyn Sink) -> ToolOutput {
     run_tool(tools, call, &mut |text| sink.tool_delta(call, text))
 }
 

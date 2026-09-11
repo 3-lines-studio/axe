@@ -650,6 +650,58 @@ def tui_help_screen(h, axe):
 
 
 @case
+def oneshot_reads_image(h, axe):
+    """The model pulls an image into its own context by reading the file: the
+    tool result carries the image, so no user turn is needed."""
+    shot = h.work / "shot.png"
+    shot.write_bytes(bytes.fromhex("89504e470d0a1a0a") + b"\x00" * 32)
+    scenario = [
+        {"stream": [tool_chunk("read", {"path": str(shot)}), usage_chunk(10, 2)]},
+        {"stream": [content_chunk("It is a PNG.", "stop"), usage_chunk(30, 4)]},
+    ]
+    with h.mock(scenario) as srv:
+        p = h.oneshot(axe, ["what is in shot.png?"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+        check("It is a PNG." in p.stdout, p.stdout)
+    tool = body_msg(srv, 1, "tool")[-1]
+    content = tool["content"]
+    check(isinstance(content, list), "expected image blocks, got %r" % (content,))
+    check(content[1]["type"] == "image_url", content)
+    check(
+        content[1]["image_url"]["url"].startswith("data:image/png;base64,"),
+        content[1],
+    )
+
+
+@case
+def tui_image_attach(h, axe):
+    """A local image attaches through /image and reaches the provider as a
+    content block array rather than a plain string."""
+    shot = h.work / "shot.png"
+    shot.write_bytes(bytes.fromhex("89504e470d0a1a0a") + b"\x00" * 64)
+    with h.mock(ANSWER_SCENARIO) as srv:
+        t = h.tui(axe, base=srv.base_url)
+        try:
+            t.expect("Run /help")
+            t.type("/image %s\r" % shot)
+            t.expect("attached")
+            t.type("describe this\r")
+            t.expect("Done")
+            t.type("/quit\r")
+            check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
+        finally:
+            t.close()
+    content = body_msg(srv, 0, "user")[-1]["content"]
+    check(isinstance(content, list), "expected a block array, got %r" % (content,))
+    check(content[0] == {"type": "text", "text": "describe this"}, content)
+    check(content[1]["type"] == "image_url", content)
+    check(
+        content[1]["image_url"]["url"].startswith("data:image/png;base64,"),
+        content[1],
+    )
+
+
+@case
 def tui_full_turn(h, axe):
     with h.mock(TOOL_SCENARIO) as srv:
         t = h.tui(axe, base=srv.base_url)

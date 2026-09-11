@@ -157,6 +157,8 @@ fn call_tool(id: &str, name: &str, args: &str) -> Message {
             arguments: args.into(),
         }],
         tool_call_id: String::new(),
+        reasoning: String::new(),
+        images: Vec::new(),
     }
 }
 
@@ -166,6 +168,8 @@ fn user(content: &str) -> Message {
         content: content.into(),
         tool_calls: Vec::new(),
         tool_call_id: String::new(),
+        reasoning: String::new(),
+        images: Vec::new(),
     }
 }
 
@@ -175,6 +179,8 @@ fn assistant(content: &str) -> Message {
         content: content.into(),
         tool_calls: Vec::new(),
         tool_call_id: String::new(),
+        reasoning: String::new(),
+        images: Vec::new(),
     }
 }
 
@@ -385,7 +391,7 @@ fn run_end_separates_last_context_usage_from_totals() {
         "noop",
         "noop",
         r#"{"type":"object","properties":{}}"#,
-        |_: serde_json::Value| "ok".into(),
+        |_: serde_json::Value| "ok".to_string(),
     );
     let responses: VecDeque<Response> = [
         Response {
@@ -459,10 +465,10 @@ fn new_tool_bad_arguments() {
     let tool = new_tool("bad", "needs int", "{}", |args: NeedsInt| {
         args.n.to_string()
     });
-    let got = (tool.run)(r#"{"n":"x"}"#, &mut |_| {});
+    let got = (tool.run)(r#"{"n":"x"}"#, &mut |_| {}).text;
     assert!(got.contains("invalid arguments"), "got: {got}");
     assert!(got.contains("Received:"), "got: {got}");
-    assert_eq!((tool.run)(r#"{"n":42}"#, &mut |_| {}), "42");
+    assert_eq!((tool.run)(r#"{"n":42}"#, &mut |_| {}).text, "42");
 }
 
 #[derive(Deserialize)]
@@ -483,19 +489,19 @@ fn new_tool_coerces_argument_types() {
         |args: NeedsFields| format!("{} {} {} {:?}", args.n, args.b, args.s, args.o),
     );
     assert_eq!(
-        (tool.run)(r#"{"n":"7","b":1,"s":42}"#, &mut |_| {}),
+        (tool.run)(r#"{"n":"7","b":1,"s":42}"#, &mut |_| {}).text,
         "7 true 42 None"
     );
     assert_eq!(
-        (tool.run)(r#"{"n":true,"b":"false","s":null}"#, &mut |_| {}),
+        (tool.run)(r#"{"n":true,"b":"false","s":null}"#, &mut |_| {}).text,
         "1 false  None"
     );
     assert_eq!(
-        (tool.run)(r#"{"n":null,"b":0,"s":"x","o":null}"#, &mut |_| {}),
+        (tool.run)(r#"{"n":null,"b":0,"s":"x","o":null}"#, &mut |_| {}).text,
         "0 false x None"
     );
     assert_eq!(
-        (tool.run)(r#"{"n":7.9,"b":1,"s":"x"}"#, &mut |_| {}),
+        (tool.run)(r#"{"n":7.9,"b":1,"s":"x"}"#, &mut |_| {}).text,
         "7 true x None"
     );
 }
@@ -568,6 +574,8 @@ fn run_parallel_tools_ordered() {
                         },
                     ],
                     tool_call_id: String::new(),
+                    reasoning: String::new(),
+                    images: Vec::new(),
                 },
                 usage: Usage::default(),
                 stop_reason: String::new(),
@@ -580,9 +588,9 @@ fn run_parallel_tools_ordered() {
         ])),
         ..Default::default()
     };
-    let t1 = new_tool("t1", "", "{}", |_: Empty| "R1".into());
-    let t2 = new_tool("t2", "", "{}", |_: Empty| "R2".into());
-    let t3 = new_tool("t3", "", "{}", |_: Empty| "R3".into());
+    let t1 = new_tool("t1", "", "{}", |_: Empty| "R1".to_string());
+    let t2 = new_tool("t2", "", "{}", |_: Empty| "R2".to_string());
+    let t3 = new_tool("t3", "", "{}", |_: Empty| "R3".to_string());
     let mut a = TestAgent::new(p).tools(vec![t1, t2, t3]);
     let out = a.run(&[user("go")]).expect("run");
     assert_eq!(out[2].tool_call_id, "c1");
@@ -862,6 +870,8 @@ fn drop_incomplete_tool_calls() {
             content: "file contents".into(),
             tool_calls: Vec::new(),
             tool_call_id: "c1".into(),
+            reasoning: String::new(),
+            images: Vec::new(),
         },
     ];
     axe::session::drop_incomplete_tool_calls(&mut complete);
@@ -887,12 +897,16 @@ fn drop_incomplete_tool_calls() {
                 },
             ],
             tool_call_id: String::new(),
+            reasoning: String::new(),
+            images: Vec::new(),
         },
         Message {
             role: "tool".into(),
             content: "file contents".into(),
             tool_calls: Vec::new(),
             tool_call_id: "c1".into(),
+            reasoning: String::new(),
+            images: Vec::new(),
         },
     ];
     axe::session::drop_incomplete_tool_calls(&mut partial);
@@ -909,6 +923,8 @@ fn drop_incomplete_tool_calls() {
             content: "one".into(),
             tool_calls: Vec::new(),
             tool_call_id: "c1".into(),
+            reasoning: String::new(),
+            images: Vec::new(),
         },
         call_tool("c2", "read", "{}"),
         user("continue"),
@@ -964,6 +980,8 @@ fn run_cancel_mid_batch_synthesizes_results() {
                         content: String::new(),
                         tool_calls: calls,
                         tool_call_id: String::new(),
+                        reasoning: String::new(),
+                        images: Vec::new(),
                     },
                     usage: Usage::default(),
                     stop_reason: String::new(),

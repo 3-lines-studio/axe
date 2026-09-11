@@ -2,7 +2,7 @@ use crate::app;
 use crate::openai::OpenAI;
 use crate::run::{self, Outcome, RunOptions, Sink};
 use crate::session;
-use crate::{Message, Tool, ToolCall, Usage};
+use crate::{Image, Message, Tool, ToolCall, Usage};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
@@ -47,7 +47,10 @@ pub fn build_tools(dir: &str) -> Vec<Tool> {
 }
 
 enum Entry {
-    User(String),
+    User {
+        text: String,
+        images: Vec<String>,
+    },
     Assistant {
         source: String,
         rendered: Vec<Line<'static>>,
@@ -92,6 +95,7 @@ struct App {
     messages: Vec<Message>,
     input: String,
     cursor: usize,
+    attachments: Vec<Image>,
     scroll: u16,
     max_scroll: u16,
     page_size: u16,
@@ -190,6 +194,7 @@ fn run_app(
         messages: Vec::new(),
         input: String::new(),
         cursor: 0,
+        attachments: Vec::new(),
         scroll: 0,
         max_scroll: 0,
         page_size: 1,
@@ -296,8 +301,9 @@ impl App {
         let input_lines = self.input.split('\n').fold(0usize, |count, line| {
             count + line.chars().count().max(1).div_ceil(input_width)
         });
+        let composer_lines = input_lines + self.attachments.len();
         let input_height =
-            input_lines.clamp(1, frame.area().height.saturating_div(2) as usize) as u16;
+            composer_lines.clamp(1, frame.area().height.saturating_div(2) as usize) as u16;
         let activity_height = if self.tool_live.is_some() {
             2
         } else {
@@ -418,7 +424,8 @@ impl App {
         }
         frame.render_widget(Paragraph::new(status).style(Style::default()), areas[4]);
         let (cursor_row, cursor_col) = self.cursor_position(input_width);
-        let visible_start = input_lines.saturating_sub(input_height as usize);
+        let cursor_row = self.attachments.len() + cursor_row;
+        let visible_start = composer_lines.saturating_sub(input_height as usize);
         let cursor_row = cursor_row.saturating_sub(visible_start);
         frame.set_cursor_position((
             areas[2].x + 2 + cursor_col as u16,
@@ -628,7 +635,10 @@ impl App {
         self.entries.clear();
         for message in messages {
             match message.role.as_str() {
-                "user" => self.entries.push(Entry::User(message.content.clone())),
+                "user" => self.entries.push(Entry::User {
+                    text: message.content.clone(),
+                    images: message.images.iter().map(crate::image::label).collect(),
+                }),
                 "assistant" => {
                     if !message.content.is_empty() {
                         self.entries.push(assistant_entry(message.content.clone()));
@@ -663,7 +673,16 @@ impl App {
         ];
         for entry in &self.entries {
             match entry {
-                Entry::User(text) => {
+                Entry::User { text, images } => {
+                    for label in images {
+                        lines.push(Line::from(vec![
+                            Span::styled("┃ ", Style::default()),
+                            Span::styled(
+                                format!("[image {label}]"),
+                                Style::default().add_modifier(Modifier::DIM),
+                            ),
+                        ]));
+                    }
                     for line in text.lines() {
                         lines.push(Line::from(vec![
                             Span::styled("┃ ", Style::default()),
@@ -712,6 +731,15 @@ impl App {
 
     fn input_text(&self) -> Text<'_> {
         let mut lines = Vec::new();
+        for image in &self.attachments {
+            lines.push(Line::from(vec![
+                Span::styled("┃ ", Style::default()),
+                Span::styled(
+                    format!("[image {}]", crate::image::label(image)),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
         for line in self.input.split('\n') {
             lines.push(Line::from(vec![
                 Span::styled("┃ ", Style::default()),
@@ -1047,6 +1075,13 @@ impl App {
 
     fn paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.input.is_empty()
+            && self.attachments.is_empty()
+            && let Some(path) = dropped_image_path(&text)
+        {
+            self.attach(Some(path.as_str()));
+            return;
+        }
         self.input.insert_str(self.cursor, &text);
         self.cursor += text.len();
     }
@@ -1198,7 +1233,7 @@ impl App {
     }
 
     fn submit(&mut self) {
-        if self.input.trim().is_empty() {
+        if self.input.trim().is_empty() && self.attachments.is_empty() {
             return;
         }
         if self.input.starts_with('/') {
@@ -1207,11 +1242,21 @@ impl App {
             self.run_command(&command);
             return;
         }
+        if self.running && !self.attachments.is_empty() {
+            self.entries.push(Entry::Notice(
+                "agent is running; images attach to the next message".into(),
+            ));
+            return;
+        }
+        let images = std::mem::take(&mut self.attachments);
         let content = std::mem::take(&mut self.input);
         self.cursor = 0;
         self.history_index = None;
         self.history.push(content.clone());
-        self.entries.push(Entry::User(content.clone()));
+        self.entries.push(Entry::User {
+            text: content.clone(),
+            images: images.iter().map(crate::image::label).collect(),
+        });
         if self.running {
             if let Some(steer) = &self.steer {
                 let _ = steer.send(content);
@@ -1223,6 +1268,8 @@ impl App {
             content,
             tool_calls: Vec::new(),
             tool_call_id: String::new(),
+            reasoning: String::new(),
+            images,
         });
         let entry = session::Entry::Message {
             message: self.messages.last().unwrap().clone(),
@@ -1273,9 +1320,45 @@ impl App {
             Some(app::Command::Rewind) => self.open_rewind(),
             Some(app::Command::Compact) => self.start_compaction(),
             Some(app::Command::Copy) => self.copy_last(),
+            Some(app::Command::Image) => self.attach(argument),
             None => self
                 .entries
                 .push(Entry::Notice(format!("unknown command: {input}"))),
+        }
+    }
+
+    fn attach(&mut self, argument: Option<&str>) {
+        let Some(argument) = argument.filter(|argument| !argument.is_empty()) else {
+            let attached = self
+                .attachments
+                .iter()
+                .map(crate::image::label)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let notice = if attached.is_empty() {
+                "usage: /image PATH or URL, /image clear, or drop a file onto the terminal"
+                    .to_string()
+            } else {
+                format!("attached: {attached}")
+            };
+            self.entries.push(Entry::Notice(notice));
+            return;
+        };
+        if argument == "clear" {
+            self.attachments.clear();
+            self.entries
+                .push(Entry::Notice("cleared attachments".into()));
+            return;
+        }
+        match crate::image::attach(argument) {
+            Ok(image) => {
+                self.entries.push(Entry::Notice(format!(
+                    "attached {}",
+                    crate::image::label(&image)
+                )));
+                self.attachments.push(image);
+            }
+            Err(error) => self.entries.push(Entry::Notice(format!("error: {error}"))),
         }
     }
 
@@ -1316,7 +1399,7 @@ impl App {
                 .push(Entry::Notice("no assistant response to copy".into()));
             return;
         };
-        let encoded = b64_encode(text.as_bytes());
+        let encoded = crate::image::base64(text.as_bytes());
         print!("\u{1b}]52;c;{encoded}\u{1b}\\");
         let _ = io::stdout().flush();
         self.entries
@@ -1661,29 +1744,20 @@ fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize 
         .map_or(end, |(index, _)| start + index)
 }
 
-fn b64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::new();
-    for chunk in data.chunks(3) {
-        let bytes = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        output.push(TABLE[(bytes[0] >> 2) as usize] as char);
-        output.push(TABLE[(((bytes[0] & 3) << 4) | (bytes[1] >> 4)) as usize] as char);
-        output.push(if chunk.len() > 1 {
-            TABLE[(((bytes[1] & 15) << 2) | (bytes[2] >> 6)) as usize] as char
-        } else {
-            '='
-        });
-        output.push(if chunk.len() > 2 {
-            TABLE[(bytes[2] & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    output
+/// Terminals quote or backslash-escape a path dropped onto them; undo that so
+/// the path can be read.
+fn dropped_image_path(text: &str) -> Option<String> {
+    let text = text.trim();
+    let unquoted = text
+        .strip_prefix('\'')
+        .and_then(|text| text.strip_suffix('\''))
+        .or_else(|| {
+            text.strip_prefix('"')
+                .and_then(|text| text.strip_suffix('"'))
+        })
+        .unwrap_or(text)
+        .replace("\\ ", " ");
+    crate::image::is_image_path(&unquoted).then_some(unquoted)
 }
 
 struct RatatuiSink<'a> {
