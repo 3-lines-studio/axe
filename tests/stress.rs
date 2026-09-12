@@ -572,11 +572,7 @@ fn edit_multi_edit_and_line_endings() {
     .to_string();
     let out = (edit.run)(&args, &mut |_| {}).text;
     assert!(out.starts_with("Successfully replaced 2 block(s)"), "{out}");
-    assert!(out.contains("Diff:"), "{out}");
-    assert!(out.contains("-1 one"), "{out}");
-    assert!(out.contains("+1 ONE"), "{out}");
-    assert!(out.contains("-3 three"), "{out}");
-    assert!(out.contains("+3 THREE"), "{out}");
+    assert!(!out.contains("Diff:"), "{out}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "ONE\ntwo\nTHREE\n");
 
     std::fs::write(&path, "a\r\nb\r\n").unwrap();

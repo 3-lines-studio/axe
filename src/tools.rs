@@ -316,15 +316,7 @@ fn status_str(st: std::process::ExitStatus) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_edits, diff_lines, sanitize};
-
-    #[test]
-    fn diff_limits_output_to_changed_lines() {
-        assert_eq!(diff_lines("a\nold\nz", "a\nnew\nz"), "-2 old\n+2 new");
-        assert_eq!(diff_lines("a\nz", "a\nnew\nz"), "+2 new");
-        assert_eq!(diff_lines("a\nold\nz", "a\nz"), "-2 old");
-        assert_eq!(diff_lines("a\n🙈\nz", "a\n✅\nz"), "-2 🙈\n+2 ✅");
-    }
+    use super::{apply_edits, sanitize};
 
     #[test]
     fn sanitize_strips_control_characters() {
@@ -902,81 +894,6 @@ fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<String, S
 
 const EDIT_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.","items":{"type":"object","properties":{"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},"newText":{"type":"string","description":"Replacement text for this targeted edit."}},"required":["oldText","newText"]}}},"required":["path","edits"]}"#;
 
-/// Line-based diff with line numbers, one hunk per changed region.
-fn diff_lines(old: &str, new: &str) -> String {
-    if old == new {
-        return String::new();
-    }
-    let equal_prefix = old
-        .bytes()
-        .zip(new.bytes())
-        .take_while(|(old, new)| old == new)
-        .count();
-    let prefix = old.as_bytes()[..equal_prefix]
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    let max_suffix = old.len().min(new.len()).saturating_sub(prefix);
-    let equal_suffix = old
-        .bytes()
-        .rev()
-        .zip(new.bytes().rev())
-        .take(max_suffix)
-        .take_while(|(old, new)| old == new)
-        .count();
-    let mut old_end = old.len() - equal_suffix;
-    let mut new_end = new.len() - equal_suffix;
-    if old_end > prefix
-        && (old.as_bytes()[old_end - 1] != b'\n' || new.as_bytes()[new_end - 1] != b'\n')
-    {
-        old_end = old.as_bytes()[old_end..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(old.len(), |index| old_end + index + 1);
-        new_end = new.as_bytes()[new_end..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(new.len(), |index| new_end + index + 1);
-    }
-    let line_offset = old[..prefix].bytes().filter(|byte| *byte == b'\n').count();
-    let mut old_lines = old[prefix..old_end]
-        .split_terminator('\n')
-        .enumerate()
-        .peekable();
-    let mut new_lines = new[prefix..new_end]
-        .split_terminator('\n')
-        .enumerate()
-        .peekable();
-    let mut out = String::new();
-    while old_lines.peek().is_some() || new_lines.peek().is_some() {
-        if old_lines.peek().map(|line| line.1) == new_lines.peek().map(|line| line.1) {
-            old_lines.next();
-            new_lines.next();
-            continue;
-        }
-        let mut removed = Vec::new();
-        let mut added = Vec::new();
-        while old_lines.peek().is_some() || new_lines.peek().is_some() {
-            if old_lines.peek().map(|line| line.1) == new_lines.peek().map(|line| line.1) {
-                break;
-            }
-            if let Some(line) = old_lines.next() {
-                removed.push(line);
-            }
-            if let Some(line) = new_lines.next() {
-                added.push(line);
-            }
-        }
-        for (line, text) in removed {
-            out.push_str(&format!("-{} {text}\n", line_offset + line + 1));
-        }
-        for (line, text) in added {
-            out.push_str(&format!("+{} {text}\n", line_offset + line + 1));
-        }
-    }
-    out.trim_end().to_string()
-}
-
 pub fn edit() -> Tool {
     let mut t = new_tool(
         "edit",
@@ -992,15 +909,7 @@ pub fn edit() -> Tool {
                     Ok(out) => {
                         let n = a.edits.len();
                         match crate::atomic_write(std::path::Path::new(&a.path), out.as_bytes()) {
-                            Ok(()) => {
-                                let mut msg =
-                                    format!("Successfully replaced {n} block(s) in {}.", a.path);
-                                let diff = diff_lines(&normalize_lf(&s), &normalize_lf(&out));
-                                if !diff.is_empty() {
-                                    msg.push_str(&format!("\n\nDiff:\n{diff}"));
-                                }
-                                msg
-                            }
+                            Ok(()) => format!("Successfully replaced {n} block(s) in {}.", a.path),
                             Err(e) => format!("error: {e}"),
                         }
                     }

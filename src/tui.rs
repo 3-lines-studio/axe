@@ -318,18 +318,8 @@ impl App {
             .split(frame.area());
         let transcript_width = areas[0].width.max(1) as usize;
         let transcript = self.transcript(transcript_width);
-        let line_count = transcript
-            .lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.chars().count())
-                    .sum::<usize>()
-                    .max(1)
-                    .div_ceil(transcript_width)
-            })
-            .sum::<usize>() as u16;
+        let transcript = Paragraph::new(transcript).wrap(Wrap { trim: false });
+        let line_count = transcript.line_count(areas[0].width.max(1)) as u16;
         self.page_size = areas[0].height.max(1);
         self.max_scroll = line_count.saturating_sub(self.page_size);
         if self.follow {
@@ -337,9 +327,7 @@ impl App {
         } else {
             self.scroll = self.scroll.min(self.max_scroll);
         }
-        let transcript = Paragraph::new(transcript)
-            .wrap(Wrap { trim: false })
-            .scroll((self.scroll, 0));
+        let transcript = transcript.scroll((self.scroll, 0));
         frame.render_widget(transcript, areas[0]);
         if self.running || self.compacting {
             let elapsed = self.turn_started.elapsed().as_secs();
@@ -698,7 +686,7 @@ impl App {
                     if calls.len() == 1 {
                         lines.push(Line::from(vec![
                             Span::styled("● ", style),
-                            Span::styled(calls[0].clone(), style),
+                            Span::styled(truncate(&calls[0], width.saturating_sub(2)), style),
                         ]));
                     } else {
                         lines.push(Line::from(vec![
@@ -711,7 +699,10 @@ impl App {
                             } else {
                                 "├"
                             };
-                            lines.push(Line::from(Span::styled(format!("{branch} {call}"), style)));
+                            lines.push(Line::from(Span::styled(
+                                format!("{branch} {}", truncate(call, width.saturating_sub(2))),
+                                style,
+                            )));
                         }
                     }
                 }
@@ -1719,6 +1710,16 @@ fn wrap_markdown_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> 
     lines
 }
 
+/// Shorten `text` to at most `width` characters, ending with an ellipsis.
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut result: String = text.chars().take(width.saturating_sub(1)).collect();
+    result.push('…');
+    result
+}
+
 fn format_tokens(tokens: usize) -> String {
     if tokens < 1000 {
         tokens.to_string()
@@ -1882,6 +1883,45 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn scroll_to_bottom_reaches_last_line() {
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let width = 16u16;
+        let height = 3u16;
+        let paragraph = Paragraph::new(text.to_string()).wrap(Wrap { trim: false });
+        let rows = paragraph.line_count(width);
+        let max_scroll = rows.saturating_sub(height as usize) as u16;
+        assert!(max_scroll > 0);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        paragraph.render(buffer.area, &mut buffer);
+        let screen = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("alpha"));
+        assert!(!screen.contains("kappa"));
+        let paragraph = Paragraph::new(text.to_string())
+            .wrap(Wrap { trim: false })
+            .scroll((max_scroll, 0));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        paragraph.render(buffer.area, &mut buffer);
+        let screen = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("kappa"));
+        assert!(!screen.contains("alpha"));
+    }
+
+    #[test]
+    fn truncate_shortens_with_ellipsis() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("abcdefghij", 5), "abcd…");
+        assert_eq!(truncate("abcdefghij", 0), "…");
     }
 
     #[test]
