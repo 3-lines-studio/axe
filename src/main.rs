@@ -442,63 +442,14 @@ fn work_dir(cfg: &Config) -> String {
 
 fn resolve_system(cfg: &Config, tools: &[Tool]) -> String {
     if cfg.system.is_empty() {
-        system_prompt(tools, &work_dir(cfg))
+        axe::system_prompt(tools, &work_dir(cfg))
     } else {
         cfg.system.clone()
     }
 }
 
-fn system_prompt(tools: &[Tool], dir: &str) -> String {
-    let mut out = String::from(
-        "You are an expert coding assistant operating inside axe. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n",
-    );
-    for t in tools {
-        if !t.snippet.is_empty() {
-            out.push_str(&format!("- {}: {}\n", t.name, t.snippet));
-        }
-    }
-    out.push_str(
-        "\nGuidelines:\n\
-         - Be concise in your responses\n\
-         - Show file paths clearly when working with files\n\
-         - Use edit for precise changes; edits[].oldText must match exactly\n\
-         - When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls\n\
-         - Keep edits[].oldText small while still unique; do not pad with unchanged regions\n\
-         - After a simple write or edit succeeds, stop unless the user asked you to verify it\n\
-         - Tool errors return to you as text; fix them and re-issue\n",
-    );
-    out.push_str(&format!("\nCurrent working directory: {dir}"));
-    if let Some(user) = user_system_prompt() {
-        out.push_str("\n\n");
-        out.push_str(&user);
-    }
-    out
-}
-
-fn user_system_prompt() -> Option<String> {
-    let path = config_dir()?.join("axe").join("SYSTEM.md");
-    let text = std::fs::read_to_string(path).ok()?;
-    let text = text.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
-    }
-}
-
-fn config_dir() -> Option<std::path::PathBuf> {
-    if let Ok(x) = std::env::var("XDG_CONFIG_HOME")
-        && !x.is_empty()
-    {
-        return Some(std::path::PathBuf::from(x));
-    }
-    std::env::var("HOME")
-        .ok()
-        .map(|h| std::path::PathBuf::from(h).join(".config"))
-}
-
 fn axe_root() -> String {
-    match config_dir() {
+    match axe::config_dir() {
         Some(d) => d.join("axe").display().to_string(),
         None => work_dir_abs(),
     }
@@ -517,7 +468,7 @@ fn load_config() -> FileConfig {
         base: String::new(),
         context_window: None,
     };
-    let Some(dir) = config_dir() else {
+    let Some(dir) = axe::config_dir() else {
         return c;
     };
     let Ok(text) = std::fs::read_to_string(dir.join("axe").join("config")) else {
