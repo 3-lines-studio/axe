@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthChar;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -54,6 +55,7 @@ enum Entry {
     Assistant {
         source: String,
         rendered: Vec<Line<'static>>,
+        width: usize,
     },
     Tool(Vec<String>),
     Notice(String),
@@ -114,6 +116,7 @@ struct App {
     turn_started: Instant,
     tool_running: Option<String>,
     tool_live: Option<String>,
+    width: usize,
     history: Vec<String>,
     history_index: Option<usize>,
     want_quit: bool,
@@ -206,6 +209,7 @@ fn run_app(
         turn_started: Instant::now(),
         tool_running: None,
         tool_live: None,
+        width: 80,
         history: Vec::new(),
         history_index: None,
         want_quit: false,
@@ -291,9 +295,11 @@ impl App {
         self.sync_picker();
         let width = frame.area().width.max(1);
         let input_width = width.saturating_sub(2).max(1) as usize;
-        let input_lines = self.input.split('\n').fold(0usize, |count, line| {
-            count + line.chars().count().max(1).div_ceil(input_width)
-        });
+        let input_lines = self
+            .input
+            .split('\n')
+            .map(|line| wrap_input_line(line, input_width).len())
+            .sum::<usize>();
         let composer_lines = input_lines + self.attachments.len();
         let input_height =
             composer_lines.clamp(1, frame.area().height.saturating_div(2) as usize) as u16;
@@ -317,6 +323,8 @@ impl App {
             ])
             .split(frame.area());
         let transcript_width = areas[0].width.max(1) as usize;
+        self.width = transcript_width;
+        self.sync_markdown_width(transcript_width);
         let transcript = self.transcript(transcript_width);
         let transcript = Paragraph::new(transcript).wrap(Wrap { trim: false });
         let line_count = transcript.line_count(areas[0].width.max(1)) as u16;
@@ -624,7 +632,8 @@ impl App {
                 }),
                 "assistant" => {
                     if !message.content.is_empty() {
-                        self.entries.push(assistant_entry(message.content.clone()));
+                        self.entries
+                            .push(assistant_entry(message.content.clone(), self.width));
                     }
                     for call in &message.tool_calls {
                         let label = app::tool_label(call, false);
@@ -636,6 +645,21 @@ impl App {
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    fn sync_markdown_width(&mut self, width: usize) {
+        for entry in &mut self.entries {
+            if let Entry::Assistant {
+                source,
+                rendered,
+                width: entry_width,
+            } = entry
+                && *entry_width != width
+            {
+                *rendered = render_markdown(source, width);
+                *entry_width = width;
             }
         }
     }
@@ -738,29 +762,7 @@ impl App {
     }
 
     fn cursor_position(&self, width: usize) -> (usize, usize) {
-        let before = &self.input[..self.cursor];
-        let mut row = 0;
-        let mut col = 0;
-        for character in before.chars() {
-            if character == '\n' {
-                row += 1;
-                col = 0;
-                continue;
-            }
-            if col == width {
-                row += 1;
-                col = 0;
-            }
-            col += 1;
-        }
-        if col == width
-            && self.cursor < self.input.len()
-            && !self.input[self.cursor..].starts_with('\n')
-        {
-            row += 1;
-            col = 0;
-        }
-        (row, col)
+        cursor_row_col(&self.input, self.cursor, width)
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -1495,11 +1497,16 @@ impl App {
         while let Ok(event) = receiver.try_recv() {
             match event {
                 TurnEvent::AssistantDelta(delta) => {
-                    if let Some(Entry::Assistant { source, rendered }) = self.entries.last_mut() {
+                    if let Some(Entry::Assistant {
+                        source,
+                        rendered,
+                        width,
+                    }) = self.entries.last_mut()
+                    {
                         source.push_str(&delta);
-                        *rendered = render_markdown(source);
+                        *rendered = render_markdown(source, *width);
                     } else {
-                        self.entries.push(assistant_entry(delta));
+                        self.entries.push(assistant_entry(delta, self.width));
                     }
                 }
                 TurnEvent::ToolStart(label) => {
@@ -1606,13 +1613,29 @@ impl App {
     }
 }
 
-fn assistant_entry(source: String) -> Entry {
-    let rendered = render_markdown(&source);
-    Entry::Assistant { source, rendered }
+fn assistant_entry(source: String, width: usize) -> Entry {
+    let rendered = render_markdown(&source, width);
+    Entry::Assistant {
+        source,
+        rendered,
+        width,
+    }
 }
 
-fn render_markdown(markdown: &str) -> Vec<Line<'static>> {
-    tui_markdown::from_str(markdown)
+fn render_markdown(markdown: &str, width: usize) -> Vec<Line<'static>> {
+    let lines = render_markdown_with(markdown, width, false);
+    if lines
+        .iter()
+        .any(|line| box_line(line) && line.width() > width)
+    {
+        return render_markdown_with(markdown, width, true);
+    }
+    lines
+}
+
+fn render_markdown_with(markdown: &str, width: usize, force: bool) -> Vec<Line<'static>> {
+    let markdown = mobile_tables(markdown, width, force);
+    tui_markdown::from_str(&markdown)
         .lines
         .into_iter()
         .map(|line| {
@@ -1640,6 +1663,189 @@ fn render_markdown(markdown: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
+fn box_line(line: &Line<'static>) -> bool {
+    line.spans.iter().any(|span| {
+        span.content
+            .chars()
+            .any(|character| matches!(character, '┌' | '│' | '├' | '└'))
+    })
+}
+
+fn split_quote(line: &str) -> (&str, &str) {
+    let mut end = 0;
+    let mut seen = false;
+    for (index, byte) in line.bytes().enumerate() {
+        match byte {
+            b'>' => {
+                seen = true;
+                end = index + 1;
+            }
+            b' ' => {}
+            _ => break,
+        }
+    }
+    if seen {
+        (&line[..end], &line[end..])
+    } else {
+        ("", line)
+    }
+}
+
+fn mobile_tables(markdown: &str, width: usize, force: bool) -> String {
+    let lines = markdown.lines().collect::<Vec<_>>();
+    let mut out = String::with_capacity(markdown.len());
+    let mut index = 0;
+    let mut fenced = false;
+    while index < lines.len() {
+        let fence = lines[index].trim_start();
+        if fence.starts_with("```") || fence.starts_with("~~~") {
+            fenced = !fenced;
+            out.push_str(lines[index]);
+            out.push('\n');
+            index += 1;
+            continue;
+        }
+        if fenced {
+            out.push_str(lines[index]);
+            out.push('\n');
+            index += 1;
+            continue;
+        }
+        let (prefix, rest) = split_quote(lines[index]);
+        let header = table_cells(rest);
+        let delimiter = lines
+            .get(index + 1)
+            .copied()
+            .map(split_quote)
+            .filter(|(line_prefix, _)| *line_prefix == prefix)
+            .and_then(|(_, line_rest)| table_cells(line_rest))
+            .filter(|cells| is_table_delimiter(cells));
+        match (header, delimiter) {
+            (Some(header), Some(delimiter)) if header.len() == delimiter.len() => {
+                let mut end = index + 2;
+                let mut rows = Vec::new();
+                while let Some(line) = lines.get(end).copied() {
+                    let (row_prefix, row_rest) = split_quote(line);
+                    if row_prefix != prefix {
+                        break;
+                    }
+                    match table_cells(row_rest) {
+                        Some(cells) => {
+                            rows.push(cells);
+                            end += 1;
+                        }
+                        None => break,
+                    }
+                }
+                let block = lines[index..end].join("\n");
+                if rows.is_empty() || (!force && table_fits(&block, width)) {
+                    out.push_str(&block);
+                } else {
+                    out.push_str(&stacked_table(prefix, &header, &rows));
+                }
+                out.push('\n');
+                index = end;
+            }
+            _ => {
+                out.push_str(lines[index]);
+                out.push('\n');
+                index += 1;
+            }
+        }
+    }
+    if !markdown.is_empty() && !markdown.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn table_cells(line: &str) -> Option<Vec<String>> {
+    if !line.contains('|') {
+        return None;
+    }
+    let trimmed = line.trim();
+    let trimmed = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix('|').unwrap_or(trimmed);
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut characters = trimmed.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' && characters.peek() == Some(&'|') {
+            cell.push('|');
+            characters.next();
+        } else if character == '|' {
+            cells.push(cell.trim().to_string());
+            cell = String::new();
+        } else {
+            cell.push(character);
+        }
+    }
+    cells.push(cell.trim().to_string());
+    Some(cells)
+}
+
+fn is_table_delimiter(cells: &[String]) -> bool {
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let dashes = cell.trim_matches(':');
+            !dashes.is_empty() && dashes.chars().all(|character| character == '-')
+        })
+}
+
+fn table_fits(block: &str, width: usize) -> bool {
+    let intrinsic = tui_markdown::from_str(block)
+        .lines
+        .iter()
+        .map(|line| line.width())
+        .max()
+        .unwrap_or(0);
+    intrinsic + 2 <= width
+}
+
+fn stacked_table(prefix: &str, header: &[String], rows: &[Vec<String>]) -> String {
+    let lead = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix} ")
+    };
+    let separator = if prefix.is_empty() {
+        "\n\n".to_string()
+    } else {
+        format!("\n{prefix}\n")
+    };
+    let mut records = Vec::new();
+    for row in rows {
+        let mut fields = Vec::new();
+        for (column, name) in header.iter().enumerate() {
+            let cell = row.get(column).map(String::as_str).unwrap_or("");
+            let break_line = if column + 1 < header.len() { "  " } else { "" };
+            fields.push(format!("{lead}**{name}:** {cell}{break_line}"));
+        }
+        records.push(fields.join("\n"));
+    }
+    records.join(&separator)
+}
+
+fn quote_marker(line: &Line<'static>) -> Option<String> {
+    let content = line.spans.get(1)?.content.as_ref();
+    if !content.contains('>')
+        || !content
+            .chars()
+            .all(|character| character == '>' || character == ' ')
+    {
+        return None;
+    }
+    let mut marker = content.trim_end().to_string();
+    if line
+        .spans
+        .get(2)
+        .is_some_and(|span| span.content.starts_with(' '))
+    {
+        marker.push(' ');
+    }
+    Some(marker)
+}
+
 fn wrap_markdown_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     let characters = line
         .spans
@@ -1650,7 +1856,11 @@ fn wrap_markdown_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> 
                 .map(move |character| (character, span.style))
         })
         .collect::<Vec<_>>();
-    if characters.len() <= width || width == 0 {
+    let total = characters
+        .iter()
+        .map(|(character, _)| char_columns(*character))
+        .sum::<usize>();
+    if total <= width || width == 0 {
         return vec![line.clone()];
     }
     let marker_width = line.spans.get(1).map_or(0, |span| {
@@ -1660,38 +1870,46 @@ fn wrap_markdown_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> 
             rest.is_empty() && number.chars().all(|c| c.is_ascii_digit())
         });
         if marker.ends_with("- ") || marker.ends_with("] ") || ordered {
-            marker.chars().count()
+            columns(marker)
         } else {
             0
         }
     });
-    let continuation_width = 2 + marker_width;
+    let mut continuation = match quote_marker(line) {
+        Some(marker) => format!("  {marker}"),
+        None => " ".repeat(2 + marker_width),
+    };
+    let limit = width.saturating_sub(1);
+    if columns(&continuation) > limit {
+        continuation = take_columns(&continuation, limit);
+    }
     let mut lines = Vec::new();
     let mut start = 0;
     let mut first = true;
     while start < characters.len() {
-        let indent = if first {
-            0
-        } else {
-            continuation_width.min(width.saturating_sub(1))
-        };
-        let capacity = width.saturating_sub(indent).max(1);
-        let limit = (start + capacity).min(characters.len());
-        let mut end = limit;
-        if limit < characters.len() {
-            if let Some(offset) = characters[start..limit]
+        let prefix = if first { "" } else { continuation.as_str() };
+        let capacity = width.saturating_sub(columns(prefix)).max(1);
+        let mut end = start;
+        let mut used = 0;
+        while end < characters.len() {
+            let size = char_columns(characters[end].0);
+            if end > start && used + size > capacity {
+                break;
+            }
+            used += size;
+            end += 1;
+        }
+        if end < characters.len()
+            && let Some(offset) = characters[start..end]
                 .iter()
                 .rposition(|(character, _)| character.is_whitespace())
-            {
-                end = start + offset;
-            }
-            if end == start {
-                end = limit;
-            }
+            && offset > 0
+        {
+            end = start + offset;
         }
         let mut spans = Vec::new();
-        if indent > 0 {
-            spans.push(Span::raw(" ".repeat(indent)));
+        if !prefix.is_empty() {
+            spans.push(Span::raw(prefix.to_string()));
         }
         for (character, style) in &characters[start..end] {
             if spans.last().is_some_and(|span| span.style == *style) {
@@ -1710,12 +1928,65 @@ fn wrap_markdown_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> 
     lines
 }
 
-/// Shorten `text` to at most `width` characters, ending with an ellipsis.
+/// Display columns a character occupies; zero for control characters.
+fn char_columns(character: char) -> usize {
+    character.width().unwrap_or(0)
+}
+
+/// Row and column of `cursor` under the wrap performed by [`wrap_input_line`].
+fn cursor_row_col(input: &str, cursor: usize, width: usize) -> (usize, usize) {
+    let mut row = 0;
+    let mut col = 0;
+    for character in input[..cursor].chars() {
+        if character == '\n' {
+            row += 1;
+            col = 0;
+            continue;
+        }
+        let size = char_columns(character);
+        if col + size > width && col > 0 {
+            row += 1;
+            col = 0;
+        }
+        col += size;
+    }
+    if let Some(character) = input[cursor..].chars().next()
+        && character != '\n'
+        && col + char_columns(character) > width
+        && col > 0
+    {
+        row += 1;
+        col = 0;
+    }
+    (row, col)
+}
+
+/// Display columns a string occupies on screen (wide and zero-width aware).
+fn columns(text: &str) -> usize {
+    text.chars().map(char_columns).sum()
+}
+
+/// Keep at most `width` display columns of `text`.
+fn take_columns(text: &str, width: usize) -> String {
+    let mut result = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let size = char_columns(character);
+        if used + size > width {
+            break;
+        }
+        result.push(character);
+        used += size;
+    }
+    result
+}
+
+/// Shorten `text` to at most `width` display columns, ending with an ellipsis.
 fn truncate(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
+    if columns(text) <= width {
         return text.to_string();
     }
-    let mut result: String = text.chars().take(width.saturating_sub(1)).collect();
+    let mut result = take_columns(text, width.saturating_sub(1));
     result.push('…');
     result
 }
@@ -1757,11 +2028,15 @@ fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize 
 fn wrap_input_line(line: &str, width: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current = String::new();
+    let mut used = 0;
     for character in line.chars() {
-        current.push(character);
-        if current.chars().count() == width {
+        let size = char_columns(character);
+        if used + size > width && !current.is_empty() {
             chunks.push(std::mem::take(&mut current));
+            used = 0;
         }
+        current.push(character);
+        used += size;
     }
     if !current.is_empty() || chunks.is_empty() {
         chunks.push(current);
@@ -1841,7 +2116,7 @@ mod tests {
     fn markdown_render_is_owned_and_visible() {
         let rendered = {
             let source = "# Heading\n\n**bold**".to_string();
-            render_markdown(&source)
+            render_markdown(&source, 80)
         };
         let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 4));
         Paragraph::new(Text::from(rendered)).render(buffer.area, &mut buffer);
@@ -1856,11 +2131,11 @@ mod tests {
 
     #[test]
     fn markdown_wrap_keeps_indentation() {
-        let normal = render_markdown("alpha beta gamma");
+        let normal = render_markdown("alpha beta gamma", 80);
         let normal = wrap_markdown_line(&normal[0], 12);
         assert_eq!(line_text(&normal[1]), "  beta gamma");
 
-        let list = render_markdown("- alpha beta gamma");
+        let list = render_markdown("- alpha beta gamma", 80);
         let list = wrap_markdown_line(&list[0], 12);
         assert_eq!(line_text(&list[1]), "    beta");
     }
@@ -1869,11 +2144,11 @@ mod tests {
     fn markdown_wrap_indents_every_marker_kind() {
         // Ordered ("1. ") and task-list ("- [x] ") markers carry the same
         // continuation indent as the bullet marker.
-        let ordered = render_markdown("1. alpha beta gamma");
+        let ordered = render_markdown("1. alpha beta gamma", 80);
         let ordered = wrap_markdown_line(&ordered[0], 12);
         assert_eq!(line_text(&ordered[1]), "     beta");
 
-        let task = render_markdown("- [x] alpha beta gamma");
+        let task = render_markdown("- [x] alpha beta gamma", 80);
         let task = wrap_markdown_line(&task[0], 16);
         assert_eq!(line_text(&task[1]), "        beta");
     }
@@ -1883,6 +2158,107 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn table_stays_boxed_when_it_fits() {
+        let source = "| Name | Value |\n|------|-------|\n| foo  | bar   |";
+        let text = render_markdown(source, 40)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(text.iter().any(|line| line.contains('┌')));
+        assert!(text.iter().any(|line| line.contains("foo")));
+    }
+
+    #[test]
+    fn table_stacks_when_too_wide() {
+        let source = "| Name | Value |\n|------|-------|\n| foo  | bar   |\n| baz  | qux   |";
+        let text = render_markdown(source, 16)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(!text.iter().any(|line| line.contains('┌')));
+        assert_eq!(text.iter().filter(|line| line.contains("Name:")).count(), 2);
+        assert!(
+            text.iter()
+                .any(|line| line.contains("Value:") && line.contains("bar"))
+        );
+        assert!(text.iter().any(|line| line.is_empty()));
+    }
+
+    #[test]
+    fn table_cells_unescape_pipes() {
+        assert_eq!(
+            table_cells("| a \\| b | c |"),
+            Some(vec!["a | b".to_string(), "c".to_string()])
+        );
+    }
+
+    #[test]
+    fn fenced_code_is_never_rewritten() {
+        let fenced = "```\n| A | B |\n|---|---|\n| 1 | 2 |\n```\n";
+        let rewritten = mobile_tables(fenced, 10, true);
+        assert!(rewritten.contains("| A | B |"), "got: {rewritten}");
+        assert!(rewritten.contains("|---|---|"), "got: {rewritten}");
+        assert!(rewritten.contains("| 1 | 2 |"), "got: {rewritten}");
+        assert!(
+            !rewritten.contains("**A:**"),
+            "code fence rewritten: {rewritten}"
+        );
+
+        // A real table after the fence still stacks.
+        let mixed = "```\ncode\n```\n\n| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let out = mobile_tables(mixed, 10, false);
+        assert!(out.contains("code"), "got: {out}");
+        assert!(out.contains("**A:** 1"), "real table not stacked: {out}");
+        assert!(!out.contains("| A | B |"), "real table left boxed: {out}");
+    }
+
+    fn box_overflows(source: &str, width: usize) -> bool {
+        render_markdown(source, width).iter().any(|line| {
+            let text = line_text(line);
+            (text.contains('┌') || text.contains('│')) && line.width() > width
+        })
+    }
+
+    #[test]
+    fn tables_never_overflow_at_any_width() {
+        let sources = [
+            "| Model | Context | Input $/M | Output $/M | Notes |\n|-------|--------:|----------:|-----------:|-------|\n| gpt-4o | 128000 | 2.50 | 10.00 | multimodal |\n| claude-3-5-sonnet | 200000 | 3.00 | 15.00 | long context window |",
+            "- models:\n\n  | Model | Context | Input $/M | Output $/M | Notes |\n  |-------|--------:|----------:|-----------:|-------|\n  | gpt-4o | 128000 | 2.50 | 10.00 | multimodal |\n  | claude-3-5-sonnet | 200000 | 3.00 | 15.00 | long context window |",
+            "> | Model | Context | Input $/M | Output $/M | Notes |\n> |-------|--------:|----------:|-----------:|-------|\n> | gpt-4o | 128000 | 2.50 | 10.00 | multimodal |\n> | claude-3-5-sonnet | 200000 | 3.00 | 15.00 | long context window |",
+            "> | Key | Description |\n> |-----|-------------|\n> | id | a very long description that keeps going and going |",
+            "> > | A | B |\n> > |---|---|\n> > | 1 | 2 |",
+            "| 名前 | 説明 |\n|------|------|\n| 識別子 | とても長い説明がここに続きます |",
+            "> | 名前 | 説明 |\n> |------|------|\n> | 識別子 | とても長い説明がここに続きます |",
+        ];
+        for source in sources {
+            for width in 6..160 {
+                assert!(
+                    !box_overflows(source, width),
+                    "table overflows at width {width}: {source:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blockquote_wrap_keeps_marker() {
+        let source = "> | Key | Description |\n> |-----|-------------|\n> | id | a very long description that keeps going and going |";
+        let wrapped = render_markdown(source, 24)
+            .iter()
+            .flat_map(|line| wrap_markdown_line(line, 24))
+            .map(|line| line_text(&line))
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        assert!(wrapped.len() > 2);
+        assert!(
+            wrapped
+                .iter()
+                .all(|line| line.trim_start().starts_with('>')),
+            "wrapped blockquote lost its marker: {wrapped:?}"
+        );
     }
 
     #[test]
@@ -1915,6 +2291,48 @@ mod tests {
             .collect::<String>();
         assert!(screen.contains("kappa"));
         assert!(!screen.contains("alpha"));
+    }
+
+    #[test]
+    fn wide_characters_wrap_by_display_width() {
+        // Each CJK character occupies two columns, so a 10-column input holds
+        // five of them, not ten.
+        assert_eq!(
+            wrap_input_line("这是一段很长的中文文本", 10),
+            vec![
+                "这是一段很".to_string(),
+                "长的中文文".to_string(),
+                "本".to_string()
+            ]
+        );
+        assert_eq!(columns("这是"), 4);
+        assert_eq!(take_columns("这是一段", 5), "这是");
+        assert_eq!(truncate("这是一段很长的中文文本", 6), "这是…");
+
+        let source = "- 项目 alpha beta gamma delta epsilon zeta eta theta";
+        for width in 8..60usize {
+            let rendered = render_markdown(source, width);
+            for line in &rendered {
+                for wrapped in wrap_markdown_line(line, width) {
+                    assert!(
+                        wrapped.width() <= width,
+                        "w={width} got {}: {:?}",
+                        wrapped.width(),
+                        line_text(&wrapped)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_follows_display_width() {
+        assert_eq!(wrap_input_line("这是一段", 5), vec!["这是", "一段"]);
+        assert_eq!(cursor_row_col("这是一段", 0, 5), (0, 0));
+        assert_eq!(cursor_row_col("这是一段", "这是".len(), 5), (1, 0));
+        assert_eq!(cursor_row_col("abcdef", 3, 5), (0, 3));
+        assert_eq!(cursor_row_col("abcdef", 5, 5), (1, 0));
+        assert_eq!(cursor_row_col("ab\ncd", 4, 5), (1, 1));
     }
 
     #[test]
