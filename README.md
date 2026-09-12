@@ -9,7 +9,7 @@ Axe includes:
 - Project-scoped sessions, resume, rewind, search, and compaction
 - `read`, `write`, `edit`, and unsandboxed `bash`
 
-It has no plugins, external tools, skills, web fetcher, sidecar, or TUI framework.
+It has no plugins, external tools, skills, web fetcher, or sidecar.
 
 ## Install
 
@@ -97,7 +97,7 @@ Run live model evals separately:
 
 ```sh
 OPENAI_API_KEY="..." make eval
-AXE_EVAL_MODEL=gpt-4.1 OPENAI_API_KEY="..." make eval
+python3 scripts/eval.py --model gpt-4.1 --runs 3
 python3 scripts/eval.py --bin target/release/axe --runs 3
 python3 scripts/eval.py --agent axe --runs 3
 python3 scripts/eval.py --agent pi --runs 3
