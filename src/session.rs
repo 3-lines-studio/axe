@@ -997,7 +997,8 @@ pub fn compact(
     entries: &[Entry],
 ) -> Result<(String, usize, Vec<Message>), String> {
     let tokens_before = latest_context_tokens(entries).unwrap_or(0);
-    let (retained, to_summarize) = split_retained(entries);
+    let (mut retained, to_summarize) = split_retained(entries);
+    drop_incomplete_tool_calls(&mut retained);
     if to_summarize.is_empty() {
         return Err("nothing to summarize".into());
     }
@@ -1201,6 +1202,70 @@ mod tests {
         assert_eq!(retained[1].tool_calls[0].id, "call-1");
         assert_eq!(retained[2].tool_call_id, "call-1");
         assert_eq!(summarized.last().unwrap().content, "middle answer");
+    }
+
+    struct SummaryProvider;
+
+    impl crate::Provider for SummaryProvider {
+        fn complete(&self, _req: &Request) -> Result<crate::Response, crate::Error> {
+            let mut content = String::new();
+            for heading in SUMMARY_HEADINGS {
+                content.push_str(heading);
+                content.push_str("\n- fact\n");
+            }
+            Ok(crate::Response {
+                message: message("assistant", &content),
+                usage: crate::Usage::default(),
+                stop_reason: "stop".into(),
+            })
+        }
+
+        fn stream(
+            &self,
+            _req: &Request,
+            _cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> crate::StreamHandle {
+            unimplemented!()
+        }
+    }
+
+    /// A torn batch append can leave an assistant tool_call missing some of its
+    /// results. Compaction must not retain such a sequence: the provider
+    /// rejects it. The bad exchange is dropped; the turn before it survives.
+    #[test]
+    fn compact_drops_incomplete_tool_calls_from_retained() {
+        let mut tool_call = message("assistant", "");
+        tool_call.tool_calls.push(crate::ToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: "{\"path\":\"src/main.rs\"}".into(),
+        });
+        tool_call.tool_calls.push(crate::ToolCall {
+            id: "call-2".into(),
+            name: "read".into(),
+            arguments: "{\"path\":\"src/lib.rs\"}".into(),
+        });
+        let mut tool_result = message("tool", "file contents");
+        tool_result.tool_call_id = "call-1".into();
+        let entries = vec![
+            Entry::Message {
+                message: message("user", "old"),
+            },
+            Entry::Message {
+                message: message("assistant", "old answer"),
+            },
+            usage(100_000, 100),
+            Entry::Message {
+                message: message("user", "latest"),
+            },
+            Entry::Message { message: tool_call },
+            Entry::Message {
+                message: tool_result,
+            },
+        ];
+        let (_, _, retained) = compact(&SummaryProvider, "test", &entries).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].content, "latest");
     }
 
     #[test]
