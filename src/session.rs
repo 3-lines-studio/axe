@@ -73,10 +73,29 @@ pub fn now_ms() -> i64 {
 pub const COMPACTION_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 pub const COMPACTION_SUFFIX: &str = "\n</summary>";
 
+#[derive(Clone, Copy)]
+pub struct ContextOptions {
+    pub original_task: bool,
+    pub workspace_state: bool,
+}
+
+impl Default for ContextOptions {
+    fn default() -> Self {
+        Self {
+            original_task: true,
+            workspace_state: true,
+        }
+    }
+}
+
 /// Project entries into the LLM context. A compaction entry supersedes every
 /// message before it: the projection restarts from its summary plus the
 /// recent messages it retains. The entry list itself is never rewritten.
 pub fn context_messages(entries: &[Entry]) -> Vec<Message> {
+    context_messages_with(entries, ContextOptions::default())
+}
+
+pub fn context_messages_with(entries: &[Entry], options: ContextOptions) -> Vec<Message> {
     if !entries
         .iter()
         .any(|entry| matches!(entry, Entry::Compaction { .. }))
@@ -89,8 +108,20 @@ pub fn context_messages(entries: &[Entry]) -> Vec<Message> {
             })
             .collect();
     }
-    let original_task = original_task(entries);
-    let workspace = workspace_state(entries);
+    let mut sections = Vec::new();
+    if options.original_task {
+        sections.push(format!(
+            "## Authoritative Original Task\n{}",
+            original_task(entries)
+        ));
+    }
+    if options.workspace_state {
+        sections.push(format!(
+            "## Authoritative Workspace State\n{}",
+            workspace_state(entries)
+        ));
+    }
+    let extras = sections.join("\n\n");
     let mut out: Vec<Message> = Vec::new();
     for e in entries {
         match e {
@@ -98,12 +129,15 @@ pub fn context_messages(entries: &[Entry]) -> Vec<Message> {
             Entry::Compaction {
                 summary, retained, ..
             } => {
+                let content = if extras.is_empty() {
+                    format!("{COMPACTION_PREFIX}{summary}{COMPACTION_SUFFIX}")
+                } else {
+                    format!("{COMPACTION_PREFIX}{summary}\n\n{extras}{COMPACTION_SUFFIX}")
+                };
                 out.clear();
                 out.push(Message {
                     role: "user".into(),
-                    content: format!(
-                        "{COMPACTION_PREFIX}{summary}\n\n## Authoritative Original Task\n{original_task}\n\n## Authoritative Workspace State\n{workspace}{COMPACTION_SUFFIX}"
-                    ),
+                    content,
                     tool_calls: Vec::new(),
                     tool_call_id: String::new(),
                     reasoning: String::new(),
@@ -766,8 +800,8 @@ pub fn latest_context_tokens(entries: &[Entry]) -> Option<usize> {
     None
 }
 
-fn split_retained(entries: &[Entry]) -> (Vec<Message>, Vec<Message>) {
-    let msgs = context_messages(entries);
+fn split_retained(entries: &[Entry], options: ContextOptions) -> (Vec<Message>, Vec<Message>) {
+    let msgs = context_messages_with(entries, options);
     let Some(current_tokens) = latest_context_tokens(entries) else {
         return split_last_turn(msgs);
     };
@@ -996,8 +1030,17 @@ pub fn compact(
     model: &str,
     entries: &[Entry],
 ) -> Result<(String, usize, Vec<Message>), String> {
+    compact_with(provider, model, entries, ContextOptions::default())
+}
+
+pub fn compact_with(
+    provider: &impl Provider,
+    model: &str,
+    entries: &[Entry],
+    options: ContextOptions,
+) -> Result<(String, usize, Vec<Message>), String> {
     let tokens_before = latest_context_tokens(entries).unwrap_or(0);
-    let (mut retained, to_summarize) = split_retained(entries);
+    let (mut retained, to_summarize) = split_retained(entries, options);
     drop_incomplete_tool_calls(&mut retained);
     if to_summarize.is_empty() {
         return Err("nothing to summarize".into());
@@ -1195,7 +1238,7 @@ mod tests {
             },
             usage(125_000, 100),
         ];
-        let (retained, summarized) = split_retained(&entries);
+        let (retained, summarized) = split_retained(&entries, ContextOptions::default());
         assert_eq!(latest_context_tokens(&entries), Some(125_100));
         assert_eq!(retained.len(), 4);
         assert_eq!(retained[0].content, "latest");
@@ -1327,6 +1370,32 @@ mod tests {
                 .content
                 .contains("cargo test => all tests passed")
         );
+    }
+
+    #[test]
+    fn context_options_drop_original_task_and_workspace_state() {
+        let entries = vec![
+            Entry::Message {
+                message: message("user", "Fix compaction exactly"),
+            },
+            Entry::Message {
+                message: message("assistant", "done"),
+            },
+            Entry::Compaction {
+                summary: "summary".into(),
+                tokens_before: 100,
+                timestamp: 1,
+                retained: Vec::new(),
+            },
+        ];
+        let options = ContextOptions {
+            original_task: false,
+            workspace_state: false,
+        };
+        let context = context_messages_with(&entries, options);
+        assert!(context[0].content.contains("summary"));
+        assert!(!context[0].content.contains("Authoritative Original Task"));
+        assert!(!context[0].content.contains("Authoritative Workspace State"));
     }
 
     #[test]
