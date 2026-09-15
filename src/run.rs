@@ -59,7 +59,7 @@ pub trait Sink {
     fn assistant_done(&mut self) {}
     fn tool_start(&mut self, _call: &ToolCall) {}
     fn tool_delta(&mut self, _call: &ToolCall, _text: &str) {}
-    fn tool_result(&mut self, _call: &ToolCall) {}
+    fn tool_result(&mut self, _call: &ToolCall, _output: &ToolOutput, _elapsed: Duration) {}
     fn tokens(&mut self, _input: usize, _output: usize, _cached_input: usize) {}
     fn should_compact(&mut self, _input: usize, _output: usize) -> bool {
         false
@@ -251,19 +251,25 @@ fn run_tool_batch(
         for call in calls {
             interrupted |= cancelled(cancel);
             sink.tool_start(&call);
-            let output = if interrupted {
+            let (output, elapsed) = if interrupted {
                 // Synthesize a result for every un-executed call so the
                 // transcript stays valid: providers reject an assistant
                 // message whose tool_calls lack matching tool results.
-                ToolOutput::text("error: tool call not executed: the run was interrupted.")
+                (
+                    ToolOutput::text("error: tool call not executed: the run was interrupted."),
+                    Duration::ZERO,
+                )
             } else if truncated {
-                ToolOutput::text(
-                    "error: tool call not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.",
+                (
+                    ToolOutput::text(
+                        "error: tool call not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.",
+                    ),
+                    Duration::ZERO,
                 )
             } else {
                 exec(tools, &call, sink)
             };
-            sink.tool_result(&call);
+            sink.tool_result(&call, &output, elapsed);
             push_tool_result(h, call, output);
             sink.tool(turn, h.last().unwrap());
         }
@@ -285,8 +291,15 @@ fn push_tool_result(h: &mut Vec<Message>, call: ToolCall, output: ToolOutput) {
 }
 
 enum ParallelMsg {
-    Delta { idx: usize, text: String },
-    Done { idx: usize, output: ToolOutput },
+    Delta {
+        idx: usize,
+        text: String,
+    },
+    Done {
+        idx: usize,
+        output: ToolOutput,
+        elapsed: Duration,
+    },
 }
 
 fn run_parallel(
@@ -301,14 +314,17 @@ fn run_parallel(
         sink.tool_start(call);
     }
     let (ptx, prx) = std::sync::mpsc::channel::<ParallelMsg>();
-    let mut outputs: Vec<Option<ToolOutput>> = (0..calls.len()).map(|_| None).collect();
+    let mut outputs: Vec<Option<(ToolOutput, Duration)>> = (0..calls.len()).map(|_| None).collect();
     std::thread::scope(|scope| {
         for (idx, call) in calls.iter().enumerate() {
             let ptx = ptx.clone();
             let cancel = cancel.clone();
             scope.spawn(move || {
-                let output = if cancelled(&cancel) {
-                    ToolOutput::text("error: tool call not executed: the run was interrupted.")
+                let (output, elapsed) = if cancelled(&cancel) {
+                    (
+                        ToolOutput::text("error: tool call not executed: the run was interrupted."),
+                        Duration::ZERO,
+                    )
                 } else {
                     run_tool(tools, call, &mut |text| {
                         let _ = ptx.send(ParallelMsg::Delta {
@@ -317,7 +333,11 @@ fn run_parallel(
                         });
                     })
                 };
-                let _ = ptx.send(ParallelMsg::Done { idx, output });
+                let _ = ptx.send(ParallelMsg::Done {
+                    idx,
+                    output,
+                    elapsed,
+                });
             });
         }
         drop(ptx);
@@ -328,47 +348,60 @@ fn run_parallel(
                         sink.tool_delta(call, &text);
                     }
                 }
-                ParallelMsg::Done { idx, output } => outputs[idx] = Some(output),
+                ParallelMsg::Done {
+                    idx,
+                    output,
+                    elapsed,
+                } => outputs[idx] = Some((output, elapsed)),
             }
         }
     });
     for (idx, call) in calls.iter().enumerate() {
-        sink.tool_result(call);
         // Every spawned thread sends exactly one Done before the scope joins,
         // so a missing result means the thread panicked. That aborts the
         // process (release, panic = "immediate-abort") or is re-raised by
         // thread::scope (test profile) before this loop runs, so the result is
         // always present.
-        let content = outputs[idx]
+        let (content, elapsed) = outputs[idx]
             .take()
             .expect("scoped tool thread always reports a result");
+        sink.tool_result(call, &content, elapsed);
         push_tool_result(h, call.clone(), content);
         sink.tool(turn, h.last().unwrap());
     }
     !cancelled(cancel)
 }
 
-fn run_tool(tools: &[Tool], call: &ToolCall, progress: &mut dyn FnMut(&str)) -> ToolOutput {
+fn run_tool(
+    tools: &[Tool],
+    call: &ToolCall,
+    progress: &mut dyn FnMut(&str),
+) -> (ToolOutput, Duration) {
     let started = Instant::now();
     for t in tools {
         if t.name == call.name {
             let output = (t.run)(&call.arguments, progress);
+            let elapsed = started.elapsed();
             trace(format!(
                 "tool name={} elapsed_ms={} argument_bytes={} output_bytes={}",
                 call.name,
-                started.elapsed().as_millis(),
+                elapsed.as_millis(),
                 call.arguments.len(),
                 output.text.len()
             ));
-            return output;
+            return (output, elapsed);
         }
     }
+    let elapsed = started.elapsed();
     trace(format!(
         "tool name={} elapsed_ms={} unknown=true",
         call.name,
-        started.elapsed().as_millis()
+        elapsed.as_millis()
     ));
-    ToolOutput::text(format!("error: unknown tool: {}", call.name))
+    (
+        ToolOutput::text(format!("error: unknown tool: {}", call.name)),
+        elapsed,
+    )
 }
 
 fn stream<P: Provider>(
@@ -452,7 +485,7 @@ fn stream<P: Provider>(
     }
 }
 
-fn exec(tools: &[Tool], call: &ToolCall, sink: &mut dyn Sink) -> ToolOutput {
+fn exec(tools: &[Tool], call: &ToolCall, sink: &mut dyn Sink) -> (ToolOutput, Duration) {
     run_tool(tools, call, &mut |text| sink.tool_delta(call, text))
 }
 
