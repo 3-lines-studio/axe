@@ -2,7 +2,7 @@ use crate::app;
 use crate::openai::OpenAI;
 use crate::run::{self, Outcome, RunOptions, Sink};
 use crate::session;
-use crate::{Image, Message, Tool, ToolCall, Usage};
+use crate::{Image, Message, Tool, ToolCall, ToolOutput, Usage};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
@@ -2081,7 +2081,7 @@ impl Sink for RatatuiSink<'_> {
         let _ = self.sender.send(TurnEvent::ToolDelta(text.into()));
     }
 
-    fn tool_result(&mut self, call: &ToolCall) {
+    fn tool_result(&mut self, call: &ToolCall, _output: &ToolOutput, _elapsed: Duration) {
         let _ = self
             .sender
             .send(TurnEvent::ToolResult(app::tool_label(call, false)));
