@@ -79,6 +79,27 @@ tasks = [
         ),
     },
     {
+        "name": "edit-nbsp-line",
+        "files": {"data.txt": "hello\u00a0world\nsecond line\n"},
+        "prompt": "In data.txt, replace the first line with exactly 'goodbye world' as plain "
+        "ASCII text. Leave the second line unchanged.",
+        "check": lambda root, r: exact(root, "data.txt", "goodbye world\nsecond line\n"),
+    },
+    {
+        "name": "edit-large-block",
+        "files": {"gendata.txt": "".join(f"item {i}\n" for i in range(1, 61))},
+        "prompt": "In gendata.txt, replace the contiguous block from 'item 20' through "
+        "'item 40' inclusive with a single line containing exactly collapsed. "
+        "Change nothing else.",
+        "check": lambda root, r: exact(
+            root,
+            "gendata.txt",
+            "".join(f"item {i}\n" for i in range(1, 20))
+            + "collapsed\n"
+            + "".join(f"item {i}\n" for i in range(41, 61)),
+        ),
+    },
+    {
         "name": "write-subdir",
         "files": {},
         "prompt": "Create logs/app.log containing exactly ready followed by a newline.",

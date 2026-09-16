@@ -336,7 +336,7 @@ mod tests {
             old_text: "a\r\n".into(),
             new_text: "A\r\n".into(),
         }];
-        let out = apply_edits("f", body, &edits).unwrap();
+        let out = apply_edits("f", body, &edits).unwrap().content;
         assert_eq!(out, "A\r\nb\nc\r\n");
 
         // Editing the LF-only line leaves CRLF lines alone.
@@ -344,7 +344,7 @@ mod tests {
             old_text: "b".into(),
             new_text: "B\nB2".into(),
         }];
-        let out = apply_edits("f", body, &edits).unwrap();
+        let out = apply_edits("f", body, &edits).unwrap().content;
         assert_eq!(out, "a\r\nB\nB2\nc\r\n");
     }
 
@@ -355,7 +355,7 @@ mod tests {
             old_text: "two".into(),
             new_text: "TWO\nTWO2".into(),
         }];
-        let out = apply_edits("f", body, &edits).unwrap();
+        let out = apply_edits("f", body, &edits).unwrap().content;
         assert_eq!(out, "one\r\nTWO\r\nTWO2\r\nthree\r\n");
     }
 
@@ -366,7 +366,7 @@ mod tests {
             old_text: "wörld".into(),
             new_text: "planet".into(),
         }];
-        let out = apply_edits("f", body, &edits).unwrap();
+        let out = apply_edits("f", body, &edits).unwrap().content;
         assert_eq!(out, "héllo planet 🙈\nsecond\n");
     }
 
@@ -393,9 +393,88 @@ mod tests {
             new_text: "new".into(),
         }];
         assert_eq!(
-            apply_edits("f", "\u{feff}old", &edits).unwrap(),
+            apply_edits("f", "\u{feff}old", &edits).unwrap().content,
             "\u{feff}new"
         );
+    }
+
+    #[test]
+    fn edit_falls_back_to_fuzzy_match() {
+        let edits = [super::EditArg {
+            old_text: "let s = \"hi\";".into(),
+            new_text: "let s = \"bye\";".into(),
+        }];
+        let out = apply_edits("f", "let s = \u{201c}hi\u{201d};\n", &edits)
+            .unwrap()
+            .content;
+        assert_eq!(out, "let s = \"bye\";\n");
+
+        let edits = [super::EditArg {
+            old_text: "a b\nc\n".into(),
+            new_text: "X\n".into(),
+        }];
+        let out = apply_edits("f", "a b   \nc\n", &edits).unwrap().content;
+        assert_eq!(out, "X\n");
+    }
+
+    #[test]
+    fn edit_accepts_quirk_inputs() {
+        let parse = |s: &str| serde_json::from_str::<super::EditArgs>(s).unwrap();
+        assert_eq!(
+            parse(r##"{"path":"f","edits":"[{\"oldText\":\"a\",\"newText\":\"b\"}]"}"##)
+                .edits
+                .len(),
+            1
+        );
+        assert_eq!(
+            parse(r##"{"path":"f","edits":{"oldText":"a","newText":"b"}}"##)
+                .edits
+                .len(),
+            1
+        );
+        assert_eq!(
+            parse(r##"{"path":"f","oldText":"a","newText":"b"}"##)
+                .edits
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn edit_returns_unified_patch() {
+        let edits = [super::EditArg {
+            old_text: "b\n".into(),
+            new_text: "B\n".into(),
+        }];
+        let patch = apply_edits("f.txt", "a\nb\nc\n", &edits).unwrap().patch;
+        assert!(patch.contains("@@ -1,3 +1,3 @@"), "{patch}");
+        assert!(patch.contains("-b"), "{patch}");
+        assert!(patch.contains("+B"), "{patch}");
+    }
+
+    #[test]
+    fn edit_truncates_large_patch() {
+        let old: String = (0..500).map(|i| format!("old line {i}\n")).collect();
+        let new: String = (0..500).map(|i| format!("new line {i}\n")).collect();
+        let edits = [super::EditArg {
+            old_text: old.clone(),
+            new_text: new,
+        }];
+        let patch = apply_edits("f", &old, &edits).unwrap().patch;
+        assert!(patch.contains("lines omitted"), "{patch}");
+        assert!(patch.lines().count() <= 82, "{}", patch.lines().count());
+    }
+
+    #[test]
+    fn edit_fuzzy_folds_full_width() {
+        let edits = [super::EditArg {
+            old_text: "(1)".into(),
+            new_text: "(2)".into(),
+        }];
+        let out = apply_edits("f", "let x = \u{ff08}1\u{ff09};\n", &edits)
+            .unwrap()
+            .content;
+        assert_eq!(out, "let x = (2);\n");
     }
 
     #[test]
@@ -727,10 +806,62 @@ struct EditArg {
     new_text: String,
 }
 
-#[derive(Deserialize)]
 struct EditArgs {
     path: String,
     edits: Vec<EditArg>,
+}
+
+/// Models routinely send `edits` as a JSON string, a single object, or as
+/// legacy top-level `oldText`/`newText` fields. Normalize all of those to a
+/// `Vec<EditArg>` instead of rejecting the call.
+impl<'de> Deserialize<'de> for EditArgs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let obj = value
+            .as_object_mut()
+            .ok_or_else(|| D::Error::custom("expected an object"))?;
+        let path = obj
+            .remove("path")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .ok_or_else(|| D::Error::custom("missing path"))?;
+        let mut edits: Vec<EditArg> = Vec::new();
+        if let Some(value) = obj.remove("edits") {
+            let parsed = match value {
+                serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(&s)
+                    .map_err(|e| D::Error::custom(format!("edits is not valid JSON: {e}")))?,
+                other => other,
+            };
+            match parsed {
+                serde_json::Value::Null => {}
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        edits.push(serde_json::from_value(item).map_err(D::Error::custom)?);
+                    }
+                }
+                serde_json::Value::Object(_) => {
+                    edits.push(serde_json::from_value(parsed).map_err(D::Error::custom)?);
+                }
+                other => {
+                    return Err(D::Error::custom(format!(
+                        "edits must be an array, got {other}"
+                    )));
+                }
+            }
+        }
+        if let (Some(old), Some(new)) = (obj.remove("oldText"), obj.remove("newText"))
+            && let (Some(old), Some(new)) = (old.as_str(), new.as_str())
+        {
+            edits.push(EditArg {
+                old_text: old.to_string(),
+                new_text: new.to_string(),
+            });
+        }
+        Ok(EditArgs { path, edits })
+    }
 }
 
 fn normalize_lf(s: &str) -> std::borrow::Cow<'_, str> {
@@ -832,7 +963,336 @@ fn no_change_error(path: &str, total: usize) -> String {
     }
 }
 
-fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<String, String> {
+#[derive(Debug)]
+struct Applied {
+    content: String,
+    patch: String,
+}
+
+/// One edit located in a matching base (`normalized` or its fuzzy view).
+struct Matched {
+    edit: usize,
+    start: usize,
+    len: usize,
+    new_text: String,
+}
+
+/// A set of matches widened to the whole lines they touch.
+struct Group {
+    start: usize,
+    end: usize,
+    edits: Vec<usize>,
+}
+
+/// Fold characters models commonly mistype: smart quotes, unicode dashes and
+/// spaces, plus trailing whitespace per line. Newline count is preserved.
+fn normalize_fuzzy(s: &str) -> String {
+    s.split('\n')
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+        .map(|c| match c {
+            '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => '\'',
+            '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => '"',
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            '\u{a0}' | '\u{2002}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' => ' ',
+            '\u{ff01}'..='\u{ff5e}' => char::from_u32(c as u32 - 0xfee0).unwrap_or(c),
+            _ => c,
+        })
+        .collect()
+}
+
+/// Byte spans of each line, trailing newline included (like `split_inclusive`).
+fn line_spans(content: &str) -> Vec<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let mut spans = Vec::new();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            spans.push((start, i + 1));
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        spans.push((start, bytes.len()));
+    }
+    spans
+}
+
+fn split_lines(s: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = s.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    lines
+}
+
+fn fuzzy_find(content: &str, old: &str) -> Option<(usize, usize)> {
+    if let Some(start) = content.find(old) {
+        return Some((start, old.len()));
+    }
+    let fuzzy_content = normalize_fuzzy(content);
+    let fuzzy_old = normalize_fuzzy(old);
+    fuzzy_content
+        .find(&fuzzy_old)
+        .map(|start| (start, fuzzy_old.len()))
+}
+
+fn count_occurrences(content: &str, old: &str) -> usize {
+    let fuzzy_content = normalize_fuzzy(content);
+    let fuzzy_old = normalize_fuzzy(old);
+    if fuzzy_old.is_empty() {
+        return 0;
+    }
+    fuzzy_content.matches(fuzzy_old.as_str()).count()
+}
+
+fn find_exact(
+    path: &str,
+    content: &str,
+    olds: &[String],
+    news: &[String],
+) -> Result<Vec<Matched>, String> {
+    let total = olds.len();
+    let mut matched = Vec::with_capacity(total);
+    for (i, old) in olds.iter().enumerate() {
+        let Some(start) = content.find(old.as_str()) else {
+            return Err(not_found_error(path, i, total));
+        };
+        let remaining = &content[start + old.len()..];
+        if remaining.contains(old.as_str()) {
+            let n = 1 + remaining.matches(old.as_str()).count();
+            return Err(duplicate_error(path, i, total, n));
+        }
+        matched.push(Matched {
+            edit: i,
+            start,
+            len: old.len(),
+            new_text: news[i].clone(),
+        });
+    }
+    Ok(matched)
+}
+
+fn find_fuzzy(
+    path: &str,
+    base: &str,
+    olds: &[String],
+    news: &[String],
+) -> Result<Vec<Matched>, String> {
+    let total = olds.len();
+    let mut matched = Vec::with_capacity(total);
+    for (i, old) in olds.iter().enumerate() {
+        let Some((start, len)) = fuzzy_find(base, old) else {
+            return Err(not_found_error(path, i, total));
+        };
+        let n = count_occurrences(base, old);
+        if n > 1 {
+            return Err(duplicate_error(path, i, total, n));
+        }
+        matched.push(Matched {
+            edit: i,
+            start,
+            len,
+            new_text: news[i].clone(),
+        });
+    }
+    Ok(matched)
+}
+
+fn check_overlap(path: &str, matched: &mut [Matched]) -> Result<(), String> {
+    matched.sort_by_key(|m| m.start);
+    for w in matched.windows(2) {
+        if w[0].start + w[0].len > w[1].start {
+            return Err(format!(
+                "error: edits[{}] and edits[{}] overlap in {path}. Merge them into one edit or target disjoint regions.",
+                w[0].edit, w[1].edit
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn line_range(spans: &[(usize, usize)], start: usize, end: usize) -> Option<(usize, usize)> {
+    let start_line = spans.iter().position(|&(s, e)| start >= s && start < e)?;
+    let mut end_line = start_line;
+    while end_line < spans.len() && spans[end_line].1 < end {
+        end_line += 1;
+    }
+    if end_line >= spans.len() {
+        return None;
+    }
+    Some((start_line, end_line + 1))
+}
+
+fn group_regions(spans: &[(usize, usize)], matched: &[Matched]) -> Vec<Group> {
+    let mut order: Vec<usize> = (0..matched.len()).collect();
+    order.sort_by_key(|&i| matched[i].start);
+    let mut groups: Vec<Group> = Vec::new();
+    for i in order {
+        let m = &matched[i];
+        let Some((start, end)) = line_range(spans, m.start, m.start + m.len) else {
+            continue;
+        };
+        if let Some(cur) = groups.last_mut()
+            && start < cur.end
+        {
+            cur.end = cur.end.max(end);
+            cur.edits.push(i);
+            continue;
+        }
+        groups.push(Group {
+            start,
+            end,
+            edits: vec![i],
+        });
+    }
+    groups
+}
+
+/// The replacement text for a group: the base lines it covers with every
+/// matched edit applied in place, so untouched parts of a line survive.
+fn group_block(
+    source: &str,
+    spans: &[(usize, usize)],
+    group: &Group,
+    matched: &[Matched],
+) -> String {
+    let start = spans[group.start].0;
+    let end = spans[group.end - 1].1;
+    let mut block = source[start..end].to_string();
+    for &i in group.edits.iter().rev() {
+        let m = &matched[i];
+        let s = m.start - start;
+        block.replace_range(s..s + m.len, &m.new_text);
+    }
+    block
+}
+
+/// Apply exact matches in body coordinates so each region keeps its own line
+/// endings; untouched lines are never rewritten, even in mixed-ending files.
+fn apply_exact(body: &str, matched: &[Matched]) -> String {
+    let map = body.contains('\r').then(|| lf_map(body));
+    let mut out = body.to_string();
+    for m in matched.iter().rev() {
+        let bs = map.as_ref().map_or(m.start, |map| map[m.start]);
+        let be = map
+            .as_ref()
+            .map_or(m.start + m.len, |map| map[m.start + m.len]);
+        let replacement = with_ending(&m.new_text, region_ending(body, bs, be));
+        out.replace_range(bs..be, &replacement);
+    }
+    out
+}
+
+/// Apply fuzzy groups by rewriting only the touched lines; every other line is
+/// copied from the original body, endings included.
+fn apply_groups(
+    body: &str,
+    body_lines: &[(usize, usize)],
+    base: &str,
+    base_lines: &[(usize, usize)],
+    groups: &[Group],
+    matched: &[Matched],
+) -> String {
+    let mut out = String::new();
+    let mut line = 0;
+    for group in groups {
+        out.push_str(&body[body_lines[line].0..body_lines[group.start].0]);
+        let block = group_block(base, base_lines, group, matched);
+        let bs = body_lines[group.start].0;
+        let be = body_lines[group.end - 1].1;
+        out.push_str(&with_ending(&block, region_ending(body, bs, be)));
+        line = group.end;
+    }
+    let tail = body_lines.get(line).map_or(body.len(), |l| l.0);
+    out.push_str(&body[tail..]);
+    out
+}
+
+/// Cap on the patch the model sees. Beyond this, the middle is elided so a
+/// large edit cannot flood the context with its own diff.
+const MAX_PATCH_LINES: usize = 80;
+
+fn truncate_patch(patch: String) -> String {
+    let lines: Vec<&str> = patch.lines().collect();
+    if lines.len() <= MAX_PATCH_LINES {
+        return patch;
+    }
+    let head = MAX_PATCH_LINES / 2;
+    let tail = MAX_PATCH_LINES - head;
+    let omitted = lines.len() - head - tail;
+    let mut out = String::new();
+    for line in &lines[..head] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&format!("... [{omitted} lines omitted] ...\n"));
+    for line in &lines[lines.len() - tail..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Minimal unified diff over the touched line groups, with as much context as
+/// the gaps allow so hunks never overlap.
+fn unified_patch(
+    path: &str,
+    old: &str,
+    spans: &[(usize, usize)],
+    groups: &[Group],
+    blocks: &[String],
+) -> String {
+    const CONTEXT: usize = 4;
+    let line_text = |i: usize| -> &str {
+        let (s, e) = spans[i];
+        let e = if old.as_bytes()[e - 1] == b'\n' {
+            e - 1
+        } else {
+            e
+        };
+        &old[s..e]
+    };
+    let mut out = format!("--- {path}\n+++ {path}\n");
+    let mut new_offset: isize = 0;
+    for (index, group) in groups.iter().enumerate() {
+        let prev_end = if index == 0 { 0 } else { groups[index - 1].end };
+        let next_start = groups.get(index + 1).map_or(spans.len(), |n| n.start);
+        let old_start = group.start.saturating_sub(CONTEXT).max(prev_end);
+        let old_end = (group.end + CONTEXT).min(next_start);
+        let before = group.start - old_start;
+        let after = old_end - group.end;
+        let added = split_lines(&blocks[index]);
+        let old_count = before + (group.end - group.start) + after;
+        let new_start = (old_start as isize + new_offset + 1).max(1);
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            old_start + 1,
+            old_count,
+            new_start,
+            before + added.len() + after
+        ));
+        for i in old_start..group.start {
+            out.push_str(&format!(" {}\n", line_text(i)));
+        }
+        for i in group.start..group.end {
+            out.push_str(&format!("-{}\n", line_text(i)));
+        }
+        for line in &added {
+            out.push_str(&format!("+{line}\n"));
+        }
+        for i in group.end..old_end {
+            out.push_str(&format!(" {}\n", line_text(i)));
+        }
+        new_offset += added.len() as isize - (group.end - group.start) as isize;
+    }
+    truncate_patch(out)
+}
+
+fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<Applied, String> {
     if edits.is_empty() {
         return Err("error: edits must contain at least one replacement.".to_string());
     }
@@ -842,54 +1302,62 @@ fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<String, S
     };
     let normalized = normalize_lf(body);
     let mut olds = Vec::with_capacity(edits.len());
+    let mut news = Vec::with_capacity(edits.len());
     for (i, e) in edits.iter().enumerate() {
         if e.old_text.is_empty() {
             return Err(empty_old_error(path, i, edits.len()));
         }
-        olds.push(normalize_lf(&e.old_text));
+        olds.push(normalize_lf(&e.old_text).into_owned());
+        news.push(normalize_lf(&e.new_text).into_owned());
     }
-    let mut found: Vec<(usize, usize, usize)> = Vec::new();
-    for (i, old) in olds.iter().enumerate() {
-        let old = old.as_ref();
-        let (start, len) = match normalized.find(old) {
-            Some(idx) => {
-                let remaining = &normalized[idx + old.len()..];
-                if remaining.contains(old) {
-                    let n = 1 + remaining.matches(old).count();
-                    return Err(duplicate_error(path, i, edits.len(), n));
-                }
-                (idx, old.len())
-            }
-            None => return Err(not_found_error(path, i, edits.len())),
-        };
-        found.push((i, start, len));
-    }
-    found.sort_by_key(|f| f.1);
-    for w in found.windows(2) {
-        if w[0].1 + w[0].2 > w[1].1 {
-            return Err(format!(
-                "error: edits[{}] and edits[{}] overlap in {path}. Merge them into one edit or target disjoint regions.",
-                w[0].0, w[1].0
-            ));
+
+    // Exact match first. Only when some edit cannot be found exactly do we
+    // retry once against a fuzzy-normalized view of the same content.
+    if olds.iter().all(|old| normalized.contains(old.as_str())) {
+        let mut matched = find_exact(path, &normalized, &olds, &news)?;
+        check_overlap(path, &mut matched)?;
+        let spans = line_spans(&normalized);
+        let groups = group_regions(&spans, &matched);
+        let blocks: Vec<String> = groups
+            .iter()
+            .map(|g| group_block(&normalized, &spans, g, &matched))
+            .collect();
+        let patch = unified_patch(path, &normalized, &spans, &groups, &blocks);
+        let out = apply_exact(body, &matched);
+        if out == body {
+            return Err(no_change_error(path, edits.len()));
         }
+        return Ok(Applied {
+            content: format!("{bom}{out}"),
+            patch,
+        });
     }
-    // Apply in body coordinates so each region keeps its own line endings:
-    // untouched lines are never rewritten, even in files with mixed endings.
-    let map = body.contains('\r').then(|| lf_map(body));
-    let mut out = body.to_string();
-    for &(i, start, len) in found.iter().rev() {
-        let bs = map.as_ref().map_or(start, |map| map[start]);
-        let be = map.as_ref().map_or(start + len, |map| map[start + len]);
-        let replacement = with_ending(
-            &normalize_lf(&edits[i].new_text),
-            region_ending(body, bs, be),
-        );
-        out.replace_range(bs..be, &replacement);
+
+    let base = normalize_fuzzy(&normalized);
+    let mut matched = find_fuzzy(path, &base, &olds, &news)?;
+    check_overlap(path, &mut matched)?;
+    let body_lines = line_spans(body);
+    let base_lines = line_spans(&base);
+    if body_lines.len() != base_lines.len() {
+        return Err(format!(
+            "error: cannot match edits in {path}: the file mixes line endings in a way that prevents safe reconstruction."
+        ));
     }
+    let groups = group_regions(&base_lines, &matched);
+    let blocks: Vec<String> = groups
+        .iter()
+        .map(|g| group_block(&base, &base_lines, g, &matched))
+        .collect();
+    let spans = line_spans(&normalized);
+    let patch = unified_patch(path, &normalized, &spans, &groups, &blocks);
+    let out = apply_groups(body, &body_lines, &base, &base_lines, &groups, &matched);
     if out == body {
         return Err(no_change_error(path, edits.len()));
     }
-    Ok(format!("{bom}{out}"))
+    Ok(Applied {
+        content: format!("{bom}{out}"),
+        patch,
+    })
 }
 
 const EDIT_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.","items":{"type":"object","properties":{"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},"newText":{"type":"string","description":"Replacement text for this targeted edit."}},"required":["oldText","newText"]}}},"required":["path","edits"]}"#;
@@ -906,10 +1374,16 @@ pub fn edit() -> Tool {
             match std::fs::read_to_string(&a.path) {
                 Err(e) => format!("error: {e}"),
                 Ok(s) => match apply_edits(&a.path, &s, &a.edits) {
-                    Ok(out) => {
+                    Ok(applied) => {
                         let n = a.edits.len();
-                        match crate::atomic_write(std::path::Path::new(&a.path), out.as_bytes()) {
-                            Ok(()) => format!("Successfully replaced {n} block(s) in {}.", a.path),
+                        match crate::atomic_write(
+                            std::path::Path::new(&a.path),
+                            applied.content.as_bytes(),
+                        ) {
+                            Ok(()) => format!(
+                                "Successfully replaced {n} block(s) in {}.\n\n{}",
+                                a.path, applied.patch
+                            ),
                             Err(e) => format!("error: {e}"),
                         }
                     }

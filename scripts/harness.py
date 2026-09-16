@@ -515,6 +515,95 @@ def oneshot_write_workdir(h, axe):
         check((h.work / "out.txt").read_text() == "hi", "write ran in wrong dir")
 
 
+def edit_result(srv):
+    return body_msg(srv, 1, "tool")[-1]["content"]
+
+
+@case
+def oneshot_edit_patch(h, axe):
+    (h.work / "f.txt").write_text("a\nb\nc\n")
+    scenario = [
+        {
+            "stream": [
+                tool_chunk("edit", {"path": "f.txt", "edits": [{"oldText": "b\n", "newText": "B\n"}]}),
+                usage_chunk(10, 5),
+            ]
+        },
+        {"stream": [content_chunk("done", "stop"), usage_chunk(20, 8)]},
+    ]
+    with h.mock(scenario) as srv:
+        p = h.oneshot(axe, ["edit it"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+        result = edit_result(srv)
+    check((h.work / "f.txt").read_text() == "a\nB\nc\n", (h.work / "f.txt").read_text())
+    check("Successfully replaced 1 block(s)" in result, result)
+    check("--- f.txt" in result and "+++ f.txt" in result, result)
+    check("-b" in result and "+B" in result, result)
+
+
+@case
+def oneshot_edit_fuzzy(h, axe):
+    (h.work / "f.txt").write_text("let x = \uff08hi\uff09;\n")
+    scenario = [
+        {
+            "stream": [
+                tool_chunk("edit", {"path": "f.txt", "edits": [{"oldText": "(hi)", "newText": "(bye)"}]}),
+                usage_chunk(10, 5),
+            ]
+        },
+        {"stream": [content_chunk("done", "stop"), usage_chunk(20, 8)]},
+    ]
+    with h.mock(scenario) as srv:
+        p = h.oneshot(axe, ["edit it"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+    check(
+        (h.work / "f.txt").read_text() == "let x = (bye);\n",
+        repr((h.work / "f.txt").read_text()),
+    )
+
+
+@case
+def oneshot_edit_quirk_string(h, axe):
+    (h.work / "f.txt").write_text("a\nb\nc\n")
+    edits = json.dumps([{"oldText": "b\n", "newText": "B\n"}])
+    scenario = [
+        {
+            "stream": [
+                tool_chunk("edit", {"path": "f.txt", "edits": edits}),
+                usage_chunk(10, 5),
+            ]
+        },
+        {"stream": [content_chunk("done", "stop"), usage_chunk(20, 8)]},
+    ]
+    with h.mock(scenario) as srv:
+        p = h.oneshot(axe, ["edit it"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+    check((h.work / "f.txt").read_text() == "a\nB\nc\n", repr((h.work / "f.txt").read_text()))
+
+
+@case
+def oneshot_edit_patch_truncated(h, axe):
+    old = "".join("old line %d\n" % i for i in range(300))
+    new = "".join("new line %d\n" % i for i in range(300))
+    (h.work / "f.txt").write_text(old)
+    scenario = [
+        {
+            "stream": [
+                tool_chunk("edit", {"path": "f.txt", "edits": [{"oldText": old, "newText": new}]}),
+                usage_chunk(10, 5),
+            ]
+        },
+        {"stream": [content_chunk("done", "stop"), usage_chunk(20, 8)]},
+    ]
+    with h.mock(scenario) as srv:
+        p = h.oneshot(axe, ["edit it"], base=srv.base_url)
+        check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
+        result = edit_result(srv)
+    check((h.work / "f.txt").read_text() == new, "large edit not applied")
+    check("lines omitted" in result, result[:300] + " ... " + result[-300:])
+    check(result.count("\n") <= 84, "patch not bounded: %d lines" % result.count("\n"))
+
+
 @case
 def oneshot_flags_and_config(h, axe):
     h.write_config('base = "http://127.0.0.1:9"\nmodel = "cfg-model"\n')
