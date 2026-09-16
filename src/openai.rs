@@ -128,7 +128,7 @@ impl OpenAI {
 /// carries images.
 fn message_content(m: &Message) -> Option<Value> {
     if m.images.is_empty() {
-        if m.content.is_empty() && m.role != "tool" {
+        if m.content.is_empty() && m.role != "assistant" && m.role != "tool" {
             return None;
         }
         return Some(Value::String(m.content.clone()));

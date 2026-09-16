@@ -286,3 +286,79 @@ fn openai_error_status() {
     assert!(msg.contains("openai: 401"), "got: {msg}");
     assert!(msg.contains("Invalid API key"), "got: {msg}");
 }
+
+#[test]
+fn openai_empty_assistant_keeps_content() {
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let (mut sock, _) = server.accept().unwrap();
+        let mut req = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = sock.read(&mut buf).unwrap();
+            req.extend_from_slice(&buf[..n]);
+            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header_end = req
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let cl: usize = String::from_utf8_lossy(&req[..header_end])
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.eq_ignore_ascii_case("content-length") {
+                    v.trim().parse().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        while req.len() < header_end + cl {
+            let n = sock.read(&mut buf).unwrap();
+            req.extend_from_slice(&buf[..n]);
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(&req[header_end..header_end + cl]).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"], "");
+        assert_eq!(msgs[1].get("tool_calls"), None);
+        let resp = br#"{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":0}}}"#;
+        let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: ");
+        let _ = sock.write_all(resp.len().to_string().as_bytes());
+        let _ = sock.write_all(b"\r\nConnection: close\r\n\r\n");
+        let _ = sock.write_all(resp);
+    });
+
+    let p = OpenAI::new(format!("http://{addr}"), "k1");
+    let req = Request {
+        model: "m1",
+        system: "",
+        messages: &[
+            Message {
+                role: "user".into(),
+                content: "hi".into(),
+                tool_calls: Vec::new(),
+                tool_call_id: String::new(),
+                reasoning: String::new(),
+                images: Vec::new(),
+            },
+            Message {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: String::new(),
+                reasoning: String::new(),
+                images: Vec::new(),
+            },
+        ],
+        tools: &[],
+    };
+    p.complete(&req).unwrap();
+    handle.join().unwrap();
+}
