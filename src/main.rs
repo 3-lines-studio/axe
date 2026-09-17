@@ -441,11 +441,16 @@ fn work_dir(cfg: &Config) -> String {
 }
 
 fn resolve_system(cfg: &Config, tools: &[Tool]) -> String {
-    if cfg.system.is_empty() {
-        axe::system_prompt(tools, &work_dir(cfg))
-    } else {
-        cfg.system.clone()
+    if !cfg.system.is_empty() {
+        return cfg.system.clone();
     }
+    let mut out = axe::system_prompt(tools);
+    out.push_str(&format!("\nCurrent working directory: {}", work_dir(cfg)));
+    if let Some(user) = axe::user_system_prompt() {
+        out.push_str("\n\n");
+        out.push_str(&user);
+    }
+    out
 }
 
 fn axe_root() -> String {
@@ -572,6 +577,13 @@ fn fmt_dur(d: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axe::new_tool;
+
+    fn tool(name: &'static str, snippet: &'static str) -> Tool {
+        let mut tool = new_tool(name, "", "{}", |_: ()| String::new());
+        tool.snippet = snippet;
+        tool
+    }
 
     fn empty_config() -> FileConfig {
         FileConfig {
@@ -762,5 +774,21 @@ mod tests {
         assert_eq!(c.base, expect("base"), "base round-trip");
         assert_eq!(c.model, expect("model"), "model round-trip");
         assert_eq!(c.api_key, expect("api_key"), "api_key round-trip");
+    }
+
+    #[test]
+    fn default_system_prompt_is_the_tool_list() {
+        let tools = vec![tool("bash", "run a command"), tool("edit", "")];
+        let cfg = Config {
+            base: String::new(),
+            model: String::new(),
+            system: String::new(),
+            dir: "/tmp/work".into(),
+            resume: None,
+            images: Vec::new(),
+        };
+        let head =
+            "Available tools:\n- bash: run a command\n\nCurrent working directory: /tmp/work";
+        assert!(resolve_system(&cfg, &tools).starts_with(head));
     }
 }
