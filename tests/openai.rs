@@ -302,11 +302,7 @@ fn openai_empty_assistant_keeps_content() {
                 break;
             }
         }
-        let header_end = req
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .unwrap()
-            + 4;
+        let header_end = req.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         let cl: usize = String::from_utf8_lossy(&req[..header_end])
             .lines()
             .find_map(|l| {

@@ -694,10 +694,7 @@ impl App {
                         for chunk in wrap_input_line(line, width.saturating_sub(2)) {
                             lines.push(Line::from(vec![
                                 Span::styled("┃ ", Style::default()),
-                                Span::styled(
-                                    chunk,
-                                    Style::default().add_modifier(Modifier::BOLD),
-                                ),
+                                Span::styled(chunk, Style::default().add_modifier(Modifier::BOLD)),
                             ]));
                         }
                     }
