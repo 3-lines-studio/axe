@@ -295,7 +295,7 @@ fn match_assignment(s: &str, i: usize) -> Option<(usize, usize, String)> {
     let value_start = if gap < b.len() && (b[gap] == b'=' || b[gap] == b':') {
         let sep = b[gap];
         let mut v = gap + 1;
-        while v < b.len() && b[v].is_ascii_whitespace() {
+        while v < b.len() && matches!(b[v], b' ' | b'\t') {
             v += 1;
         }
         (v, sep)
@@ -345,9 +345,11 @@ fn looks_like_value(token: &str) -> bool {
 }
 
 fn starts_with_secret_prefix(token: &str) -> bool {
-    PREFIXES
-        .iter()
-        .any(|p| token.len() >= p.len() && token[..p.len()].eq_ignore_ascii_case(p))
+    PREFIXES.iter().any(|p| {
+        token
+            .get(..p.len())
+            .is_some_and(|h| h.eq_ignore_ascii_case(p))
+    })
 }
 
 /// An env-style key (`UPPER_CASE`), where a bare value is taken at face value.
@@ -582,6 +584,18 @@ mod tests {
         assert_eq!(
             sentinel().redact("Authorization: Basic dXNlcjpwYXNzd29yZA=="),
             "Authorization: [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn empty_assignment_does_not_eat_the_next_line() {
+        assert_eq!(
+            sentinel().redact("TRANSCRIBE_API_KEY=\n# comentario"),
+            "TRANSCRIBE_API_KEY=\n# comentario"
+        );
+        assert_eq!(
+            sentinel().redact("API_KEY=\nport = 8080"),
+            "API_KEY=\nport = 8080"
         );
     }
 

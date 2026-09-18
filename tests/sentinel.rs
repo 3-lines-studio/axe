@@ -139,9 +139,34 @@ fn malformed_input_does_not_panic() {
         "-----END b",
         "=\":",
         "\\\\",
+        "password abá",
+        "password abcá",
+        "token abcá",
+        "api_key 1á2b",
+        "password a✓x",
+        "passwd éx",
     ];
     let s = sentinel();
     for input in inputs {
+        let once = s.redact(input);
+        assert_eq!(s.redact(&once), once, "not idempotent: {input:?}");
+    }
+}
+
+#[test]
+fn multibyte_values_do_not_panic() {
+    let s = sentinel();
+    for input in [
+        "password abá",
+        "password abcá",
+        "token abcá",
+        "api_key 1á2b",
+        "password a✓x",
+        "passwd éx",
+        "secret 12á3",
+        "Authorization: ánonimo",
+        "run --token abá --verbose",
+    ] {
         let once = s.redact(input);
         assert_eq!(s.redact(&once), once, "not idempotent: {input:?}");
     }
