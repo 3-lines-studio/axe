@@ -407,6 +407,9 @@ fn redact_value(s: &str, start: usize) -> (usize, String) {
         while m < b.len() && b[m].is_ascii_whitespace() {
             m += 1;
         }
+        if s[m..].starts_with(REDACTED) {
+            return (m + REDACTED.len(), REDACTED.to_string());
+        }
         let mut n = m;
         while n < b.len() && !is_value_break(b[n]) {
             n += 1;
@@ -566,6 +569,18 @@ mod tests {
     fn basic_auth_is_replaced() {
         assert_eq!(
             sentinel().redact("Authorization: Basic dXNlcjpwYXNz"),
+            "Authorization: [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn bearer_credential_is_not_double_redacted() {
+        assert_eq!(
+            sentinel().redact("Authorization: Bearer ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
+            "Authorization: [REDACTED]"
+        );
+        assert_eq!(
+            sentinel().redact("Authorization: Basic dXNlcjpwYXNzd29yZA=="),
             "Authorization: [REDACTED]"
         );
     }
