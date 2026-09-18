@@ -293,27 +293,31 @@ fn match_assignment(s: &str, i: usize) -> Option<(usize, usize, String)> {
         gap += 1;
     }
     let value_start = if gap < b.len() && (b[gap] == b'=' || b[gap] == b':') {
+        let sep = b[gap];
         let mut v = gap + 1;
         while v < b.len() && b[v].is_ascii_whitespace() {
             v += 1;
         }
-        v
+        (v, sep)
     } else if gap > j {
-        let token = bare_token(s, gap);
-        if key.starts_with("--")
-            || token.eq_ignore_ascii_case("bearer")
-            || token.eq_ignore_ascii_case("basic")
-            || looks_like_value(token)
-        {
-            gap
-        } else {
-            return None;
-        }
+        (gap, 0)
     } else {
         return None;
     };
+    let (value_start, sep) = value_start;
     if value_start >= b.len() || s[value_start..].starts_with(REDACTED) {
         return None;
+    }
+    if !matches!(b[value_start], b'"' | b'\'') {
+        let token = bare_token(s, value_start);
+        let allowed = key.starts_with("--")
+            || (sep == b'=' && env_style_key(key))
+            || token.eq_ignore_ascii_case("bearer")
+            || token.eq_ignore_ascii_case("basic")
+            || looks_like_value(token);
+        if !allowed {
+            return None;
+        }
     }
     let (value_end, repl) = redact_value(s, value_start);
     if value_end == value_start {
@@ -332,9 +336,52 @@ fn bare_token(s: &str, start: usize) -> &str {
 }
 
 /// A whitespace-separated value (no `=`/`:`), such as a `.netrc` password.
-/// Gated so prose like `the password is ...` is left alone.
+/// Gated so prose (`the password is ...`) and code identifiers (`bare_token`)
+/// are left alone: a value must carry a digit or a known token prefix.
 fn looks_like_value(token: &str) -> bool {
-    token.len() >= 6 && token.chars().any(|c| !c.is_ascii_alphabetic())
+    let has_digit = token.chars().any(|c| c.is_ascii_digit());
+    let has_alpha = token.chars().any(|c| c.is_ascii_alphabetic());
+    (token.len() >= 6 && has_digit && has_alpha) || starts_with_secret_prefix(token)
+}
+
+fn starts_with_secret_prefix(token: &str) -> bool {
+    PREFIXES
+        .iter()
+        .any(|p| token.len() >= p.len() && token[..p.len()].eq_ignore_ascii_case(p))
+}
+
+/// An env-style key (`UPPER_CASE`), where a bare value is taken at face value.
+fn env_style_key(key: &str) -> bool {
+    key.bytes().any(|c| c.is_ascii_alphabetic())
+        && key
+            .bytes()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+}
+
+/// Split an identifier into lowercase words on separators and camelCase, so
+/// `KeyCode` is `[key, code]` and `input_tokens` is `[input, tokens]`.
+fn key_words(raw: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for c in raw.chars() {
+        if !c.is_ascii_alphanumeric() {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_ascii_uppercase() && prev_lower && !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+        }
+        prev_lower = c.is_ascii_lowercase();
+        cur.push(c.to_ascii_lowercase());
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
 }
 
 fn redact_value(s: &str, start: usize) -> (usize, String) {
@@ -380,30 +427,41 @@ fn is_key_byte(c: u8) -> bool {
 }
 
 fn is_sensitive_key(raw: &str) -> bool {
-    let key = raw.to_lowercase().replace(['_', '-'], "");
-    if key.is_empty() {
-        return false;
-    }
-    const MARKERS: &[&str] = &[
-        "secret",
-        "token",
+    const WORDS: &[&str] = &[
         "password",
         "passwd",
+        "pwd",
         "passphrase",
+        "secret",
+        "token",
         "credential",
         "creds",
         "auth",
+        "authorization",
         "cookie",
         "apikey",
-        "pwd",
+        "privatekey",
+        "accesskey",
+        "bearer",
     ];
-    if MARKERS.iter().any(|m| key.contains(m)) {
+    const COMPOUNDS: &[&str] = &[
+        "apikey",
+        "privatekey",
+        "accesskey",
+        "secretkey",
+        "signingkey",
+        "encryptionkey",
+        "clientsecret",
+    ];
+    if key_words(raw).iter().any(|w| WORDS.contains(&w.as_str())) {
         return true;
     }
-    key.contains("key")
-        && !key.contains("keyboard")
-        && !key.contains("keynote")
-        && !key.contains("keyword")
+    let joined: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    COMPOUNDS.iter().any(|c| joined.contains(c))
 }
 
 #[cfg(test)]
@@ -422,6 +480,19 @@ mod tests {
             sentinel().redact("key is hunter2-secret-value ok"),
             "key is [REDACTED] ok"
         );
+    }
+
+    #[test]
+    fn known_values_match_longest_first_and_skip_short() {
+        let mut s = Sentinel::new();
+        s.add_value("abcdef");
+        s.add_value("abcdefgh");
+        s.add_value("abcdef");
+        assert_eq!(s.redact("x abcdefgh y"), "x [REDACTED] y");
+        assert_eq!(s.redact("z abcdef w"), "z [REDACTED] w");
+        let mut short = Sentinel::new();
+        short.add_value("ab");
+        assert_eq!(short.redact("ab"), "ab");
     }
 
     #[test]
