@@ -26,12 +26,14 @@ struct FileConfig {
 }
 
 fn main() {
+    axe::set_non_dumpable();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.as_slice(), [arg] if arg == "-V" || arg == "--version") {
         println!("axe {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     let fc = load_config();
+    axe::sentinel::seed(&api_key(&fc));
     let (cfg, prompt) = match parse_args(&args, &fc) {
         Ok(x) => x,
         Err(e) => {
@@ -279,7 +281,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     }
     history.push(Message {
         role: "user".into(),
-        content: prompt.join(" "),
+        content: axe::sentinel::redact(&prompt.join(" ")),
         tool_calls: Vec::new(),
         tool_call_id: String::new(),
         reasoning: String::new(),

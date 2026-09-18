@@ -313,6 +313,47 @@ fn run_executes_tools_and_returns_transcript() {
     assert_eq!(last[2].content, "HI");
 }
 
+#[test]
+fn loop_redacts_secrets_from_tool_output_and_user_input() {
+    let leak = new_tool("leak", "returns a secret", "{}", |_: Empty| {
+        "PASSWORD=hunter2\nconnect postgres://user:s3cr3t@db/x".to_string()
+    });
+    let p = Fake {
+        responses: RefCell::new(VecDeque::from([
+            Response {
+                message: call_tool("c1", "leak", "{}"),
+                usage: Usage::default(),
+                stop_reason: String::new(),
+            },
+            Response {
+                message: assistant("done"),
+                usage: Usage::default(),
+                stop_reason: String::new(),
+            },
+        ])),
+        ..Default::default()
+    };
+    let mut a = TestAgent::new(p).tools(vec![leak]).max_turns(5);
+    let out = a
+        .run(&[user("my key is sk-abcdefghijklmnopqrstuvwxyz")])
+        .expect("run");
+
+    assert_eq!(out[0].content, "my key is [REDACTED]");
+    assert_eq!(out[2].role, "tool");
+    assert_eq!(
+        out[2].content,
+        "PASSWORD=[REDACTED]\nconnect postgres://[REDACTED]@db/x"
+    );
+
+    let reqs = a.provider().requests.borrow();
+    let last = reqs.last().unwrap();
+    assert_eq!(last[0].content, "my key is [REDACTED]");
+    assert_eq!(
+        last[2].content,
+        "PASSWORD=[REDACTED]\nconnect postgres://[REDACTED]@db/x"
+    );
+}
+
 #[derive(Deserialize)]
 struct Empty {}
 

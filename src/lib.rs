@@ -18,6 +18,7 @@ mod http;
 pub mod image;
 pub mod openai;
 pub mod run;
+pub mod sentinel;
 pub mod session;
 pub mod tools;
 pub mod tui;
@@ -58,6 +59,21 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(|h| std::path::PathBuf::from(h).join(".config"))
+}
+
+/// Make this process non-dumpable so a same-uid child cannot read its initial
+/// environment (or memory) through `/proc/<pid>/environ`. Linux only; other
+/// platforms have no `/proc` and no-op.
+#[cfg(target_os = "linux")]
+pub fn set_non_dumpable() -> bool {
+    // SAFETY: prctl(PR_SET_DUMPABLE, 0) takes no pointers, cannot fail
+    // unsafely, and only lowers this process's ptrace reachability.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) == 0 }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_non_dumpable() -> bool {
+    false
 }
 
 /// Write via temp file + rename in the destination directory so a crash or
@@ -435,6 +451,45 @@ pub struct Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn non_dumpable_helper() {
+        assert!(set_non_dumpable());
+        let pid = std::process::id();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("cat /proc/{pid}/environ"))
+            .output()
+            .unwrap();
+        let leaked = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !leaked.contains("AXE_SECRET_TEST_TOKEN"),
+            "environ leaked: {leaked}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_dumpable_blocks_child_environ_read() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "tests::non_dumpable_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("AXE_SECRET_TEST_TOKEN", "leaky-value")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "helper failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 
     #[test]
     fn atomic_write_roundtrip() {

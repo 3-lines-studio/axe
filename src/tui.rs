@@ -694,10 +694,7 @@ impl App {
                         for chunk in wrap_input_line(line, width.saturating_sub(2)) {
                             lines.push(Line::from(vec![
                                 Span::styled("┃ ", Style::default()),
-                                Span::styled(
-                                    chunk,
-                                    Style::default().add_modifier(Modifier::BOLD),
-                                ),
+                                Span::styled(chunk, Style::default().add_modifier(Modifier::BOLD)),
                             ]));
                         }
                     }
@@ -1253,12 +1250,13 @@ impl App {
             return;
         }
         let images = std::mem::take(&mut self.attachments);
-        let content = std::mem::take(&mut self.input);
+        let raw = std::mem::take(&mut self.input);
+        let content = crate::sentinel::redact(&raw);
         self.cursor = 0;
         self.history_index = None;
-        self.history.push(content.clone());
+        self.history.push(raw.clone());
         self.entries.push(Entry::User {
-            text: content.clone(),
+            text: raw,
             images: images.iter().map(crate::image::label).collect(),
         });
         if self.running {
