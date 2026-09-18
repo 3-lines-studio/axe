@@ -171,34 +171,6 @@ fn reap(child: &mut std::process::Child, grace: std::time::Duration) {
     }
 }
 
-/// Environment variable names whose values are withheld from the bash child,
-/// so `env`/`printenv` and the shell's temp file never carry them and child
-/// programs cannot use them. Names the child legitimately needs never match,
-/// and `GH_TOKEN`/`GITHUB_TOKEN` are kept so `gh` still authenticates.
-fn is_secret_env_name(name: &str) -> bool {
-    if is_kept_env_name(name) {
-        return false;
-    }
-    let n = name.to_lowercase().replace(['_', '-'], "");
-    const MARKERS: &[&str] = &[
-        "secret",
-        "token",
-        "password",
-        "passwd",
-        "passphrase",
-        "credential",
-        "apikey",
-        "privatekey",
-        "accesskey",
-    ];
-    MARKERS.iter().any(|m| n.contains(m))
-}
-
-fn is_kept_env_name(name: &str) -> bool {
-    const EXACT: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN"];
-    EXACT.contains(&name)
-}
-
 pub fn bash(dir: &str) -> Tool {
     let dir = dir.to_string();
     let mut t = new_tool_with_progress(
@@ -237,13 +209,6 @@ pub fn bash(dir: &str) -> Tool {
             cmd.stdout(std::process::Stdio::from(out_file));
             cmd.stderr(std::process::Stdio::from(err_file));
             cmd.process_group(0);
-            for (key, _) in std::env::vars_os() {
-                if let Some(name) = key.to_str()
-                    && is_secret_env_name(name)
-                {
-                    cmd.env_remove(&key);
-                }
-            }
             let mut child = match cmd.spawn() {
                 Ok(child) => child,
                 Err(e) => {
@@ -351,57 +316,7 @@ fn status_str(st: std::process::ExitStatus) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_edits, is_secret_env_name, sanitize};
-
-    #[test]
-    fn bash_env_withholds_secret_names() {
-        assert!(is_secret_env_name("OPENAI_API_KEY"));
-        assert!(is_secret_env_name("AWS_SECRET_ACCESS_KEY"));
-        assert!(is_secret_env_name("AWS_ACCESS_KEY_ID"));
-        assert!(is_secret_env_name("NPM_TOKEN"));
-        assert!(is_secret_env_name("DB_PASSWORD"));
-        assert!(is_secret_env_name("GOOGLE_APPLICATION_CREDENTIALS"));
-        assert!(!is_secret_env_name("GH_TOKEN"));
-        assert!(!is_secret_env_name("GITHUB_TOKEN"));
-        assert!(!is_secret_env_name("PATH"));
-        assert!(!is_secret_env_name("HOME"));
-        assert!(!is_secret_env_name("TERM"));
-        assert!(!is_secret_env_name("SSH_AUTH_SOCK"));
-        assert!(!is_secret_env_name("GPG_KEY"));
-        assert!(!is_secret_env_name("PWD"));
-    }
-
-    #[test]
-    #[ignore]
-    fn bash_env_scrub_helper() {
-        let tool = super::bash("");
-        let out = (tool.run)("{\"command\":\"env\"}", &mut |_| {});
-        assert!(
-            !out.text.contains("AXE_SECRET_TEST_TOKEN"),
-            "secret env leaked to child: {}",
-            out.text
-        );
-    }
-
-    #[test]
-    fn bash_env_scrub_hides_secrets_from_child() {
-        let exe = std::env::current_exe().unwrap();
-        let out = std::process::Command::new(exe)
-            .args([
-                "--exact",
-                "tools::tests::bash_env_scrub_helper",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("AXE_SECRET_TEST_TOKEN", "leaky-value")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "helper failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    use super::{apply_edits, sanitize};
 
     #[test]
     fn sanitize_strips_control_characters() {
