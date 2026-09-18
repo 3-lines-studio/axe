@@ -2,6 +2,7 @@
 //! repeat. It never mutates its input; the transcript it builds is
 //! append-only. Compaction and steering live outside this module.
 
+use crate::sentinel;
 use crate::{
     Error, Message, Provider, Request, Response, StreamEvent, Tool, ToolCall, ToolOutput, Usage,
 };
@@ -106,7 +107,7 @@ pub fn run_stream<P: Provider>(
     sink: &mut dyn Sink,
 ) -> RunEnd {
     let started = Instant::now();
-    let mut h = msgs.to_vec();
+    let mut h: Vec<Message> = msgs.iter().map(sentinel::redact_message).collect();
     let mut usage = Usage::default();
     let mut context = Usage::default();
     trace(format!(
@@ -220,7 +221,7 @@ pub fn run_stream<P: Provider>(
 fn user_message(text: String) -> Message {
     Message {
         role: "user".into(),
-        content: text,
+        content: sentinel::redact(&text),
         tool_calls: Vec::new(),
         tool_call_id: String::new(),
         reasoning: String::new(),
@@ -282,7 +283,7 @@ fn run_tool_batch(
 fn push_tool_result(h: &mut Vec<Message>, call: ToolCall, output: ToolOutput) {
     h.push(Message {
         role: "tool".into(),
-        content: output.text,
+        content: sentinel::redact(&output.text),
         tool_calls: Vec::new(),
         tool_call_id: call.id,
         reasoning: String::new(),
