@@ -22,6 +22,7 @@ const TRANSFER_TIMEOUT: i64 = 30;
 const MAX_SEARCH: usize = 2 * 1024 * 1024;
 const MAX_PAGE: usize = 8 * 1024 * 1024;
 const MAX_MARKDOWN: usize = 32 * 1024;
+const MAX_LINKS: usize = 40;
 const MIN_TEXT: usize = 200;
 const RENDER_BUDGET_MS: u64 = 4000;
 const RENDER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -42,20 +43,22 @@ struct Page {
 #[derive(Deserialize)]
 struct SearchArgs {
     query: String,
+    count: Option<usize>,
 }
 
 pub fn search() -> Tool {
     let mut tool = new_tool(
         "search",
         "Search the web. Returns a numbered list of results with title, URL and snippet; read one with fetch.",
-        r#"{"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]}"#,
+        r#"{"type":"object","properties":{"query":{"type":"string","description":"Search query"},"count":{"type":"integer","description":"How many results to return (default 8)"}},"required":["query"]}"#,
         |a: SearchArgs| {
             let query = a.query.trim();
             if query.is_empty() {
                 return "error: empty query".to_string();
             }
+            let count = a.count.unwrap_or(RESULTS).clamp(1, RESULTS * 4);
             match run_search(query) {
-                Ok(items) => format_results(&items),
+                Ok(items) => format_results(&items, count),
                 Err(error) => format!("error: {error}"),
             }
         },
@@ -72,7 +75,7 @@ struct FetchArgs {
 pub fn fetch() -> Tool {
     let mut tool = new_tool(
         "fetch",
-        "Fetch a URL and return it as Markdown. HTML goes through readability extraction, so you get the content and not the chrome. Pages that need JavaScript are rendered when a browser is available.",
+        "Fetch a URL and return it as Markdown. HTML goes through readability extraction, so you get the content and not the chrome. Pages that need JavaScript are rendered when a browser is available. The links found on the page are listed at the end.",
         r#"{"type":"object","properties":{"url":{"type":"string","description":"HTTP or HTTPS URL"}},"required":["url"]}"#,
         |a: FetchArgs| {
             let url = a.url.trim();
@@ -97,12 +100,12 @@ fn run_search(query: &str) -> Result<Vec<Item>, String> {
     Ok(parse(&decode(&page.body, &page.content_type)))
 }
 
-fn format_results(items: &[Item]) -> String {
+fn format_results(items: &[Item], count: usize) -> String {
     if items.is_empty() {
         return "no results".to_string();
     }
     let mut out = String::new();
-    for (index, item) in items.iter().take(RESULTS).enumerate() {
+    for (index, item) in items.iter().take(count).enumerate() {
         let snippet = item
             .snippet
             .split_whitespace()
@@ -122,20 +125,19 @@ fn run_fetch(url: &str) -> Result<String, String> {
     if !is_html(&page.content_type) {
         return plain_or_error(&page);
     }
-    let html = decode(&page.body, &page.content_type);
-    let (title, markdown) = extract(&html, &page.url)?;
-    if markdown.chars().count() >= MIN_TEXT {
-        return Ok(compose(&title, &markdown));
-    }
 
-    let Some(rendered) = render(url) else {
-        return Ok(compose(&title, &markdown));
-    };
-    let (rendered_title, rendered_markdown) = extract(&rendered, &page.url)?;
-    if rendered_markdown.trim().is_empty() {
-        return Ok(compose(&title, &markdown));
+    let mut html = decode(&page.body, &page.content_type);
+    let (mut title, mut markdown) = extract(&html, &page.url)?;
+    if markdown.chars().count() < MIN_TEXT
+        && let Some(rendered) = render(url)
+        && let Ok((rendered_title, rendered_markdown)) = extract(&rendered, &page.url)
+        && !rendered_markdown.trim().is_empty()
+    {
+        title = rendered_title;
+        markdown = rendered_markdown;
+        html = rendered;
     }
-    Ok(compose(&rendered_title, &rendered_markdown))
+    Ok(compose(&title, &markdown, &page_links(&html, &page.url)))
 }
 
 /// Readability first, then Markdown. Returns the article title and body.
@@ -147,7 +149,7 @@ fn extract(html: &str, url: &str) -> Result<(String, String), String> {
     Ok((article.title, markdown))
 }
 
-fn compose(title: &str, markdown: &str) -> String {
+fn compose(title: &str, markdown: &str, links: &[String]) -> String {
     let mut out = String::new();
     if !title.trim().is_empty() {
         out.push_str(&format!("# {}\n\n", title.trim()));
@@ -157,10 +159,66 @@ fn compose(title: &str, markdown: &str) -> String {
         out = out.chars().take(MAX_MARKDOWN).collect();
         out.push_str("\n\n[truncado]");
     }
+    if !links.is_empty() {
+        out.push_str("\n\n## Links");
+        for link in links {
+            out.push_str(&format!("\n- <{link}>"));
+        }
+    }
     if out.trim().is_empty() {
         return "the page has no readable content".to_string();
     }
     out
+}
+
+/// Every distinct link on the page, navigation included: readability throws
+/// the menu away, which is exactly where the way to the next page lives.
+fn page_links(html: &str, base: &str) -> Vec<String> {
+    let document = dom_query::Document::from(html);
+    let mut seen = std::collections::HashSet::new();
+    let mut links = Vec::new();
+    for node in document.select("a[href]").iter() {
+        let Some(href) = node.attr("href") else {
+            continue;
+        };
+        let Some(url) = absolutize(base, href.trim()) else {
+            continue;
+        };
+        if seen.insert(url.clone()) {
+            links.push(url);
+        }
+        if links.len() == MAX_LINKS {
+            break;
+        }
+    }
+    links
+}
+
+/// Enough URL joining for the shapes HTML links come in. Fragments, other
+/// schemes and `..` are skipped rather than guessed.
+fn absolutize(base: &str, href: &str) -> Option<String> {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return Some(href.to_string());
+    }
+    let scheme_end = base.find("://")? + 3;
+    let origin_end = base[scheme_end..]
+        .find('/')
+        .map_or(base.len(), |at| scheme_end + at);
+    let (origin, path) = base.split_at(origin_end);
+    if let Some(rest) = href.strip_prefix("//") {
+        return Some(format!("{}://{rest}", &base[..scheme_end - 3]));
+    }
+    if href.starts_with('/') {
+        return Some(format!("{origin}{href}"));
+    }
+    if href.is_empty() || href.starts_with('#') || href.starts_with('?') {
+        return None;
+    }
+    if href.contains("..") || href.contains(':') {
+        return None;
+    }
+    let dir = path.rfind('/').map_or("/", |at| &path[..=at]);
+    Some(format!("{origin}{dir}{href}"))
 }
 
 fn plain_or_error(page: &Page) -> Result<String, String> {
@@ -604,9 +662,54 @@ mod tests {
 
     #[test]
     fn formats_results() {
-        let text = format_results(&parse(RESULTS_HTML));
+        let text = format_results(&parse(RESULTS_HTML), RESULTS);
         assert!(text.starts_with("1. The Rust Programming Language\n   https://rust-lang.org/"));
         assert!(text.contains("2. Example\n   https://example.com/a?b=1"));
+        assert_eq!(format_results(&parse(RESULTS_HTML), 1).lines().count(), 3);
+    }
+
+    #[test]
+    fn joins_the_url_shapes_html_uses() {
+        let base = "https://example.com/a/b/index.html";
+        assert_eq!(
+            absolutize(base, "https://x.com/y").unwrap(),
+            "https://x.com/y"
+        );
+        assert_eq!(
+            absolutize(base, "//cdn.com/z").unwrap(),
+            "https://cdn.com/z"
+        );
+        assert_eq!(
+            absolutize(base, "/docs/x").unwrap(),
+            "https://example.com/docs/x"
+        );
+        assert_eq!(
+            absolutize(base, "sub.html").unwrap(),
+            "https://example.com/a/b/sub.html"
+        );
+        assert_eq!(
+            absolutize("http://127.0.0.1:8080", "x").unwrap(),
+            "http://127.0.0.1:8080/x"
+        );
+        for skipped in [
+            "#frag",
+            "?q=1",
+            "mailto:a@b.com",
+            "../up",
+            "javascript:void(0)",
+        ] {
+            assert!(absolutize(base, skipped).is_none(), "{skipped}");
+        }
+    }
+
+    #[test]
+    fn lists_links_once_in_page_order() {
+        let html = r##"<html><body><nav>
+            <a href="/docs/a">A</a><a href="/docs/a">A otra vez</a>
+            <a href="#top">Arriba</a><a href="https://x.com/y">Y</a>
+            </nav><article><p>cuerpo</p></article></body></html>"##;
+        let links = page_links(html, "https://example.com/guia/index.html");
+        assert_eq!(links, ["https://example.com/docs/a", "https://x.com/y"]);
     }
 
     #[test]
@@ -652,8 +755,12 @@ mod tests {
 
     #[test]
     fn composes_with_the_title_and_truncates() {
-        assert_eq!(compose("T", "body"), "# T\n\nbody");
-        assert_eq!(compose("", "body"), "body");
-        assert!(compose("T", &"x".repeat(MAX_MARKDOWN + 10)).ends_with("[truncado]"));
+        assert_eq!(compose("T", "body", &[]), "# T\n\nbody");
+        assert_eq!(compose("", "body", &[]), "body");
+        assert!(compose("T", &"x".repeat(MAX_MARKDOWN + 10), &[]).ends_with("[truncado]"));
+        assert_eq!(
+            compose("T", "body", &["https://a".to_string()]),
+            "# T\n\nbody\n\n## Links\n- <https://a>"
+        );
     }
 }

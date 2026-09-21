@@ -37,6 +37,7 @@ name = "axe"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "dom_query",
  "dom_smoothie",
  "encoding_rs",
  "htmd",

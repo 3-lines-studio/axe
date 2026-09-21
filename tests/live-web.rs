@@ -36,6 +36,8 @@ fn fetches_and_extracts_a_page() {
     assert!(text.contains("dom_smoothie"), "{text}");
     assert!(!text.contains("<div"), "quedó html crudo: {text}");
     assert!(!text.starts_with("error"), "{text}");
+    assert!(text.contains("\n\n## Links\n"), "sin sección de links");
+    assert!(text.contains("- <https://"), "sin links absolutos");
 }
 
 #[test]
