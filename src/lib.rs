@@ -22,6 +22,7 @@ pub mod sentinel;
 pub mod session;
 pub mod tools;
 pub mod tui;
+pub mod web;
 
 pub use openai::OpenAI;
 

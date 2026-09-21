@@ -8,8 +8,9 @@ Axe includes:
 - A terminal UI and one-shot mode
 - Project-scoped sessions, resume, rewind, search, and compaction
 - `read`, `write`, `edit`, and unsandboxed `bash`
+- `search` and `fetch`: DuckDuckGo and a page-to-Markdown reader
 
-It has no plugins, external tools, skills, web fetcher, or sidecar.
+It has no plugins, external tools, skills, or sidecar.
 
 ## Install
 
@@ -107,8 +108,16 @@ AXE_EVAL_MODEL=gpt-4.1-mini AXE_EVAL_COMPACTION_CYCLES=10 OPENAI_API_KEY="..." m
 
 The agent eval loads the endpoint, model, and API key from `~/.config/axe/config` by default and compares Axe with `pi`. Use `--agent` to run one agent. The compaction eval checks required-fact recall and context size after every compaction cycle. Evals cost money and can vary by model, so `make check` does not run them.
 
-## Bash
+## Web
 
+Two tools, both in process over the system libcurl:
+
+- `search QUERY` hits DuckDuckGo's HTML view and returns a numbered list of titles, URLs, and snippets.
+- `fetch URL` downloads the page, runs it through readability extraction, and returns the article as Markdown. The chrome, the navigation, and the script tags do not reach the model.
+
+When the extracted text comes out nearly empty, the page probably builds itself with JavaScript, so Axe looks for `chromium`, `chromium-browser`, `google-chrome`, or `google-chrome-stable` on `PATH` and asks for the DOM after the scripts ran. If there is no browser installed, it returns what it read. Nothing is required: rendering is an upgrade, not a dependency.
+
+## Bash
 Bash runs directly on the host in the selected work directory. Axe captures stdout and stderr, reports exit status, truncates large output while preserving the full output in a temporary file, supports timeouts, and kills the command process group on timeout or cancellation.
 
 Axe does not ask for tool permission and does not provide a sandbox.

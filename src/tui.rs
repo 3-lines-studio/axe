@@ -44,6 +44,8 @@ pub fn build_tools(dir: &str) -> Vec<Tool> {
         crate::tools::write(),
         crate::tools::edit(),
         crate::tools::bash(dir),
+        crate::web::search(),
+        crate::web::fetch(),
     ]
 }
 
