@@ -15,20 +15,27 @@ use std::sync::OnceLock;
 const CURL_GLOBAL_DEFAULT: c_long = 3;
 const CURLOPT_WRITEDATA: c_int = 10001;
 const CURLOPT_URL: c_int = 10002;
+const CURLOPT_TIMEOUT: c_int = 13;
 const CURLOPT_POSTFIELDS: c_int = 10015;
+const CURLOPT_USERAGENT: c_int = 10018;
 const CURLOPT_HTTPHEADER: c_int = 10023;
 const CURLOPT_NOPROGRESS: c_int = 43;
 const CURLOPT_FAILONERROR: c_int = 45;
 const CURLOPT_POST: c_int = 47;
+const CURLOPT_FOLLOWLOCATION: c_int = 52;
 const CURLOPT_POSTFIELDSIZE: c_int = 60;
+const CURLOPT_MAXREDIRS: c_int = 68;
 const CURLOPT_CONNECTTIMEOUT: c_int = 78;
 const CURLOPT_LOW_SPEED_LIMIT: c_int = 19;
 const CURLOPT_LOW_SPEED_TIME: c_int = 20;
 const CURLOPT_NOSIGNAL: c_int = 99;
+const CURLOPT_ACCEPT_ENCODING: c_int = 10102;
 const CURLOPT_PROGRESSDATA: c_int = 10057;
 const CURLOPT_WRITEFUNCTION: c_int = 20011;
 const CURLOPT_PROGRESSFUNCTION: c_int = 20056;
+const CURLINFO_EFFECTIVE_URL: c_int = 0x100001;
 const CURLINFO_RESPONSE_CODE: c_int = 0x200002;
+const CURLINFO_CONTENT_TYPE: c_int = 0x100012;
 const CURLINFO_NUM_CONNECTS: c_int = 0x20001a;
 
 pub type WriteCb = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize;
@@ -40,6 +47,7 @@ type SetoptPtr = unsafe extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int;
 type SetoptWriteCb = unsafe extern "C" fn(*mut c_void, c_int, WriteCb) -> c_int;
 type SetoptProgressCb = unsafe extern "C" fn(*mut c_void, c_int, ProgressCb) -> c_int;
 type GetinfoLong = unsafe extern "C" fn(*mut c_void, c_int, *mut c_long) -> c_int;
+type GetinfoString = unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char) -> c_int;
 
 struct Curl {
     global_init: unsafe extern "C" fn(c_long) -> c_int,
@@ -51,6 +59,7 @@ struct Curl {
     setopt_progress_cb: SetoptProgressCb,
     perform: unsafe extern "C" fn(*mut c_void) -> c_int,
     getinfo_long: GetinfoLong,
+    getinfo_string: GetinfoString,
     cleanup: unsafe extern "C" fn(*mut c_void),
     strerror: unsafe extern "C" fn(c_int) -> *const c_char,
     slist_append: unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void,
@@ -112,6 +121,9 @@ unsafe fn load_syms(handle: *mut libc::c_void) -> Result<Curl, String> {
                 sym(b"curl_easy_perform")?,
             ),
             getinfo_long: std::mem::transmute::<*mut c_void, GetinfoLong>(sym(
+                b"curl_easy_getinfo",
+            )?),
+            getinfo_string: std::mem::transmute::<*mut c_void, GetinfoString>(sym(
                 b"curl_easy_getinfo",
             )?),
             cleanup: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void)>(sym(
@@ -185,6 +197,31 @@ impl Easy {
         setopt_long(self, CURLOPT_FAILONERROR, v as c_long)
     }
 
+    pub fn follow_location(&mut self, v: bool) -> Result<(), String> {
+        setopt_long(self, CURLOPT_FOLLOWLOCATION, v as c_long)
+    }
+
+    pub fn max_redirects(&mut self, count: c_long) -> Result<(), String> {
+        setopt_long(self, CURLOPT_MAXREDIRS, count)
+    }
+
+    pub fn user_agent(&mut self, ua: &str) -> Result<(), String> {
+        let s = CString::new(ua).map_err(|_| "user agent contains NUL".to_string())?;
+        setopt(self, CURLOPT_USERAGENT, s.as_ptr())
+    }
+
+    /// Ask for a compressed body; libcurl decompresses it before the write
+    /// callback. An empty string means every encoding it was built with.
+    pub fn accept_encoding(&mut self, encodings: &str) -> Result<(), String> {
+        let s = CString::new(encodings).map_err(|_| "encodings contain NUL".to_string())?;
+        setopt(self, CURLOPT_ACCEPT_ENCODING, s.as_ptr())
+    }
+
+    /// Cap the whole transfer, not just the connection attempt.
+    pub fn timeout(&mut self, secs: c_long) -> Result<(), String> {
+        setopt_long(self, CURLOPT_TIMEOUT, secs)
+    }
+
     /// Seconds to wait for the connection to be established. Without this a
     /// server that accepts but never responds blocks the run forever.
     pub fn connect_timeout(&mut self, secs: c_long) -> Result<(), String> {
@@ -234,6 +271,15 @@ impl Easy {
             .map(|value| value as u32)
     }
 
+    /// The URL after redirects. Valid until the handle is reused or dropped.
+    pub fn effective_url(&self) -> Result<String, String> {
+        self.getinfo_string(CURLINFO_EFFECTIVE_URL)
+    }
+
+    pub fn content_type(&self) -> Result<String, String> {
+        self.getinfo_string(CURLINFO_CONTENT_TYPE)
+    }
+
     fn getinfo_long(&self, info: c_int) -> Result<c_long, String> {
         let c = curl()?;
         let mut value = 0;
@@ -242,6 +288,21 @@ impl Easy {
             return Err(curl_err(c, result));
         }
         Ok(value)
+    }
+
+    fn getinfo_string(&self, info: c_int) -> Result<String, String> {
+        let c = curl()?;
+        let mut value: *mut c_char = std::ptr::null_mut();
+        let result = unsafe { (c.getinfo_string)(self.handle, info, &mut value) };
+        if result != 0 {
+            return Err(curl_err(c, result));
+        }
+        if value.is_null() {
+            return Ok(String::new());
+        }
+        Ok(unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned())
     }
 }
 
