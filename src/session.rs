@@ -752,33 +752,48 @@ fn read_sidecar(path: &Path, bytes: u64) -> Option<SessionSidecar> {
 /// message whose `tool_calls` lack matching tool results, together with the
 /// results it did produce. Providers reject such a sequence, and a crash
 /// mid-batch (or a session file written by an older version) can leave one
-/// anywhere in the transcript, not only at the end. Complete exchanges are
-/// kept untouched.
+/// anywhere in the transcript, not only at the end. Results are looked up by
+/// call id, so an exchange whose results landed apart from the call — a batch
+/// whose tools finish out of order — is rebuilt around it in call order
+/// instead of dropped. Complete exchanges are kept untouched.
 pub fn drop_incomplete_tool_calls(msgs: &mut Vec<Message>) {
-    let mut i = 0;
-    while i < msgs.len() {
-        if msgs[i].role != "assistant" || msgs[i].tool_calls.is_empty() {
-            i += 1;
-            continue;
+    let mut results: HashMap<&str, usize> = HashMap::new();
+    for (index, message) in msgs.iter().enumerate() {
+        if message.role == "tool" {
+            results
+                .entry(message.tool_call_id.as_str())
+                .or_insert(index);
         }
-        let mut end = i + 1;
-        let mut answered = 0;
-        while end < msgs.len() && msgs[end].role == "tool" {
-            if msgs[i]
-                .tool_calls
-                .iter()
-                .any(|call| call.id == msgs[end].tool_call_id)
-            {
-                answered += 1;
-            }
-            end += 1;
-        }
-        if answered < msgs[i].tool_calls.len() {
-            msgs.drain(i..end);
-            continue;
-        }
-        i = end;
     }
+    let mut used = vec![false; msgs.len()];
+    let mut out: Vec<Message> = Vec::with_capacity(msgs.len());
+    for (index, message) in msgs.iter().enumerate() {
+        if used[index] || message.role == "tool" {
+            continue;
+        }
+        if message.role != "assistant" || message.tool_calls.is_empty() {
+            out.push(message.clone());
+            continue;
+        }
+        let ids: Vec<&str> = message
+            .tool_calls
+            .iter()
+            .map(|call| call.id.as_str())
+            .collect();
+        if !ids
+            .iter()
+            .all(|id| results.get(id).is_some_and(|index| !used[*index]))
+        {
+            continue;
+        }
+        out.push(message.clone());
+        for id in ids {
+            let index = results[id];
+            used[index] = true;
+            out.push(msgs[index].clone());
+        }
+    }
+    *msgs = out;
 }
 
 const RETAIN_TOKENS: usize = 20_000;
@@ -1118,6 +1133,20 @@ mod tests {
         }
     }
 
+    fn call(id: &str) -> crate::ToolCall {
+        crate::ToolCall {
+            id: id.into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        }
+    }
+
+    fn tool_result(id: &str) -> Message {
+        let mut message = message("tool", "output");
+        message.tool_call_id = id.into();
+        message
+    }
+
     #[test]
     fn session_summary_reads_entries() {
         let dir = std::env::temp_dir().join(format!("axe-summary-{}", std::process::id()));
@@ -1309,6 +1338,54 @@ mod tests {
         let (_, _, retained) = compact(&SummaryProvider, "test", &entries).unwrap();
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].content, "latest");
+    }
+
+    /// Tools of the same batch finish out of order and each result is appended
+    /// as it lands, so a result can sit far from the call that asked for it.
+    /// The exchange is rebuilt around its call instead of dropped.
+    #[test]
+    fn out_of_order_tool_results_go_back_with_their_calls() {
+        let mut first = message("assistant", "");
+        first.tool_calls.push(call("call-1"));
+        let mut second = message("assistant", "");
+        second.tool_calls.push(call("call-2"));
+        let mut msgs = vec![
+            message("user", "go"),
+            first,
+            second,
+            tool_result("call-2"),
+            message("assistant", "done"),
+            tool_result("call-1"),
+        ];
+        drop_incomplete_tool_calls(&mut msgs);
+        let shape: Vec<(&str, &str)> = msgs
+            .iter()
+            .map(|m| (m.role.as_str(), m.tool_call_id.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("user", ""),
+                ("assistant", ""),
+                ("tool", "call-1"),
+                ("assistant", ""),
+                ("tool", "call-2"),
+                ("assistant", ""),
+            ]
+        );
+    }
+
+    /// A result whose call never made it into the transcript has nothing left
+    /// to answer, and the provider rejects it as it stands.
+    #[test]
+    fn a_tool_result_without_its_call_is_dropped() {
+        let mut msgs = vec![
+            message("user", "go"),
+            message("assistant", "answer"),
+            tool_result("call-1"),
+        ];
+        drop_incomplete_tool_calls(&mut msgs);
+        assert_eq!(msgs.len(), 2);
     }
 
     #[test]
