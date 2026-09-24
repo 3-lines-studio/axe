@@ -8,7 +8,7 @@
 //! `key value` assignments. Replacement is exact and idempotent; the local
 //! transcript keeps the real value.
 
-use crate::{Message, ToolCall};
+use crate::Message;
 use std::sync::OnceLock;
 
 const REDACTED: &str = "[REDACTED]";
@@ -69,21 +69,12 @@ impl Sentinel {
     }
 
     pub fn redact_message(&self, m: &Message) -> Message {
+        if !matches!(m.role.as_str(), "user" | "tool") {
+            return m.clone();
+        }
         Message {
-            role: m.role.clone(),
             content: self.redact(&m.content),
-            tool_calls: m
-                .tool_calls
-                .iter()
-                .map(|c| ToolCall {
-                    id: c.id.clone(),
-                    name: c.name.clone(),
-                    arguments: self.redact(&c.arguments),
-                })
-                .collect(),
-            tool_call_id: m.tool_call_id.clone(),
-            reasoning: self.redact(&m.reasoning),
-            images: m.images.clone(),
+            ..m.clone()
         }
     }
 }
