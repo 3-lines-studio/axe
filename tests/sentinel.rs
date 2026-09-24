@@ -101,28 +101,41 @@ fn leaves_real_code_untouched() {
 }
 
 #[test]
-fn redact_message_covers_arguments_and_reasoning() {
+fn redact_message_leaves_what_the_agent_writes_alone() {
     let m = Message {
         role: "assistant".into(),
-        content: "PASSWORD=hunter2".into(),
+        content: "PASSWORD=hunter2-secret-value".into(),
         tool_calls: vec![ToolCall {
             id: "c1".into(),
-            name: "read".into(),
-            arguments: r#"{"api_key":"sk-abcdefghijklmnopqrstuvwxyz"}"#.into(),
+            name: "write".into(),
+            arguments: r#"{"api_key":"hunter2-secret-value"}"#.into(),
         }],
         tool_call_id: String::new(),
-        reasoning: "use token hunter2".into(),
+        reasoning: "use hunter2-secret-value".into(),
         images: Vec::new(),
     };
     let r = sentinel().redact_message(&m);
-    assert_eq!(r.content, "PASSWORD=[REDACTED]");
-    assert!(r.tool_calls[0].arguments.contains("[REDACTED]"));
-    assert!(
-        !r.tool_calls[0]
-            .arguments
-            .contains("sk-abcdefghijklmnopqrstuvwxyz")
-    );
-    assert!(r.reasoning.contains("[REDACTED]"));
+    assert_eq!(r.content, m.content);
+    assert_eq!(r.tool_calls[0].arguments, m.tool_calls[0].arguments);
+    assert_eq!(r.reasoning, m.reasoning);
+}
+
+#[test]
+fn redact_message_covers_what_the_user_writes_and_what_tools_return() {
+    for role in ["user", "tool"] {
+        let m = Message {
+            role: role.into(),
+            content: "my key is hunter2-secret-value".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: String::new(),
+            reasoning: String::new(),
+            images: Vec::new(),
+        };
+        assert_eq!(
+            sentinel().redact_message(&m).content,
+            "my key is [REDACTED]"
+        );
+    }
 }
 
 #[test]
