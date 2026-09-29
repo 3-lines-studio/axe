@@ -16,6 +16,7 @@ pub mod app;
 pub mod curlffi;
 mod http;
 pub mod image;
+pub mod machine;
 pub mod openai;
 pub mod run;
 pub mod sentinel;

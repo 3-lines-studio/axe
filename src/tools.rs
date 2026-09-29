@@ -171,8 +171,130 @@ fn reap(child: &mut std::process::Child, grace: std::time::Duration) {
     }
 }
 
-pub fn bash(dir: &str) -> Tool {
-    let dir = dir.to_string();
+/// Run a command on the local machine: the process group, the temporary output
+/// files, the timeout and the exit status are all handled here.
+pub fn run_shell(dir: &str, command: &str, timeout: u64, progress: &mut dyn FnMut(&str)) -> String {
+    let tag = BASH_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ensure_sigint_handler();
+    let out_path = std::env::temp_dir().join(format!("axe-bash-{}-{tag}.out", std::process::id()));
+    let out_file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&out_path)
+    {
+        Ok(file) => file,
+        Err(e) => return format!("error: {e}"),
+    };
+    let err_file = match out_file.try_clone() {
+        Ok(file) => file,
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_path);
+            return format!("error: {e}");
+        }
+    };
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg("-c").arg(command);
+    if !dir.is_empty() {
+        cmd.current_dir(dir);
+    }
+    cmd.stdout(std::process::Stdio::from(out_file));
+    cmd.stderr(std::process::Stdio::from(err_file));
+    cmd.process_group(0);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_path);
+            return format!("error: {e}");
+        }
+    };
+    // Registered so sigint_reap_children can kill the group if axe
+    // dies first; dropped (unregistered) when the child is reaped.
+    let pgid = child.id() as i32;
+    if !register_pgid(pgid) {
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        reap(&mut child, KILL_GRACE);
+        return "error: too many live bash processes".to_string();
+    }
+    let _guard = PgidGuard(pgid);
+    let pidfd = child_pidfd(child.id());
+    let mut exit: Option<std::process::ExitStatus> = None;
+    let mut timed_out = false;
+    let started = std::time::Instant::now();
+    let timeout_dur = std::time::Duration::from_secs(timeout);
+    let mut last_progress = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                exit = Some(st);
+                break;
+            }
+            Ok(None) => {
+                if started.elapsed() >= timeout_dur {
+                    unsafe {
+                        libc::kill(-(child.id() as i32), libc::SIGKILL);
+                    }
+                    reap(&mut child, KILL_GRACE);
+                    timed_out = true;
+                    break;
+                }
+                if last_progress.elapsed() >= std::time::Duration::from_millis(100) {
+                    last_progress = std::time::Instant::now();
+                    let tail = read_file_tail(&out_path);
+                    if !tail.is_empty() {
+                        progress(&sanitize(&tail));
+                    }
+                }
+                let progress_wait =
+                    std::time::Duration::from_millis(100).saturating_sub(last_progress.elapsed());
+                let timeout_wait = timeout_dur.saturating_sub(started.elapsed());
+                wait_for_child(pidfd.as_ref(), progress_wait.min(timeout_wait));
+            }
+            Err(e) => {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                reap(&mut child, KILL_GRACE);
+                let _ = std::fs::remove_file(&out_path);
+                return format!("error: {e}");
+            }
+        }
+    }
+    let truncated = std::fs::metadata(&out_path)
+        .map(|metadata| metadata.len() > MAX_OUTPUT as u64)
+        .unwrap_or(false);
+    let output = if truncated {
+        read_file_tail(&out_path)
+    } else {
+        std::fs::read(&out_path)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default()
+    };
+    let mut display = sanitize(&output);
+    if truncated {
+        display.push_str(&format!(
+            "\n\n[Output truncated to the last 16KB. Full output: {}]",
+            out_path.display()
+        ));
+    } else {
+        let _ = std::fs::remove_file(&out_path);
+    }
+    if timed_out {
+        if !display.is_empty() && !display.ends_with('\n') {
+            display.push('\n');
+        }
+        display.push_str(&format!("error: command timed out after {timeout} seconds"));
+    } else if let Some(st) = exit
+        && !st.success()
+    {
+        if !display.is_empty() && !display.ends_with('\n') {
+            display.push('\n');
+        }
+        display.push_str(&format!("error: {}", status_str(st)));
+    }
+    display
+}
+
+pub fn bash(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
     let mut t = new_tool_with_progress(
         "bash",
         "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 16KB. The default timeout is 120 seconds.",
@@ -182,125 +304,7 @@ pub fn bash(dir: &str) -> Tool {
                 return "error: invalid timeout: must be a positive number of seconds".to_string();
             }
             let timeout = a.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT);
-            let tag = BASH_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            ensure_sigint_handler();
-            let out_path =
-                std::env::temp_dir().join(format!("axe-bash-{}-{tag}.out", std::process::id()));
-            let out_file = match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&out_path)
-            {
-                Ok(file) => file,
-                Err(e) => return format!("error: {e}"),
-            };
-            let err_file = match out_file.try_clone() {
-                Ok(file) => file,
-                Err(e) => {
-                    let _ = std::fs::remove_file(&out_path);
-                    return format!("error: {e}");
-                }
-            };
-            let mut cmd = std::process::Command::new("bash");
-            cmd.arg("-c").arg(&a.command);
-            if !dir.is_empty() {
-                cmd.current_dir(&dir);
-            }
-            cmd.stdout(std::process::Stdio::from(out_file));
-            cmd.stderr(std::process::Stdio::from(err_file));
-            cmd.process_group(0);
-            let mut child = match cmd.spawn() {
-                Ok(child) => child,
-                Err(e) => {
-                    let _ = std::fs::remove_file(&out_path);
-                    return format!("error: {e}");
-                }
-            };
-            // Registered so sigint_reap_children can kill the group if axe
-            // dies first; dropped (unregistered) when the child is reaped.
-            let pgid = child.id() as i32;
-            if !register_pgid(pgid) {
-                unsafe { libc::kill(-pgid, libc::SIGKILL) };
-                reap(&mut child, KILL_GRACE);
-                return "error: too many live bash processes".to_string();
-            }
-            let _guard = PgidGuard(pgid);
-            let pidfd = child_pidfd(child.id());
-            let mut exit: Option<std::process::ExitStatus> = None;
-            let mut timed_out = false;
-            let started = std::time::Instant::now();
-            let timeout_dur = std::time::Duration::from_secs(timeout);
-            let mut last_progress = std::time::Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(st)) => {
-                        exit = Some(st);
-                        break;
-                    }
-                    Ok(None) => {
-                        if started.elapsed() >= timeout_dur {
-                            unsafe {
-                                libc::kill(-(child.id() as i32), libc::SIGKILL);
-                            }
-                            reap(&mut child, KILL_GRACE);
-                            timed_out = true;
-                            break;
-                        }
-                        if last_progress.elapsed() >= std::time::Duration::from_millis(100) {
-                            last_progress = std::time::Instant::now();
-                            let tail = read_file_tail(&out_path);
-                            if !tail.is_empty() {
-                                progress(&sanitize(&tail));
-                            }
-                        }
-                        let progress_wait = std::time::Duration::from_millis(100)
-                            .saturating_sub(last_progress.elapsed());
-                        let timeout_wait = timeout_dur.saturating_sub(started.elapsed());
-                        wait_for_child(pidfd.as_ref(), progress_wait.min(timeout_wait));
-                    }
-                    Err(e) => {
-                        unsafe {
-                            libc::kill(-(child.id() as i32), libc::SIGKILL);
-                        }
-                        reap(&mut child, KILL_GRACE);
-                        let _ = std::fs::remove_file(&out_path);
-                        return format!("error: {e}");
-                    }
-                }
-            }
-            let truncated = std::fs::metadata(&out_path)
-                .map(|metadata| metadata.len() > MAX_OUTPUT as u64)
-                .unwrap_or(false);
-            let output = if truncated {
-                read_file_tail(&out_path)
-            } else {
-                std::fs::read(&out_path)
-                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                    .unwrap_or_default()
-            };
-            let mut display = sanitize(&output);
-            if truncated {
-                display.push_str(&format!(
-                    "\n\n[Output truncated to the last 16KB. Full output: {}]",
-                    out_path.display()
-                ));
-            } else {
-                let _ = std::fs::remove_file(&out_path);
-            }
-            if timed_out {
-                if !display.is_empty() && !display.ends_with('\n') {
-                    display.push('\n');
-                }
-                display.push_str(&format!("error: command timed out after {timeout} seconds"));
-            } else if let Some(st) = exit
-                && !st.success()
-            {
-                if !display.is_empty() && !display.ends_with('\n') {
-                    display.push('\n');
-                }
-                display.push_str(&format!("error: {}", status_str(st)));
-            }
-            display
+            machine.run(&a.command, timeout, progress)
         },
     );
     t.snippet = "Execute bash commands (ls, grep, find, etc.)";
@@ -477,13 +481,17 @@ mod tests {
         assert_eq!(out, "let x = (2);\n");
     }
 
+    fn local() -> std::sync::Arc<dyn crate::machine::Machine> {
+        std::sync::Arc::new(crate::machine::Local::new(""))
+    }
+
     #[test]
     fn read_accepts_float_offset() {
         let dir = std::env::temp_dir().join(format!("axe-read-float-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("f.txt");
         std::fs::write(&path, "a\nb\nc\n").unwrap();
-        let read = crate::tools::read();
+        let read = crate::tools::read(local());
         let args = format!(
             r#"{{"path":"{}","offset":2.0,"limit":1.0}}"#,
             path.display()
@@ -498,7 +506,7 @@ mod tests {
     fn read_attaches_images_and_rejects_binary() {
         let dir = std::env::temp_dir().join(format!("axe-read-image-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let read = crate::tools::read();
+        let read = crate::tools::read(local());
 
         // A real PNG signature followed by NUL bytes: the image check must win
         // over the binary guard so the model can see the picture.
@@ -565,7 +573,7 @@ mod tests {
     #[test]
     fn bash_truncation_notice() {
         let _lock = BASH_TEST.lock().unwrap();
-        let bash = crate::tools::bash("");
+        let bash = crate::tools::bash(local());
         let args = serde_json::json!({"command": "yes | head -c 20000"}).to_string();
         let out = (bash.run)(&args, &mut |_| {}).text;
         assert!(
@@ -593,6 +601,91 @@ mod tests {
             "full output file missing: {path}"
         );
     }
+
+    /// A machine that is not this process: everything lives in a map, and
+    /// commands are answered instead of run. A tool that touches the real
+    /// filesystem or spawns a real child would show up here.
+    #[derive(Default)]
+    struct Fake {
+        files: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+        runs: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::machine::Machine for Fake {
+        fn read(&self, path: &str) -> Result<Vec<u8>, String> {
+            self.files
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| format!("no such file: {path}"))
+        }
+
+        fn write(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), bytes.to_vec());
+            Ok(())
+        }
+
+        fn list(&self, _: &str) -> Result<Vec<crate::machine::Entry>, String> {
+            Ok(Vec::new())
+        }
+
+        fn remove(&self, path: &str) -> Result<(), String> {
+            self.files
+                .lock()
+                .unwrap()
+                .remove(path)
+                .map(|_| ())
+                .ok_or_else(|| format!("no such file: {path}"))
+        }
+
+        fn run(&self, command: &str, _: u64, _: &mut dyn FnMut(&str)) -> String {
+            self.runs.lock().unwrap().push(command.to_string());
+            format!("ran: {command}")
+        }
+    }
+
+    #[test]
+    fn tools_go_through_the_machine_they_are_given() {
+        let fake = std::sync::Arc::new(Fake::default());
+        let machine: std::sync::Arc<dyn crate::machine::Machine> = fake.clone();
+
+        let write = crate::tools::write(machine.clone());
+        let out = (write.run)(
+            r#"{"path":"/memoria/nota.txt","content":"hola\n"}"#,
+            &mut |_| {},
+        )
+        .text;
+        assert!(out.starts_with("wrote /memoria/nota.txt"), "got: {out}");
+
+        let read = crate::tools::read(machine.clone());
+        let out = (read.run)(r#"{"path":"/memoria/nota.txt"}"#, &mut |_| {}).text;
+        assert_eq!(out.trim(), "hola", "got: {out}");
+
+        let edit = crate::tools::edit(machine.clone());
+        let args = r#"{"path":"/memoria/nota.txt","edits":[{"oldText":"hola","newText":"chau"}]}"#;
+        let out = (edit.run)(args, &mut |_| {}).text;
+        assert!(
+            out.contains("Successfully replaced 1 block(s)"),
+            "got: {out}"
+        );
+        let guardado = fake
+            .files
+            .lock()
+            .unwrap()
+            .get("/memoria/nota.txt")
+            .cloned()
+            .unwrap();
+        assert_eq!(guardado, b"chau\n");
+
+        let bash = crate::tools::bash(machine);
+        let out = (bash.run)(r#"{"command":"ls /memoria"}"#, &mut |_| {}).text;
+        assert_eq!(out, "ran: ls /memoria");
+        assert_eq!(fake.runs.lock().unwrap().as_slice(), ["ls /memoria"]);
+    }
 }
 
 #[derive(Deserialize)]
@@ -605,15 +698,11 @@ struct ReadArgs {
 }
 
 /// Read a file as text lines, with offset/limit paging and truncation.
-fn read_text(a: &ReadArgs) -> String {
+fn read_text(a: &ReadArgs, data: &[u8]) -> String {
     use std::io::BufRead;
-    let file = match std::fs::File::open(&a.path) {
-        Ok(file) => file,
-        Err(e) => return format!("error: {e}"),
-    };
     let start = a.offset.unwrap_or(1).saturating_sub(1);
     let limit = a.limit.unwrap_or(usize::MAX);
-    let mut reader = std::io::BufReader::new(file);
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(data));
     let mut line = Vec::new();
     let mut output = String::new();
     let mut total = 0usize;
@@ -737,37 +826,33 @@ fn read_text(a: &ReadArgs) -> String {
 
 /// A NUL byte in the first block means this is not a text file. Images are
 /// handled before this; anything else would only poison the context.
-fn looks_binary(path: &str) -> bool {
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut head = [0u8; 8192];
-    let Ok(read) = file.read(&mut head) else {
-        return false;
-    };
-    head[..read].contains(&0)
+fn looks_binary(data: &[u8]) -> bool {
+    data[..data.len().min(8192)].contains(&0)
 }
 
-pub fn read() -> Tool {
+pub fn read(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
     let mut t = new_tool(
         "read",
         "Read the contents of a file. Output is truncated to 16KB. Use offset/limit for large files. When you need the full file, continue with the suggested offset. Reading a JPEG, PNG, GIF, or WebP attaches the image so you can see it.",
         r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"integer","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"integer","description":"Maximum number of lines to read"}},"required":["path"]}"#,
-        |a: ReadArgs| {
-            if let Some(image) = crate::image::attach_if_image(&a.path) {
+        move |a: ReadArgs| {
+            let data = match machine.read(&a.path) {
+                Ok(data) => data,
+                Err(e) => return ToolOutput::text(format!("error: {e}")),
+            };
+            if let Some(image) = crate::image::attach_bytes(&a.path, &data) {
                 return ToolOutput {
                     text: format!("Attached {} for viewing.", a.path),
                     images: vec![image],
                 };
             }
-            if looks_binary(&a.path) {
+            if looks_binary(&data) {
                 return ToolOutput::text(format!(
                     "error: {} is a binary file; read handles text files and JPEG, PNG, GIF, and WebP images",
                     a.path
                 ));
             }
-            ToolOutput::text(read_text(&a))
+            ToolOutput::text(read_text(&a, &data))
         },
     );
     t.snippet = "Read file contents (truncated, use offset to continue); images are attached so you can see them";
@@ -780,15 +865,12 @@ struct WriteArgs {
     content: String,
 }
 
-pub fn write() -> Tool {
+pub fn write(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
     let mut t = new_tool(
         "write",
         "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
         r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to write (relative or absolute)"},"content":{"type":"string","description":"Content to write to the file"}},"required":["path","content"]}"#,
-        |a: WriteArgs| match crate::atomic_write(
-            std::path::Path::new(&a.path),
-            a.content.as_bytes(),
-        ) {
+        move |a: WriteArgs| match machine.write(&a.path, a.content.as_bytes()) {
             Ok(()) => format!("wrote {} ({} bytes)", a.path, a.content.len()),
             Err(e) => format!("error: {e}"),
         },
@@ -1362,24 +1444,25 @@ fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<Applied, 
 
 const EDIT_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.","items":{"type":"object","properties":{"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},"newText":{"type":"string","description":"Replacement text for this targeted edit."}},"required":["oldText","newText"]}}},"required":["path","edits"]}"#;
 
-pub fn edit() -> Tool {
+pub fn edit(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
     let mut t = new_tool(
         "edit",
         "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
         EDIT_SCHEMA,
-        |a: EditArgs| {
+        move |a: EditArgs| {
             if a.edits.is_empty() {
                 return "error: edits must contain at least one replacement".into();
             }
-            match std::fs::read_to_string(&a.path) {
+            let data = match machine.read(&a.path) {
+                Ok(data) => data,
+                Err(e) => return format!("error: {e}"),
+            };
+            match String::from_utf8(data) {
                 Err(e) => format!("error: {e}"),
                 Ok(s) => match apply_edits(&a.path, &s, &a.edits) {
                     Ok(applied) => {
                         let n = a.edits.len();
-                        match crate::atomic_write(
-                            std::path::Path::new(&a.path),
-                            applied.content.as_bytes(),
-                        ) {
+                        match machine.write(&a.path, applied.content.as_bytes()) {
                             Ok(()) => format!(
                                 "Successfully replaced {n} block(s) in {}.\n\n{}",
                                 a.path, applied.patch

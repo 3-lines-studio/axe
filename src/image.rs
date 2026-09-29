@@ -14,6 +14,10 @@ pub fn attach(source: &str) -> Result<Image, String> {
         });
     }
     let data = std::fs::read(source).map_err(|error| format!("read image {source}: {error}"))?;
+    attach_data(source, &data)
+}
+
+pub fn attach_data(source: &str, data: &[u8]) -> Result<Image, String> {
     if data.len() > MAX_IMAGE_BYTES {
         return Err(format!(
             "image {source} is {} MiB; the limit is {} MiB",
@@ -21,11 +25,18 @@ pub fn attach(source: &str) -> Result<Image, String> {
             MAX_IMAGE_BYTES / (1024 * 1024)
         ));
     }
-    let url = format!("data:{};base64,{}", mime(&data, source), base64(&data));
+    let url = format!("data:{};base64,{}", mime(data, source), base64(data));
     Ok(Image {
         path: source.to_string(),
         url,
     })
+}
+
+/// Attach bytes already in hand when they are a supported image, so a tool
+/// that read a file through a machine does not read it twice.
+pub fn attach_bytes(source: &str, data: &[u8]) -> Option<Image> {
+    sniff(&data[..data.len().min(16)])?;
+    attach_data(source, data).ok()
 }
 
 /// Attach `path` when its content is a supported image, so a tool can hand an
