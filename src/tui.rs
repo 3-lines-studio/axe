@@ -39,11 +39,17 @@ pub struct TuiConfig {
 }
 
 pub fn build_tools(dir: &str) -> Vec<Tool> {
+    build_tools_on(std::sync::Arc::new(crate::machine::Local::new(dir)))
+}
+
+/// The tools over a machine that is not necessarily this process's: a control
+/// plane brings its own volume and shell, and the tools cannot tell.
+pub fn build_tools_on(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Vec<Tool> {
     vec![
-        crate::tools::read(),
-        crate::tools::write(),
-        crate::tools::edit(),
-        crate::tools::bash(dir),
+        crate::tools::read(machine.clone()),
+        crate::tools::write(machine.clone()),
+        crate::tools::edit(machine.clone()),
+        crate::tools::bash(machine),
         crate::web::search(),
         crate::web::fetch(),
     ]

@@ -216,9 +216,9 @@ fn fuzz_tools(_rng: &mut Rng, seed: u64, input: &[u8]) {
     let _ = std::fs::write(&target, input);
     let path = target.to_str().unwrap().to_string();
 
-    let read = axe::tools::read();
-    let write = axe::tools::write();
-    let edit = axe::tools::edit();
+    let read = axe::tools::read(std::sync::Arc::new(axe::machine::Local::new("")));
+    let write = axe::tools::write(std::sync::Arc::new(axe::machine::Local::new("")));
+    let edit = axe::tools::edit(std::sync::Arc::new(axe::machine::Local::new("")));
 
     guard("tool read", seed, || {
         let args = serde_json::json!({"path": path, "offset": 1, "limit": 2}).to_string();
@@ -561,7 +561,7 @@ fn edit_multi_edit_and_line_endings() {
     let dir = std::env::temp_dir().join(format!("axe-edit-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("f.txt");
-    let edit = axe::tools::edit();
+    let edit = axe::tools::edit(std::sync::Arc::new(axe::machine::Local::new("")));
     let p = path.to_str().unwrap();
 
     std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
@@ -612,7 +612,7 @@ fn read_offset_paging() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("f.txt");
     std::fs::write(&path, "line1\nline2\nline3\nline4\n").unwrap();
-    let read = axe::tools::read();
+    let read = axe::tools::read(std::sync::Arc::new(axe::machine::Local::new("")));
     let p = path.to_str().unwrap();
 
     let args = serde_json::json!({"path": p, "offset": 2, "limit": 2}).to_string();
@@ -633,7 +633,7 @@ fn read_offset_paging() {
 fn write_creates_parent_dirs() {
     let dir = std::env::temp_dir().join(format!("axe-write-{}", std::process::id()));
     let path = dir.join("sub").join("f.txt");
-    let write = axe::tools::write();
+    let write = axe::tools::write(std::sync::Arc::new(axe::machine::Local::new("")));
     let args = serde_json::json!({"path": path.to_str().unwrap(), "content": "hi"}).to_string();
     let out = (write.run)(&args, &mut |_| {}).text;
     assert!(out.starts_with("wrote"), "{out}");
@@ -643,7 +643,7 @@ fn write_creates_parent_dirs() {
 
 #[test]
 fn bash_timeout_kills() {
-    let bash = axe::tools::bash("");
+    let bash = axe::tools::bash(std::sync::Arc::new(axe::machine::Local::new("")));
     let args = serde_json::json!({"command": "sleep 5", "timeout": 1}).to_string();
     let start = std::time::Instant::now();
     let out = (bash.run)(&args, &mut |_| {}).text;
@@ -657,7 +657,7 @@ fn bash_timeout_kills() {
 
 #[test]
 fn bash_rejects_zero_timeout() {
-    let bash = axe::tools::bash("");
+    let bash = axe::tools::bash(std::sync::Arc::new(axe::machine::Local::new("")));
     let args = serde_json::json!({"command": "echo hi", "timeout": 0}).to_string();
     let out = (bash.run)(&args, &mut |_| {}).text;
     assert!(out.contains("invalid timeout"), "{out}");
@@ -665,7 +665,7 @@ fn bash_rejects_zero_timeout() {
 
 #[test]
 fn bash_captures_output_and_status() {
-    let bash = axe::tools::bash("");
+    let bash = axe::tools::bash(std::sync::Arc::new(axe::machine::Local::new("")));
     let args = serde_json::json!({"command": "echo hello"}).to_string();
     assert_eq!((bash.run)(&args, &mut |_| {}).text, "hello\n");
     let args = serde_json::json!({"command": "exit 3"}).to_string();
