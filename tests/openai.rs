@@ -358,3 +358,57 @@ fn openai_empty_assistant_keeps_content() {
     p.complete(&req).unwrap();
     handle.join().unwrap();
 }
+
+#[test]
+fn openai_stream_error_keeps_the_message() {
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let (mut sock, _) = server.accept().unwrap();
+        let mut req = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = sock.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            req.extend_from_slice(&buf[..n]);
+            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let resp = format!(
+            r#"{{"error":{{"message":".messages[58].image[0]: {} unsupported image"}}}}"#,
+            "x".repeat(200)
+        );
+        let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: ");
+        let _ = sock.write_all(resp.len().to_string().as_bytes());
+        let _ = sock.write_all(b"\r\nConnection: close\r\n\r\n");
+        let _ = sock.write_all(resp.as_bytes());
+    });
+
+    let p = OpenAI::new(format!("http://{addr}"), "k1");
+    let req = Request {
+        model: "m1",
+        system: "",
+        messages: &[Message {
+            role: "user".into(),
+            content: "go".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: String::new(),
+            reasoning: String::new(),
+            images: Vec::new(),
+        }],
+        tools: &[],
+    };
+    let (tx, _rx) = mpsc::channel();
+    let err = p
+        .complete_stream(&req, &Arc::new(AtomicBool::new(false)), tx)
+        .join()
+        .unwrap()
+        .unwrap_err();
+    handle.join().unwrap();
+    let msg = err.to_string();
+    assert!(msg.contains("openai: 400"), "got: {msg}");
+    assert!(msg.contains("unsupported image"), "got: {msg}");
+}

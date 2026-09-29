@@ -369,6 +369,10 @@ struct OaStreamChoice {
 
 const MAX_STREAM_TOOL_CALLS: usize = 64;
 
+/// The stream only keeps `raw` to report a non-200 body, so the cap has to
+/// clear the provider's whole error. SSE chunks are read from `buf`.
+const STREAM_RAW_LIMIT: usize = 64 * 1024;
+
 impl StreamAcc {
     fn feed(
         &mut self,
@@ -376,7 +380,7 @@ impl StreamAcc {
         tx: Option<&std::sync::mpsc::Sender<StreamEvent>>,
         stream: bool,
     ) {
-        let raw_limit = if stream { 200 } else { usize::MAX };
+        let raw_limit = if stream { STREAM_RAW_LIMIT } else { usize::MAX };
         let remaining = raw_limit.saturating_sub(self.raw.len());
         self.raw
             .extend_from_slice(&data[..data.len().min(remaining)]);
@@ -736,8 +740,16 @@ mod tests {
     #[test]
     fn streaming_raw_body_is_bounded() {
         let mut acc = StreamAcc::default();
-        feed_all(&mut acc, &[&[b'x'; 300]]);
-        assert_eq!(acc.raw.len(), 200);
+        feed_all(&mut acc, &[&vec![b'x'; STREAM_RAW_LIMIT + 1]]);
+        assert_eq!(acc.raw.len(), STREAM_RAW_LIMIT);
+    }
+
+    #[test]
+    fn a_provider_error_body_fits_whole() {
+        let mut acc = StreamAcc::default();
+        let body = format!(r#"{{"error":{{"message":"{}"}}}}"#, "x".repeat(300));
+        feed_all(&mut acc, &[body.as_bytes()]);
+        assert_eq!(acc.raw, body.as_bytes());
     }
 
     #[test]
@@ -754,7 +766,7 @@ mod tests {
         assert!(got.iter().any(
             |event| matches!(event, StreamEvent::Content(value) if value.len() == content.len())
         ));
-        assert_eq!(acc.raw.len(), 200);
+        assert_eq!(acc.raw.len(), STREAM_RAW_LIMIT);
     }
 
     #[test]
