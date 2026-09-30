@@ -1,7 +1,7 @@
 use crate::app;
 use crate::openai::OpenAI;
 use crate::run::{self, Outcome, RunOptions, Sink};
-use crate::session;
+use crate::session::{self, Store};
 use crate::{Image, Message, ToolCall, ToolOutput, Usage};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -32,7 +32,7 @@ pub struct TuiConfig {
     pub model: String,
     pub system: String,
     pub dir: String,
-    pub session_dir: String,
+    pub store: Arc<dyn Store>,
     pub api_key: String,
     pub resume: Option<String>,
     pub context_window: Option<usize>,
@@ -174,7 +174,7 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     cfg: TuiConfig,
 ) -> Result<(), String> {
-    session::archive_live(&cfg.session_dir);
+    cfg.store.archive();
     let mut app = App {
         cfg,
         entries: Vec::new(),
@@ -259,13 +259,13 @@ impl App {
     fn on_exit(&mut self) {
         match self.resume_id.take() {
             Some(id) => {
-                if !session::continue_archived_live(&self.cfg.session_dir, &id).unwrap_or(false) {
-                    let entries = session::load_live(&self.cfg.session_dir);
-                    let _ = session::continue_archived(&self.cfg.session_dir, &id, &entries);
+                if !self.cfg.store.continue_archived_live(&id).unwrap_or(false) {
+                    let entries = self.cfg.store.live();
+                    let _ = self.cfg.store.continue_archived(&id, &entries);
                 }
             }
             None => {
-                session::archive_live(&self.cfg.session_dir);
+                self.cfg.store.archive();
             }
         }
     }
@@ -470,7 +470,7 @@ impl App {
     }
 
     fn open_resume(&mut self) {
-        self.sessions = session::list_sessions(&self.cfg.session_dir);
+        self.sessions = self.cfg.store.list();
         self.catalog_query.clear();
         self.resume_selected = 0;
         self.resume_open = true;
@@ -575,18 +575,22 @@ impl App {
 
     fn resume(&mut self, id: &str) {
         if let Some(previous) = self.resume_id.take()
-            && !session::continue_archived_live(&self.cfg.session_dir, &previous).unwrap_or(false)
+            && !self
+                .cfg
+                .store
+                .continue_archived_live(&previous)
+                .unwrap_or(false)
         {
-            let entries = session::load_live(&self.cfg.session_dir);
-            let _ = session::continue_archived(&self.cfg.session_dir, &previous, &entries);
+            let entries = self.cfg.store.live();
+            let _ = self.cfg.store.continue_archived(&previous, &entries);
         }
-        let Some((id, entries)) = app::load_session(&self.cfg.session_dir, id) else {
+        let Some((id, entries)) = app::load_session(self.cfg.store.as_ref(), id) else {
             self.entries
                 .push(Entry::Notice(format!("no such session: {id}")));
             return;
         };
         self.resume_id = Some(id.clone());
-        session::set_resume_id(&self.cfg.session_dir, &id);
+        self.cfg.store.set_resume_id(&id);
         let transcript = entries
             .iter()
             .filter_map(|entry| match entry {
@@ -602,7 +606,7 @@ impl App {
         self.session_input = usage.input;
         self.session_output = usage.output;
         self.rebuild_transcript_from(&transcript);
-        if let Err(error) = session::save_live(&self.cfg.session_dir, &entries) {
+        if let Err(error) = self.cfg.store.save(&entries) {
             self.entries
                 .push(Entry::Notice(format!("error: save session: {error}")));
         }
@@ -1267,7 +1271,7 @@ impl App {
         let entry = session::Entry::Message {
             message: self.messages.last().unwrap().clone(),
         };
-        if let Err(error) = session::append_live(&self.cfg.session_dir, &[entry]) {
+        if let Err(error) = self.cfg.store.append(&[entry]) {
             self.entries
                 .push(Entry::Notice(format!("error: save session: {error}")));
         }
@@ -1303,7 +1307,7 @@ impl App {
                 self.picker = None;
             }
             Some(app::Command::New) => {
-                session::archive_live(&self.cfg.session_dir);
+                self.cfg.store.archive();
                 self.clear_session();
             }
             Some(app::Command::Resume) => match argument {
@@ -1369,7 +1373,7 @@ impl App {
 
     fn rewind_to(&mut self, index: usize) {
         let entries = app::rewind_entries(&self.messages, index);
-        if let Err(error) = session::save_live(&self.cfg.session_dir, &entries) {
+        if let Err(error) = self.cfg.store.save(&entries) {
             self.entries
                 .push(Entry::Notice(format!("error: save session: {error}")));
             return;
@@ -1412,7 +1416,7 @@ impl App {
         }
         let provider = OpenAI::new(self.cfg.base.clone(), self.cfg.api_key.clone());
         let model = self.cfg.model.clone();
-        let entries = session::load_live(&self.cfg.session_dir);
+        let entries = self.cfg.store.live();
         let (sender, receiver) = mpsc::channel();
         self.events = Some(receiver);
         self.compacting = true;
@@ -1530,10 +1534,8 @@ impl App {
                                 timestamp: session::now_ms(),
                                 retained,
                             };
-                            if let Err(error) = session::append_live(
-                                &self.cfg.session_dir,
-                                std::slice::from_ref(&entry),
-                            ) {
+                            if let Err(error) = self.cfg.store.append(std::slice::from_ref(&entry))
+                            {
                                 self.entries
                                     .push(Entry::Notice(format!("error: save session: {error}")));
                                 continue;
@@ -1573,7 +1575,7 @@ impl App {
                             context_output: context.output,
                         });
                     }
-                    if let Err(error) = session::append_live(&self.cfg.session_dir, &entries) {
+                    if let Err(error) = self.cfg.store.append(&entries) {
                         self.entries
                             .push(Entry::Notice(format!("error: save session: {error}")));
                     }

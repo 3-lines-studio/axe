@@ -4,6 +4,9 @@
 //!
 //! Lines are append-only entries: a message, or a compaction summary with the
 //! recent messages it retains. Older files with bare messages still load.
+//!
+//! Where the history lives is behind [`Store`]; [`FsStore`] is the one on
+//! files and the one this module implements. An embedder brings its own.
 
 use crate::{Message, Provider, Request};
 use serde::{Deserialize, Serialize};
@@ -38,7 +41,45 @@ pub struct SessionMeta {
     pub title: String,
     pub updated: i64,
     pub turns: usize,
-    pub path: PathBuf,
+}
+
+/// The history of one conversation: the entries the model reads back, and the
+/// catalog of what is stored. Where it lives is the implementor's business, so
+/// an embedder can keep it in files, in a database, or anywhere else, and the
+/// TUI never finds out.
+pub trait Store: Send + Sync {
+    /// The entries of the live session.
+    fn live(&self) -> Vec<Entry>;
+
+    /// Replace the live session with these entries.
+    fn save(&self, entries: &[Entry]) -> std::io::Result<()>;
+
+    /// Add entries to the live session.
+    fn append(&self, entries: &[Entry]) -> std::io::Result<()>;
+
+    /// Move the live session into the archive and return its id.
+    fn archive(&self) -> Option<String>;
+
+    /// Write these entries back into the archived session `id` instead of
+    /// forking a new one. Clears the live session.
+    fn continue_archived(&self, id: &str, entries: &[Entry]) -> std::io::Result<bool>;
+
+    /// Move the live session into the archive `id`.
+    fn continue_archived_live(&self, id: &str) -> std::io::Result<bool>;
+
+    /// Forget the live session.
+    fn discard(&self);
+
+    /// Every archived session, newest first.
+    fn list(&self) -> Vec<SessionMeta>;
+
+    /// The entries of the archived session `id`.
+    fn load(&self, id: &str) -> Option<Vec<Entry>>;
+
+    /// The session `--resume` should reopen, if any.
+    fn resume_id(&self) -> Option<String>;
+    fn set_resume_id(&self, id: &str);
+    fn clear_resume_id(&self);
 }
 
 fn store_dir(dir: &str) -> PathBuf {
@@ -59,7 +100,7 @@ pub fn scope_dir(dir: &str, cwd: &Path) -> String {
         .to_string()
 }
 
-pub fn live_path(dir: &str) -> PathBuf {
+fn live_path(dir: &str) -> PathBuf {
     Path::new(dir).join("session.jsonl")
 }
 
@@ -294,7 +335,7 @@ fn write_entries(path: &Path, entries: &[Entry]) -> std::io::Result<()> {
     })
 }
 
-pub fn save_live(dir: &str, entries: &[Entry]) -> std::io::Result<()> {
+fn save_live(dir: &str, entries: &[Entry]) -> std::io::Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -304,7 +345,7 @@ pub fn save_live(dir: &str, entries: &[Entry]) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn append_live(dir: &str, entries: &[Entry]) -> std::io::Result<()> {
+fn append_live(dir: &str, entries: &[Entry]) -> std::io::Result<()> {
     use std::io::{Read, Seek, Write};
     if entries.is_empty() {
         return Ok(());
@@ -367,25 +408,25 @@ fn resume_id_path(dir: &str) -> PathBuf {
     Path::new(dir).join("session.resume_id")
 }
 
-pub fn set_resume_id(dir: &str, id: &str) {
+fn set_resume_id(dir: &str, id: &str) {
     if !valid_id(id) {
         return;
     }
     let _ = crate::atomic_write(&resume_id_path(dir), id.as_bytes());
 }
 
-pub fn clear_resume_id(dir: &str) {
+fn clear_resume_id(dir: &str) {
     let _ = std::fs::remove_file(resume_id_path(dir));
 }
 
-pub fn discard_live(dir: &str) {
+fn discard_live(dir: &str) {
     let _ = std::fs::remove_file(live_path(dir));
     let _ = std::fs::remove_file(live_sidecar_path(dir));
     let _ = std::fs::remove_file(Path::new(dir).join("session.title"));
     clear_resume_id(dir);
 }
 
-pub fn load_resume_id(dir: &str) -> Option<String> {
+fn load_resume_id(dir: &str) -> Option<String> {
     let id = std::fs::read_to_string(resume_id_path(dir)).ok()?;
     let id = id.trim();
     if valid_id(id) {
@@ -398,7 +439,7 @@ pub fn load_resume_id(dir: &str) -> Option<String> {
 /// Write a continued session back into its original archive instead of
 /// forking a new one. Clears the live transcript so the next launch does
 /// not re-archive it as a duplicate.
-pub fn continue_archived(dir: &str, id: &str, entries: &[Entry]) -> std::io::Result<bool> {
+fn continue_archived(dir: &str, id: &str, entries: &[Entry]) -> std::io::Result<bool> {
     if !valid_id(id) || entries.is_empty() {
         return Ok(false);
     }
@@ -422,7 +463,7 @@ pub fn continue_archived(dir: &str, id: &str, entries: &[Entry]) -> std::io::Res
     Ok(true)
 }
 
-pub fn continue_archived_live(dir: &str, id: &str) -> std::io::Result<bool> {
+fn continue_archived_live(dir: &str, id: &str) -> std::io::Result<bool> {
     if !valid_id(id) {
         return Ok(false);
     }
@@ -453,11 +494,11 @@ pub fn continue_archived_live(dir: &str, id: &str) -> std::io::Result<bool> {
     Ok(true)
 }
 
-pub fn load_live(dir: &str) -> Vec<Entry> {
+fn load_live(dir: &str) -> Vec<Entry> {
     read_entries(&live_path(dir))
 }
 
-pub fn list_sessions(dir: &str) -> Vec<SessionMeta> {
+fn list_sessions(dir: &str) -> Vec<SessionMeta> {
     let store = store_dir(dir);
     let Ok(entries) = std::fs::read_dir(&store) else {
         return Vec::new();
@@ -500,7 +541,6 @@ pub fn list_sessions(dir: &str) -> Vec<SessionMeta> {
             title,
             updated,
             turns,
-            path,
         });
     }
     out.sort_by_key(|m| std::cmp::Reverse(m.updated));
@@ -557,11 +597,7 @@ fn first_words(s: &str, n: usize) -> String {
     words.join(" ")
 }
 
-pub fn load_session(path: &Path) -> Vec<Entry> {
-    read_entries(path)
-}
-
-pub fn archive_live(dir: &str) -> Option<String> {
+fn archive_live(dir: &str) -> Option<String> {
     let path = live_path(dir);
     let bytes = std::fs::metadata(&path).ok()?.len();
     let live_sidecar = read_live_sidecar(dir, bytes);
@@ -618,7 +654,7 @@ pub fn archive_live(dir: &str) -> Option<String> {
     Some(id)
 }
 
-pub fn load_by_id(dir: &str, id: &str) -> Option<Vec<Entry>> {
+fn load_by_id(dir: &str, id: &str) -> Option<Vec<Entry>> {
     if !valid_id(id) {
         return None;
     }
@@ -627,6 +663,68 @@ pub fn load_by_id(dir: &str, id: &str) -> Option<Vec<Entry>> {
         return None;
     }
     Some(read_entries(&path))
+}
+
+/// The history as files: the live session beside its sidecar, and the archive
+/// as a directory of `<id>.jsonl` files with their own.
+pub struct FsStore {
+    dir: String,
+}
+
+impl FsStore {
+    pub fn new(dir: impl Into<String>) -> Self {
+        Self { dir: dir.into() }
+    }
+}
+
+impl Store for FsStore {
+    fn live(&self) -> Vec<Entry> {
+        load_live(&self.dir)
+    }
+
+    fn save(&self, entries: &[Entry]) -> std::io::Result<()> {
+        save_live(&self.dir, entries)
+    }
+
+    fn append(&self, entries: &[Entry]) -> std::io::Result<()> {
+        append_live(&self.dir, entries)
+    }
+
+    fn archive(&self) -> Option<String> {
+        archive_live(&self.dir)
+    }
+
+    fn continue_archived(&self, id: &str, entries: &[Entry]) -> std::io::Result<bool> {
+        continue_archived(&self.dir, id, entries)
+    }
+
+    fn continue_archived_live(&self, id: &str) -> std::io::Result<bool> {
+        continue_archived_live(&self.dir, id)
+    }
+
+    fn discard(&self) {
+        discard_live(&self.dir)
+    }
+
+    fn list(&self) -> Vec<SessionMeta> {
+        list_sessions(&self.dir)
+    }
+
+    fn load(&self, id: &str) -> Option<Vec<Entry>> {
+        load_by_id(&self.dir, id)
+    }
+
+    fn resume_id(&self) -> Option<String> {
+        load_resume_id(&self.dir)
+    }
+
+    fn set_resume_id(&self, id: &str) {
+        set_resume_id(&self.dir, id)
+    }
+
+    fn clear_resume_id(&self) {
+        clear_resume_id(&self.dir)
+    }
 }
 
 fn title_path(dir: &str, id: &str) -> PathBuf {

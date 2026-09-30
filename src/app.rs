@@ -1,4 +1,4 @@
-use crate::session::{self, Entry};
+use crate::session::{self, Entry, Store};
 use crate::{Message, ToolCall};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,17 +359,13 @@ pub fn session_usage(entries: &[Entry]) -> SessionUsage {
     usage
 }
 
-pub fn load_session(dir: &str, id: &str) -> Option<(String, Vec<Entry>)> {
+pub fn load_session(store: &dyn Store, id: &str) -> Option<(String, Vec<Entry>)> {
     if id == "last" {
-        return session::list_sessions(dir)
-            .into_iter()
-            .next()
-            .map(|session_meta| {
-                let entries = session::load_session(&session_meta.path);
-                (session_meta.id, entries)
-            });
+        let session_meta = store.list().into_iter().next()?;
+        let entries = store.load(&session_meta.id)?;
+        return Some((session_meta.id, entries));
     }
-    session::load_by_id(dir, id).map(|entries| (id.to_string(), entries))
+    store.load(id).map(|entries| (id.to_string(), entries))
 }
 
 #[cfg(test)]
