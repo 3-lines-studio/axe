@@ -45,8 +45,8 @@ pub struct SessionMeta {
 
 /// The history of one conversation: the entries the model reads back, and the
 /// catalog of what is stored. Where it lives is the implementor's business, so
-/// an embedder can keep it in files, in a database, or anywhere else, and the
-/// TUI never finds out.
+/// an embedder can keep it in files, in a database, or anywhere else, and
+/// nothing above it finds out.
 pub trait Store: Send + Sync {
     /// The entries of the live session.
     fn live(&self) -> Vec<Entry>;
