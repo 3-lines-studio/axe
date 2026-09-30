@@ -439,65 +439,6 @@ fn session_large_roundtrip() {
 }
 
 #[test]
-fn stress_load_config_via_binary() {
-    let bin = env!("CARGO_BIN_EXE_axe");
-    let dir = std::env::temp_dir().join(format!("axe-cfg-bin-{}", std::process::id()));
-    let cfg_dir = dir.join("axe");
-    std::fs::create_dir_all(&cfg_dir).unwrap();
-
-    let mut rng = Rng(0xFEEDFACE);
-    let keys = ["api_key", "model", "base", "other", ""];
-    let mut cases = 0;
-    for _ in 0..150 {
-        let mut text = String::new();
-        for _ in 0..rng.below(12) {
-            let k = keys[rng.below(keys.len())];
-            let v: String = (0..rng.below(40))
-                .map(|_| {
-                    let b = rng.next() as u8;
-                    if b == b'\n' || b == 0 { 'x' } else { b as char }
-                })
-                .collect();
-            text.push_str(&format!("{k}={v}\n"));
-        }
-        std::fs::write(cfg_dir.join("config"), &text).unwrap();
-        let out = std::process::Command::new(bin)
-            .arg("-h")
-            .env("XDG_CONFIG_HOME", &dir)
-            .env_remove("OPENAI_API_KEY")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "binary crashed on fuzzed config:\n{text}"
-        );
-        cases += 1;
-    }
-
-    if let Some(home) = std::env::var_os("HOME") {
-        let real = std::path::Path::new(&home).join(".config").join("axe");
-        if real.join("config").exists() {
-            let _ = std::fs::create_dir_all(cfg_dir.clone());
-            let _ = std::fs::copy(real.join("config"), cfg_dir.join("config"));
-            let _ = std::fs::copy(real.join("SYSTEM.md"), cfg_dir.join("SYSTEM.md"));
-            let out = std::process::Command::new(bin)
-                .arg("-h")
-                .env("XDG_CONFIG_HOME", &dir)
-                .env_remove("OPENAI_API_KEY")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "binary crashed on real ~/.config/axe/config"
-            );
-        }
-    }
-
-    std::fs::remove_dir_all(&dir).ok();
-    eprintln!("stress_load_config_via_binary: {cases} fuzzed + real config");
-}
-
-#[test]
 fn sse_huge_index_capped() {
     let payload = concat!(
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":2000000000,\"id\":\"c\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n\n",

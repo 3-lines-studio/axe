@@ -2,31 +2,18 @@
 
 ## Quality gate
 
-Run `make check` before finishing any change. It runs fmt, clippy,
-`cargo test`, the release build, and the black-box harness:
+Run `make check` before finishing any change. It runs fmt, clippy with warnings
+as errors, and `cargo test`:
 
 ```bash
 make check
 ```
-
-The release build catches linker/panic-abort issues that unit tests miss.
-`scripts/harness.py` (also runnable standalone via `make harness`) drives the
-real binary end to end with a mock OpenAI endpoint and a PTY for the TUI; it
-needs python3, already a dev dependency for `scripts/mock-server.py`.
 
 Cheaper daily loop (autofixes without the gate):
 
 ```bash
 cargo clippy --fix --allow-dirty && cargo fmt && cargo test
 ```
-
-Install the current checkout to `~/.local/bin/axe` for local use:
-
-```bash
-make install
-```
-
-Set `PREFIX` to install elsewhere.
 
 ## Known exceptions
 
@@ -36,8 +23,8 @@ Set `PREFIX` to install elsewhere.
 
 ## Project rules
 
-- Release binary stays under 1 MB.
 - Keep dependencies minimal. No compile-time curl.
 - Extra instructions live in `~/.config/axe/SYSTEM.md`. No plugin system,
   no MCP, no permissions layer.
 - Config and project-scoped sessions live under `~/.config/axe/`.
+- Axe is a library: no UI, no binary, no terminal handling.
