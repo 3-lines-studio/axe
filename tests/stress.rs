@@ -7,6 +7,7 @@
 //! Run: cargo test --release --test stress
 
 use axe::openai::StreamEvent;
+use axe::session::{FsStore, Store};
 use axe::{Message, OpenAI, Request, new_tool};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -190,20 +191,21 @@ fn fuzz_session(_rng: &mut Rng, seed: u64, input: &[u8]) {
         std::env::temp_dir().join(format!("axe-stress-session-{seed}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join("session.jsonl"), input);
+    let store = FsStore::new(dir.to_str().unwrap());
     guard("session load_live", seed, || {
-        let msgs = axe::session::load_live(dir.to_str().unwrap());
+        let msgs = store.live();
         assert!(msgs.len() <= input.iter().filter(|&&b| b == b'\n').count() + 1);
     });
     guard("session list", seed, || {
-        let _ = axe::session::list_sessions(dir.to_str().unwrap());
+        let _ = store.list();
     });
     guard("session archive", seed, || {
-        let _ = axe::session::archive_live(dir.to_str().unwrap());
+        let _ = store.archive();
     });
     guard("session save roundtrip", seed, || {
-        let msgs = axe::session::load_live(dir.to_str().unwrap());
-        let _ = axe::session::save_live(dir.to_str().unwrap(), &msgs);
-        let again = axe::session::load_live(dir.to_str().unwrap());
+        let msgs = store.live();
+        let _ = store.save(&msgs);
+        let again = store.live();
         assert_eq!(msgs, again);
     });
     let _ = std::fs::remove_dir_all(&dir);
@@ -408,6 +410,7 @@ fn session_large_roundtrip() {
     let dir = std::env::temp_dir().join(format!("axe-session-large-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let d = dir.to_str().unwrap();
+    let store = FsStore::new(d);
     let n = 50_000;
     let message = Message {
         role: "user".into(),
@@ -422,13 +425,13 @@ fn session_large_roundtrip() {
             message: message.clone(),
         })
         .collect();
-    axe::session::save_live(d, &entries).unwrap();
-    let loaded = axe::session::load_live(d);
+    store.save(&entries).unwrap();
+    let loaded = store.live();
     assert_eq!(loaded.len(), n);
     assert_eq!(loaded, entries);
     assert_eq!(axe::session::context_messages(&loaded).len(), n);
-    let id = axe::session::archive_live(d).expect("archive");
-    let meta = axe::session::list_sessions(d);
+    let id = store.archive().expect("archive");
+    let meta = store.list();
     assert_eq!(meta.len(), 1);
     assert_eq!(meta[0].id, id);
     assert_eq!(meta[0].turns, n);
@@ -517,17 +520,15 @@ fn session_load_by_id_sanitizes_paths() {
     .unwrap();
     std::fs::write(dir.join("secret.jsonl"), "not a session").unwrap();
     let d = dir.to_str().unwrap();
+    let fs = FsStore::new(d);
 
-    let ok = axe::session::load_by_id(d, "123").expect("valid id loads");
+    let ok = fs.load("123").expect("valid id loads");
     let msgs = axe::session::context_messages(&ok);
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].content, "hi");
 
     for bad in ["", ".", "..", "../secret", "..\\secret", "/etc/passwd"] {
-        assert!(
-            axe::session::load_by_id(d, bad).is_none(),
-            "id {bad:?} must be rejected"
-        );
+        assert!(fs.load(bad).is_none(), "id {bad:?} must be rejected");
     }
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -681,6 +682,7 @@ fn session_compaction_roundtrip() {
     let dir = std::env::temp_dir().join(format!("axe-session-entries-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let d = dir.to_str().unwrap();
+    let store = FsStore::new(d);
 
     let entry = axe::session::Entry::Compaction {
         summary: "done stuff".into(),
@@ -702,8 +704,8 @@ fn session_compaction_roundtrip() {
         context_input: 100,
         context_output: 8,
     };
-    axe::session::save_live(d, &[entry, usage]).unwrap();
-    let entries = axe::session::load_live(d);
+    store.save(&[entry, usage]).unwrap();
+    let entries = store.live();
     assert!(matches!(
         entries[1],
         axe::session::Entry::Usage {
@@ -728,6 +730,7 @@ fn session_compaction_is_append_only() {
     let dir = std::env::temp_dir().join(format!("axe-compact-append-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let d = dir.to_str().unwrap();
+    let store = FsStore::new(d);
 
     let msg = |role: &str, content: &str| Message {
         role: role.into(),
@@ -745,7 +748,7 @@ fn session_compaction_is_append_only() {
             message: msg("assistant", "noted"),
         },
     ];
-    axe::session::save_live(d, &entries).unwrap();
+    store.save(&entries).unwrap();
 
     // Compaction appends; nothing is rewritten or dropped from disk.
     entries.push(axe::session::Entry::Compaction {
@@ -757,11 +760,11 @@ fn session_compaction_is_append_only() {
     entries.push(axe::session::Entry::Message {
         message: msg("user", "new question"),
     });
-    axe::session::save_live(d, &entries).unwrap();
-    assert_eq!(axe::session::load_live(d).len(), 4, "history stays on disk");
+    store.save(&entries).unwrap();
+    assert_eq!(store.live().len(), 4, "history stays on disk");
 
     // The projection supersedes everything before the summary.
-    let msgs = axe::session::context_messages(&axe::session::load_live(d));
+    let msgs = axe::session::context_messages(&store.live());
     assert_eq!(msgs.len(), 3);
     assert!(msgs[0].content.contains("earlier work summarized"));
     assert_eq!(msgs[1].content, "recent");
@@ -788,7 +791,7 @@ fn session_overflow_patterns() {
 
 #[test]
 fn builtin_tool_snippets_present() {
-    let tools = axe::tui::build_tools("");
+    let tools = axe::tools::build_tools("");
     for name in ["read", "write", "edit", "bash"] {
         let t = tools.iter().find(|t| t.name == name).expect(name);
         assert!(!t.snippet.is_empty(), "{name} has no snippet");

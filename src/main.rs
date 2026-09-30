@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use axe::run::{self, Outcome, RunOptions, Sink};
+use axe::session::Store;
 use axe::{Image, Message, OpenAI, Tool, ToolCall, Usage};
 use std::io::{IsTerminal, Read};
 use std::sync::Arc;
@@ -54,24 +55,34 @@ fn main() {
             eprintln!("error: --image needs a prompt; it cannot open the TUI");
             std::process::exit(2);
         }
-        let tools = axe::tui::build_tools(&cfg.dir);
-        let session_dir =
-            axe::session::scope_dir(&axe_root(), std::path::Path::new(&work_dir(&cfg)));
-        let tui_cfg = axe::tui::TuiConfig {
-            base: cfg.base.clone(),
-            model: cfg.model.clone(),
-            system: resolve_system(&cfg, &tools),
-            dir: cfg.dir.clone(),
-            session_dir,
-            api_key: api_key(&fc),
-            resume: cfg.resume.clone(),
-            context_window: fc.context_window,
-        };
-        if let Err(e) = axe::tui::run(tui_cfg) {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+        #[cfg(feature = "tui")]
+        {
+            let tools = axe::tools::build_tools(&cfg.dir);
+            let store = Arc::new(axe::session::FsStore::new(axe::session::scope_dir(
+                &axe_root(),
+                std::path::Path::new(&work_dir(&cfg)),
+            )));
+            let tui_cfg = axe::tui::TuiConfig {
+                base: cfg.base.clone(),
+                model: cfg.model.clone(),
+                system: resolve_system(&cfg, &tools),
+                dir: cfg.dir.clone(),
+                store,
+                api_key: api_key(&fc),
+                resume: cfg.resume.clone(),
+                context_window: fc.context_window,
+            };
+            if let Err(e) = axe::tui::run(tui_cfg) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            return;
         }
-        return;
+        #[cfg(not(feature = "tui"))]
+        {
+            eprintln!("error: this build of axe has no TUI; pass a prompt");
+            std::process::exit(2);
+        }
     }
     if prompt.is_empty() {
         let mut b = String::new();
@@ -227,24 +238,24 @@ impl Sink for CliSink {
 }
 
 fn persist_oneshot(
-    dir: &str,
+    store: &dyn axe::session::Store,
     resume_id: Option<&str>,
     entries: &[axe::session::Entry],
 ) -> std::io::Result<()> {
     let Some(id) = resume_id else {
         return Ok(());
     };
-    axe::session::continue_archived(dir, id, entries).map(|_| ())
+    store.continue_archived(id, entries).map(|_| ())
 }
 
 fn fail_oneshot(
-    dir: &str,
+    store: &dyn axe::session::Store,
     resume_id: Option<&str>,
     entries: &[axe::session::Entry],
     msg: String,
 ) -> ! {
     eprintln!("{msg}");
-    if let Err(e) = persist_oneshot(dir, resume_id, entries) {
+    if let Err(e) = persist_oneshot(store, resume_id, entries) {
         eprintln!("error: save session: {e}");
     }
     std::process::exit(1);
@@ -252,19 +263,23 @@ fn fail_oneshot(
 
 fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     let start = Instant::now();
-    let session_dir = axe::session::scope_dir(&axe_root(), std::path::Path::new(&work_dir(cfg)));
+    let store = axe::session::FsStore::new(axe::session::scope_dir(
+        &axe_root(),
+        std::path::Path::new(&work_dir(cfg)),
+    ));
     let mut resume_id = None;
     let mut history = Vec::new();
     let mut session_entries = Vec::new();
     if let Some(id) = &cfg.resume {
-        axe::session::archive_live(&session_dir);
+        store.archive();
         let loaded = if id == "last" {
-            axe::session::list_sessions(&session_dir)
+            store
+                .list()
                 .into_iter()
                 .next()
-                .map(|s| (s.id, axe::session::load_session(&s.path)))
+                .and_then(|s| store.load(&s.id).map(|entries| (s.id, entries)))
         } else {
-            axe::session::load_by_id(&session_dir, id).map(|entries| (id.clone(), entries))
+            store.load(id).map(|entries| (id.clone(), entries))
         };
         match loaded {
             Some((id, entries)) => {
@@ -290,7 +305,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     session_entries.push(axe::session::Entry::Message {
         message: history.last().unwrap().clone(),
     });
-    let tools = axe::tui::build_tools(&cfg.dir);
+    let tools = axe::tools::build_tools(&cfg.dir);
     let system = resolve_system(cfg, &tools);
     let provider = OpenAI::new(cfg.base.clone(), api_key(fc));
     let mut sink = CliSink {
@@ -332,14 +347,14 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
                     history = compact_or_fail(
                         &provider,
                         &cfg.model,
-                        &session_dir,
+                        &store,
                         resume_id.as_deref(),
                         &mut session_entries,
                     );
                     continue;
                 }
                 fail_oneshot(
-                    &session_dir,
+                    &store,
                     resume_id.as_deref(),
                     &session_entries,
                     format!("error: {error}"),
@@ -349,7 +364,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
                 history = compact_or_fail(
                     &provider,
                     &cfg.model,
-                    &session_dir,
+                    &store,
                     resume_id.as_deref(),
                     &mut session_entries,
                 );
@@ -357,7 +372,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
             }
             Outcome::Cancelled => {
                 fail_oneshot(
-                    &session_dir,
+                    &store,
                     resume_id.as_deref(),
                     &session_entries,
                     "error: interrupted".into(),
@@ -365,7 +380,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
             }
             Outcome::MaxTurns => {
                 fail_oneshot(
-                    &session_dir,
+                    &store,
                     resume_id.as_deref(),
                     &session_entries,
                     "error: stopped: max turns reached".into(),
@@ -377,7 +392,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
             }
         }
     }
-    if let Err(e) = persist_oneshot(&session_dir, resume_id.as_deref(), &session_entries) {
+    if let Err(e) = persist_oneshot(&store, resume_id.as_deref(), &session_entries) {
         eprintln!("error: save session: {e}");
         std::process::exit(1);
     }
@@ -399,7 +414,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
 fn compact_or_fail(
     provider: &OpenAI,
     model: &str,
-    dir: &str,
+    store: &dyn axe::session::Store,
     resume_id: Option<&str>,
     entries: &mut Vec<axe::session::Entry>,
 ) -> Vec<Message> {
@@ -416,7 +431,7 @@ fn compact_or_fail(
             out
         }
         Err(e) => fail_oneshot(
-            dir,
+            store,
             resume_id,
             entries,
             format!("error: compaction failed: {e}"),

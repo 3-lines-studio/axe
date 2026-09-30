@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
+#[cfg(feature = "tui")]
 pub mod app;
 pub mod curlffi;
 mod http;
@@ -22,6 +23,7 @@ pub mod run;
 pub mod sentinel;
 pub mod session;
 pub mod tools;
+#[cfg(feature = "tui")]
 pub mod tui;
 pub mod web;
 
