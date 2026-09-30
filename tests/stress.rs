@@ -788,7 +788,7 @@ fn session_overflow_patterns() {
 
 #[test]
 fn builtin_tool_snippets_present() {
-    let tools = axe::tui::build_tools("");
+    let tools = axe::tools::build_tools("");
     for name in ["read", "write", "edit", "bash"] {
         let t = tools.iter().find(|t| t.name == name).expect(name);
         assert!(!t.snippet.is_empty(), "{name} has no snippet");

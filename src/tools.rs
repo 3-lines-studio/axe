@@ -9,6 +9,24 @@ const MAX_OUTPUT: usize = 16 * 1024;
 const DEFAULT_BASH_TIMEOUT: u64 = 120;
 const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The tools for a process that works in `dir`.
+pub fn build_tools(dir: &str) -> Vec<Tool> {
+    build_tools_on(std::sync::Arc::new(crate::machine::Local::new(dir)))
+}
+
+/// The tools over a machine that is not necessarily this process's: a control
+/// plane brings its own volume and shell, and the tools cannot tell.
+pub fn build_tools_on(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Vec<Tool> {
+    vec![
+        read(machine.clone()),
+        write(machine.clone()),
+        edit(machine.clone()),
+        bash(machine),
+        crate::web::search(),
+        crate::web::fetch(),
+    ]
+}
+
 /// Strip control characters (except tab/newline/CR) and Unicode format
 /// interlinear annotation marks from tool output before it reaches the model.
 fn sanitize(s: &str) -> String {

@@ -1,4 +1,4 @@
-use axe::{Message, OpenAI, Provider, Request, ToolCall, run, session, tui};
+use axe::{Message, OpenAI, Provider, Request, ToolCall, run, session, tools};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -236,7 +236,7 @@ fn live_agent_finishes_a_repository_task_across_forced_compactions() {
     let mut entries = vec![session::Entry::Message {
         message: message("user", prompt),
     }];
-    let tools = tui::build_tools(root.to_str().expect("project path"));
+    let tools = tools::build_tools(root.to_str().expect("project path"));
     let mut sink = ForcedCompactionSink::default();
     let mut compactions = 0;
     let mut restarts = 0;

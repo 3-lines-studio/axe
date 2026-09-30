@@ -54,24 +54,32 @@ fn main() {
             eprintln!("error: --image needs a prompt; it cannot open the TUI");
             std::process::exit(2);
         }
-        let tools = axe::tui::build_tools(&cfg.dir);
-        let session_dir =
-            axe::session::scope_dir(&axe_root(), std::path::Path::new(&work_dir(&cfg)));
-        let tui_cfg = axe::tui::TuiConfig {
-            base: cfg.base.clone(),
-            model: cfg.model.clone(),
-            system: resolve_system(&cfg, &tools),
-            dir: cfg.dir.clone(),
-            session_dir,
-            api_key: api_key(&fc),
-            resume: cfg.resume.clone(),
-            context_window: fc.context_window,
-        };
-        if let Err(e) = axe::tui::run(tui_cfg) {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+        #[cfg(feature = "tui")]
+        {
+            let tools = axe::tools::build_tools(&cfg.dir);
+            let session_dir =
+                axe::session::scope_dir(&axe_root(), std::path::Path::new(&work_dir(&cfg)));
+            let tui_cfg = axe::tui::TuiConfig {
+                base: cfg.base.clone(),
+                model: cfg.model.clone(),
+                system: resolve_system(&cfg, &tools),
+                dir: cfg.dir.clone(),
+                session_dir,
+                api_key: api_key(&fc),
+                resume: cfg.resume.clone(),
+                context_window: fc.context_window,
+            };
+            if let Err(e) = axe::tui::run(tui_cfg) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            return;
         }
-        return;
+        #[cfg(not(feature = "tui"))]
+        {
+            eprintln!("error: this build of axe has no TUI; pass a prompt");
+            std::process::exit(2);
+        }
     }
     if prompt.is_empty() {
         let mut b = String::new();
@@ -290,7 +298,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     session_entries.push(axe::session::Entry::Message {
         message: history.last().unwrap().clone(),
     });
-    let tools = axe::tui::build_tools(&cfg.dir);
+    let tools = axe::tools::build_tools(&cfg.dir);
     let system = resolve_system(cfg, &tools);
     let provider = OpenAI::new(cfg.base.clone(), api_key(fc));
     let mut sink = CliSink {

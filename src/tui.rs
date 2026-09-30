@@ -2,7 +2,7 @@ use crate::app;
 use crate::openai::OpenAI;
 use crate::run::{self, Outcome, RunOptions, Sink};
 use crate::session;
-use crate::{Image, Message, Tool, ToolCall, ToolOutput, Usage};
+use crate::{Image, Message, ToolCall, ToolOutput, Usage};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
@@ -36,23 +36,6 @@ pub struct TuiConfig {
     pub api_key: String,
     pub resume: Option<String>,
     pub context_window: Option<usize>,
-}
-
-pub fn build_tools(dir: &str) -> Vec<Tool> {
-    build_tools_on(std::sync::Arc::new(crate::machine::Local::new(dir)))
-}
-
-/// The tools over a machine that is not necessarily this process's: a control
-/// plane brings its own volume and shell, and the tools cannot tell.
-pub fn build_tools_on(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Vec<Tool> {
-    vec![
-        crate::tools::read(machine.clone()),
-        crate::tools::write(machine.clone()),
-        crate::tools::edit(machine.clone()),
-        crate::tools::bash(machine),
-        crate::web::search(),
-        crate::web::fetch(),
-    ]
 }
 
 enum Entry {
@@ -1447,7 +1430,7 @@ impl App {
         let provider = OpenAI::new(self.cfg.base.clone(), self.cfg.api_key.clone());
         let model = self.cfg.model.clone();
         let system = self.cfg.system.clone();
-        let tools = build_tools(&self.cfg.dir);
+        let tools = crate::tools::build_tools(&self.cfg.dir);
         let threshold = self
             .cfg
             .context_window

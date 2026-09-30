@@ -3,7 +3,7 @@
 //!
 //!     cargo test --test live-web -- --ignored --nocapture
 
-use axe::tui::build_tools;
+use axe::tools::build_tools;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
