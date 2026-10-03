@@ -1,6 +1,6 @@
 //! OpenAI-compatible chat completions provider.
 
-use crate::{Error, Message, Provider, Request, Response, StreamHandle, ToolCall, Usage};
+use crate::{Error, Image, Message, Provider, Request, Response, StreamHandle, ToolCall, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
@@ -17,6 +17,8 @@ pub struct OpenAI {
 }
 
 type BuiltRequest = (String, Vec<(String, String)>, Vec<u8>);
+
+const MAX_IMAGE_URL_BYTES: usize = 24 * 1024 * 1024;
 
 pub use crate::StreamEvent;
 
@@ -59,7 +61,13 @@ impl OpenAI {
                 tool_call_id: None,
             });
         }
-        for m in req.messages {
+        let first_with_images = first_message_with_images(req.messages);
+        for (index, m) in req.messages.iter().enumerate() {
+            let images = if index >= first_with_images {
+                m.images.as_slice()
+            } else {
+                &[]
+            };
             let tool_calls = if m.tool_calls.is_empty() {
                 None
             } else {
@@ -79,7 +87,7 @@ impl OpenAI {
             };
             msgs.push(OaRequestMessage {
                 role: &m.role,
-                content: message_content(m),
+                content: message_content(m, images),
                 reasoning_content: if m.reasoning.is_empty() {
                     None
                 } else {
@@ -124,20 +132,43 @@ impl OpenAI {
     }
 }
 
+fn first_message_with_images(messages: &[Message]) -> usize {
+    let turn_start = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .unwrap_or(0);
+    let mut budget = MAX_IMAGE_URL_BYTES;
+    let mut first = messages.len();
+    for (index, message) in messages.iter().enumerate().rev() {
+        if index < turn_start {
+            break;
+        }
+        let bytes: usize = message.images.iter().map(|image| image.url.len()).sum();
+        if bytes > budget {
+            break;
+        }
+        budget -= bytes;
+        if !message.images.is_empty() {
+            first = index;
+        }
+    }
+    first
+}
+
 /// OpenAI `content` is a plain string, or a block array when the message
 /// carries images.
-fn message_content(m: &Message) -> Option<Value> {
-    if m.images.is_empty() {
+fn message_content(m: &Message, images: &[Image]) -> Option<Value> {
+    if images.is_empty() {
         if m.content.is_empty() && m.role != "assistant" && m.role != "tool" {
             return None;
         }
         return Some(Value::String(m.content.clone()));
     }
-    let mut parts = Vec::with_capacity(m.images.len() + 1);
+    let mut parts = Vec::with_capacity(images.len() + 1);
     if !m.content.is_empty() {
         parts.push(serde_json::json!({"type": "text", "text": m.content}));
     }
-    for image in &m.images {
+    for image in images {
         parts.push(serde_json::json!({
             "type": "image_url",
             "image_url": {"url": image.url},
@@ -806,5 +837,90 @@ mod tests {
                 .any(|e| matches!(e, StreamEvent::Content(c) if c == "x")),
             "{got:?}"
         );
+    }
+
+    fn image_message(index: usize, bytes: usize) -> Message {
+        Message {
+            role: "tool".into(),
+            content: format!("Attached /tmp/{index}.jpg for viewing."),
+            tool_call_id: format!("call_{index}"),
+            images: vec![Image {
+                path: format!("/tmp/{index}.jpg"),
+                url: format!("data:image/jpeg;base64,{}", "A".repeat(bytes)),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn messages_with_images(body: &[u8]) -> Vec<usize> {
+        let parsed: Value = serde_json::from_slice(body).unwrap();
+        parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message["content"].is_array())
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[test]
+    fn a_history_over_the_image_budget_sends_only_the_newest_images() {
+        let messages: Vec<Message> = (0..8).map(|i| image_message(i, 7 * 1024 * 1024)).collect();
+        let req = Request {
+            model: "m",
+            system: "",
+            messages: &messages,
+            tools: &[],
+        };
+        let provider = OpenAI::new("http://localhost", "k");
+        let (_, _, body) = provider.build_request(&req, true).unwrap();
+        assert_eq!(messages_with_images(&body), vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn an_image_from_an_earlier_turn_is_not_resent() {
+        let mut messages: Vec<Message> = vec![
+            Message {
+                role: "user".into(),
+                content: "mira esto".into(),
+                ..Default::default()
+            },
+            image_message(0, 1024),
+            Message {
+                role: "assistant".into(),
+                content: "ya la vi".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".into(),
+                content: "y ahora esta".into(),
+                ..Default::default()
+            },
+        ];
+        messages.push(image_message(1, 1024));
+        let req = Request {
+            model: "m",
+            system: "",
+            messages: &messages,
+            tools: &[],
+        };
+        let provider = OpenAI::new("http://localhost", "k");
+        let (_, _, body) = provider.build_request(&req, true).unwrap();
+        assert_eq!(messages_with_images(&body), vec![4]);
+    }
+
+    #[test]
+    fn a_history_within_the_image_budget_sends_every_image() {
+        let messages: Vec<Message> = (0..3).map(|i| image_message(i, 1024)).collect();
+        let req = Request {
+            model: "m",
+            system: "",
+            messages: &messages,
+            tools: &[],
+        };
+        let provider = OpenAI::new("http://localhost", "k");
+        let (_, _, body) = provider.build_request(&req, true).unwrap();
+        assert_eq!(messages_with_images(&body), vec![0, 1, 2]);
     }
 }
