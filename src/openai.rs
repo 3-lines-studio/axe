@@ -133,9 +133,16 @@ impl OpenAI {
 }
 
 fn first_message_with_images(messages: &[Message]) -> usize {
+    let turn_start = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .unwrap_or(0);
     let mut budget = MAX_IMAGE_URL_BYTES;
     let mut first = messages.len();
     for (index, message) in messages.iter().enumerate().rev() {
+        if index < turn_start {
+            break;
+        }
         let bytes: usize = message.images.iter().map(|image| image.url.len()).sum();
         if bytes > budget {
             break;
@@ -869,6 +876,38 @@ mod tests {
         let provider = OpenAI::new("http://localhost", "k");
         let (_, _, body) = provider.build_request(&req, true).unwrap();
         assert_eq!(messages_with_images(&body), vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn an_image_from_an_earlier_turn_is_not_resent() {
+        let mut messages: Vec<Message> = vec![
+            Message {
+                role: "user".into(),
+                content: "mira esto".into(),
+                ..Default::default()
+            },
+            image_message(0, 1024),
+            Message {
+                role: "assistant".into(),
+                content: "ya la vi".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".into(),
+                content: "y ahora esta".into(),
+                ..Default::default()
+            },
+        ];
+        messages.push(image_message(1, 1024));
+        let req = Request {
+            model: "m",
+            system: "",
+            messages: &messages,
+            tools: &[],
+        };
+        let provider = OpenAI::new("http://localhost", "k");
+        let (_, _, body) = provider.build_request(&req, true).unwrap();
+        assert_eq!(messages_with_images(&body), vec![4]);
     }
 
     #[test]
