@@ -1,7 +1,3 @@
-//! The loop is the only logic: messages -> LLM -> tool calls -> results ->
-//! repeat. It never mutates its input; the transcript it builds is
-//! append-only. Compaction and steering live outside this module.
-
 use crate::sentinel;
 use crate::{
     Error, Message, Provider, Request, Response, StreamEvent, Tool, ToolCall, ToolOutput, Usage,
@@ -10,8 +6,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Retries for retryable provider failures (rate limits, 5xx, transport
-/// errors) before the request reaches the turn loop.
 const MAX_RETRIES: usize = 2;
 
 fn retryable(e: &Error) -> bool {
@@ -19,8 +13,6 @@ fn retryable(e: &Error) -> bool {
         Error::Http { status, .. } => {
             *status == 408 || *status == 409 || *status == 429 || *status >= 500
         }
-        // Connection-level failures are worth another attempt; provider
-        // errors (bad responses, parse failures, cancellation) are not.
         Error::Transport(_) => true,
         _ => false,
     }
@@ -67,7 +59,6 @@ pub trait Sink {
     }
     fn assistant(&mut self, _turn: usize, _msg: &Message, _usage: Usage) {}
     fn tool(&mut self, _turn: usize, _msg: &Message) {}
-    /// Poll for a user message typed while the agent was running.
     fn pending_user_input(&mut self) -> Option<String> {
         None
     }
@@ -90,11 +81,7 @@ pub enum Outcome {
 }
 pub struct RunEnd {
     pub messages: Vec<Message>,
-    /// Tokens billed across every request in the run.
     pub usage: Usage,
-    /// Usage of the last request: its input is the context size the provider
-    /// saw, its output the tokens generated in the final turn. Callers
-    /// persist this for the compaction budget and the resume display.
     pub context: Usage,
     pub outcome: Outcome,
 }
@@ -186,9 +173,6 @@ pub fn run_stream<P: Provider>(
                 outcome: Outcome::Done,
             };
         }
-        // A "length" stop means the output was cut off by the token limit, so
-        // every tool call in the message may carry truncated arguments. Fail
-        // them all instead of executing potentially borked calls.
         let truncated = resp.stop_reason == "length";
         if !run_tool_batch(opts.tools, calls, truncated, turn, cancel, sink, &mut h) {
             return RunEnd {
@@ -229,8 +213,6 @@ fn user_message(text: String) -> Message {
     }
 }
 
-/// Execute one assistant message's tool calls, appending tool results to `h`.
-/// Returns false when the run should stop due to cancellation.
 fn run_tool_batch(
     tools: &[Tool],
     calls: Vec<ToolCall>,
@@ -253,9 +235,6 @@ fn run_tool_batch(
             interrupted |= cancelled(cancel);
             sink.tool_start(&call);
             let (output, elapsed) = if interrupted {
-                // Synthesize a result for every un-executed call so the
-                // transcript stays valid: providers reject an assistant
-                // message whose tool_calls lack matching tool results.
                 (
                     ToolOutput::text("error: tool call not executed: the run was interrupted."),
                     Duration::ZERO,
@@ -358,11 +337,6 @@ fn run_parallel(
         }
     });
     for (idx, call) in calls.iter().enumerate() {
-        // Every spawned thread sends exactly one Done before the scope joins,
-        // so a missing result means the thread panicked. That aborts the
-        // process (release, panic = "immediate-abort") or is re-raised by
-        // thread::scope (test profile) before this loop runs, so the result is
-        // always present.
         let (content, elapsed) = outputs[idx]
             .take()
             .expect("scoped tool thread always reports a result");
@@ -469,8 +443,6 @@ fn stream<P: Provider>(
                 return Ok((resp, calls));
             }
             Err(e) => {
-                // Only retry failures that emitted no events yet: once content
-                // reached the sink, a re-run would duplicate it.
                 if attempt >= MAX_RETRIES || forwarded > 0 || !retryable(&e) {
                     return Err(e.to_string());
                 }

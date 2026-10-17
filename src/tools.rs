@@ -1,5 +1,3 @@
-//! Built-in tools: bash, read, write, edit.
-
 use crate::{Tool, ToolOutput, new_tool, new_tool_with_progress};
 use serde::Deserialize;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -9,7 +7,6 @@ const MAX_OUTPUT: usize = 16 * 1024;
 const DEFAULT_BASH_TIMEOUT: u64 = 120;
 const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The tools for a process that works in `dir`.
 pub fn build_tools(dir: &str) -> Vec<Tool> {
     build_tools_with(
         std::sync::Arc::new(crate::machine::Local::new(dir)),
@@ -17,15 +14,10 @@ pub fn build_tools(dir: &str) -> Vec<Tool> {
     )
 }
 
-/// The tools over a machine that is not necessarily this process's: a control
-/// plane brings its own volume and shell, and the tools cannot tell.
 pub fn build_tools_on(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Vec<Tool> {
     build_tools_with(machine, crate::web::Web::from_env())
 }
 
-/// The same tools with the web ones configured explicitly. Without `web` the
-/// list keeps only what runs on the machine, so a model is never offered a
-/// search that cannot authenticate.
 pub fn build_tools_with(
     machine: std::sync::Arc<dyn crate::machine::Machine>,
     web: Option<crate::web::Web>,
@@ -43,8 +35,6 @@ pub fn build_tools_with(
     tools
 }
 
-/// Strip control characters (except tab/newline/CR) and Unicode format
-/// interlinear annotation marks from tool output before it reaches the model.
 fn sanitize(s: &str) -> String {
     s.chars()
         .filter(|&c| {
@@ -120,7 +110,6 @@ fn unregister_pgid(pgid: i32) {
     }
 }
 
-/// Kill every live bash process group. Safe from a signal handler.
 pub fn kill_children() {
     for slot in &CHILD_PGIDS {
         let pgid = slot.swap(0, std::sync::atomic::Ordering::AcqRel);
@@ -187,9 +176,6 @@ fn wait_for_child(pidfd: Option<&OwnedFd>, timeout: std::time::Duration) {
     }
 }
 
-/// Reap a killed child, giving up after `grace` so an unkillable process
-/// (uninterruptible I/O, frozen cgroup, stopped tracer) can never hang the
-/// tool past its timeout.
 fn reap(child: &mut std::process::Child, grace: std::time::Duration) {
     let until = std::time::Instant::now() + grace;
     loop {
@@ -205,8 +191,6 @@ fn reap(child: &mut std::process::Child, grace: std::time::Duration) {
     }
 }
 
-/// Run a command on the local machine: the process group, the temporary output
-/// files, the timeout and the exit status are all handled here.
 pub fn run_shell(dir: &str, command: &str, timeout: u64, progress: &mut dyn FnMut(&str)) -> String {
     let tag = BASH_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     ensure_sigint_handler();
@@ -241,8 +225,6 @@ pub fn run_shell(dir: &str, command: &str, timeout: u64, progress: &mut dyn FnMu
             return format!("error: {e}");
         }
     };
-    // Registered so sigint_reap_children can kill the group if axe
-    // dies first; dropped (unregistered) when the child is reaped.
     let pgid = child.id() as i32;
     if !register_pgid(pgid) {
         unsafe { libc::kill(-pgid, libc::SIGKILL) };
@@ -367,8 +349,6 @@ mod tests {
 
     #[test]
     fn edit_preserves_mixed_line_endings() {
-        // CRLF file with one LF-only line: editing the CRLF part must not
-        // rewrite the LF line's ending.
         let body = "a\r\nb\nc\r\n";
         let edits = vec![super::EditArg {
             old_text: "a\r\n".into(),
@@ -377,7 +357,6 @@ mod tests {
         let out = apply_edits("f", body, &edits).unwrap().content;
         assert_eq!(out, "A\r\nb\nc\r\n");
 
-        // Editing the LF-only line leaves CRLF lines alone.
         let edits = vec![super::EditArg {
             old_text: "b".into(),
             new_text: "B\nB2".into(),
@@ -542,8 +521,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let read = crate::tools::read(local());
 
-        // A real PNG signature followed by NUL bytes: the image check must win
-        // over the binary guard so the model can see the picture.
         let png = dir.join("shot.png");
         std::fs::write(
             &png,
@@ -555,7 +532,6 @@ mod tests {
         assert!(out.images[0].url.starts_with("data:image/png;base64,"));
         assert!(out.text.contains("shot.png"), "got: {}", out.text);
 
-        // Other binaries get a clear error rather than 16KB of mojibake.
         let bin = dir.join("thing.bin");
         std::fs::write(&bin, [0u8, 1, 2, 3, 0, 4]).unwrap();
         let out = (read.run)(&format!(r#"{{"path":"{}"}}"#, bin.display()), &mut |_| {});
@@ -636,9 +612,6 @@ mod tests {
         );
     }
 
-    /// A machine that is not this process: everything lives in a map, and
-    /// commands are answered instead of run. A tool that touches the real
-    /// filesystem or spawns a real child would show up here.
     #[derive(Default)]
     struct Fake {
         files: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
@@ -731,7 +704,6 @@ struct ReadArgs {
     limit: Option<usize>,
 }
 
-/// Read a file as text lines, with offset/limit paging and truncation.
 fn read_text(a: &ReadArgs, data: &[u8]) -> String {
     use std::io::BufRead;
     let start = a.offset.unwrap_or(1).saturating_sub(1);
@@ -858,8 +830,6 @@ fn read_text(a: &ReadArgs, data: &[u8]) -> String {
     output
 }
 
-/// A NUL byte in the first block means this is not a text file. Images are
-/// handled before this; anything else would only poison the context.
 fn looks_binary(data: &[u8]) -> bool {
     data[..data.len().min(8192)].contains(&0)
 }
@@ -927,9 +897,6 @@ struct EditArgs {
     edits: Vec<EditArg>,
 }
 
-/// Models routinely send `edits` as a JSON string, a single object, or as
-/// legacy top-level `oldText`/`newText` fields. Normalize all of those to a
-/// `Vec<EditArg>` instead of rejecting the call.
 impl<'de> Deserialize<'de> for EditArgs {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -988,9 +955,6 @@ fn normalize_lf(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Byte-offset map from `normalize_lf(body)` back into `body`: entry i is
-/// the body offset of normalized offset i. CRLF collapses to one byte, a
-/// lone CR becomes one LF byte, everything else maps 1:1.
 fn lf_map(body: &str) -> Vec<usize> {
     let b = body.as_bytes();
     let mut map = Vec::with_capacity(b.len() + 1);
@@ -1011,7 +975,6 @@ fn lf_map(body: &str) -> Vec<usize> {
     map
 }
 
-/// Re-apply `ending` to an LF-normalized string.
 fn with_ending(s: &str, ending: &str) -> String {
     if ending == "\r\n" {
         s.split('\n').collect::<Vec<_>>().join("\r\n")
@@ -1020,9 +983,6 @@ fn with_ending(s: &str, ending: &str) -> String {
     }
 }
 
-/// Line ending to use for newlines introduced into `body[bs..be]`: prefer
-/// the region's own, then the terminator right after / before it, then the
-/// file's dominant style.
 fn region_ending(body: &str, bs: usize, be: usize) -> &'static str {
     if body[bs..be].contains("\r\n") || body[be..].starts_with("\r\n") {
         return "\r\n";
@@ -1085,7 +1045,6 @@ struct Applied {
     patch: String,
 }
 
-/// One edit located in a matching base (`normalized` or its fuzzy view).
 struct Matched {
     edit: usize,
     start: usize,
@@ -1093,15 +1052,12 @@ struct Matched {
     new_text: String,
 }
 
-/// A set of matches widened to the whole lines they touch.
 struct Group {
     start: usize,
     end: usize,
     edits: Vec<usize>,
 }
 
-/// Fold characters models commonly mistype: smart quotes, unicode dashes and
-/// spaces, plus trailing whitespace per line. Newline count is preserved.
 fn normalize_fuzzy(s: &str) -> String {
     s.split('\n')
         .map(str::trim_end)
@@ -1120,7 +1076,6 @@ fn normalize_fuzzy(s: &str) -> String {
         .collect()
 }
 
-/// Byte spans of each line, trailing newline included (like `split_inclusive`).
 fn line_spans(content: &str) -> Vec<(usize, usize)> {
     let bytes = content.as_bytes();
     let mut spans = Vec::new();
@@ -1268,8 +1223,6 @@ fn group_regions(spans: &[(usize, usize)], matched: &[Matched]) -> Vec<Group> {
     groups
 }
 
-/// The replacement text for a group: the base lines it covers with every
-/// matched edit applied in place, so untouched parts of a line survive.
 fn group_block(
     source: &str,
     spans: &[(usize, usize)],
@@ -1287,8 +1240,6 @@ fn group_block(
     block
 }
 
-/// Apply exact matches in body coordinates so each region keeps its own line
-/// endings; untouched lines are never rewritten, even in mixed-ending files.
 fn apply_exact(body: &str, matched: &[Matched]) -> String {
     let map = body.contains('\r').then(|| lf_map(body));
     let mut out = body.to_string();
@@ -1303,8 +1254,6 @@ fn apply_exact(body: &str, matched: &[Matched]) -> String {
     out
 }
 
-/// Apply fuzzy groups by rewriting only the touched lines; every other line is
-/// copied from the original body, endings included.
 fn apply_groups(
     body: &str,
     body_lines: &[(usize, usize)],
@@ -1328,8 +1277,6 @@ fn apply_groups(
     out
 }
 
-/// Cap on the patch the model sees. Beyond this, the middle is elided so a
-/// large edit cannot flood the context with its own diff.
 const MAX_PATCH_LINES: usize = 80;
 
 fn truncate_patch(patch: String) -> String {
@@ -1353,8 +1300,6 @@ fn truncate_patch(patch: String) -> String {
     out
 }
 
-/// Minimal unified diff over the touched line groups, with as much context as
-/// the gaps allow so hunks never overlap.
 fn unified_patch(
     path: &str,
     old: &str,
@@ -1427,8 +1372,6 @@ fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<Applied, 
         news.push(normalize_lf(&e.new_text).into_owned());
     }
 
-    // Exact match first. Only when some edit cannot be found exactly do we
-    // retry once against a fuzzy-normalized view of the same content.
     if olds.iter().all(|old| normalized.contains(old.as_str())) {
         let mut matched = find_exact(path, &normalized, &olds, &news)?;
         check_overlap(path, &mut matched)?;

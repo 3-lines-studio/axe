@@ -1,8 +1,3 @@
-//! Live web tool tests. They hit DeepSeek's Search and Fetch APIs and need
-//! `DEEPSEEK_API_KEY`, so they are ignored by default:
-//!
-//!     cargo test --test live-web -- --ignored --nocapture
-
 use axe::tools::build_tools_with;
 use axe::web::Web;
 

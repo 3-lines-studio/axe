@@ -1,13 +1,3 @@
-//! Per-project session store: live session file plus an archive catalog.
-//! Live transcript: `{root}/session.jsonl`.
-//! Archived sessions live in `{root}/sessions/<unix_ms>.jsonl`.
-//!
-//! Lines are append-only entries: a message, or a compaction summary with the
-//! recent messages it retains. Older files with bare messages still load.
-//!
-//! Where the history lives is behind [`Store`]; [`FsStore`] is the one on
-//! files and the one this module implements. An embedder brings its own.
-
 use crate::{Message, Provider, Request};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -43,40 +33,25 @@ pub struct SessionMeta {
     pub turns: usize,
 }
 
-/// The history of one conversation: the entries the model reads back, and the
-/// catalog of what is stored. Where it lives is the implementor's business, so
-/// an embedder can keep it in files, in a database, or anywhere else, and
-/// nothing above it finds out.
 pub trait Store: Send + Sync {
-    /// The entries of the live session.
     fn live(&self) -> Vec<Entry>;
 
-    /// Replace the live session with these entries.
     fn save(&self, entries: &[Entry]) -> std::io::Result<()>;
 
-    /// Add entries to the live session.
     fn append(&self, entries: &[Entry]) -> std::io::Result<()>;
 
-    /// Move the live session into the archive and return its id.
     fn archive(&self) -> Option<String>;
 
-    /// Write these entries back into the archived session `id` instead of
-    /// forking a new one. Clears the live session.
     fn continue_archived(&self, id: &str, entries: &[Entry]) -> std::io::Result<bool>;
 
-    /// Move the live session into the archive `id`.
     fn continue_archived_live(&self, id: &str) -> std::io::Result<bool>;
 
-    /// Forget the live session.
     fn discard(&self);
 
-    /// Every archived session, newest first.
     fn list(&self) -> Vec<SessionMeta>;
 
-    /// The entries of the archived session `id`.
     fn load(&self, id: &str) -> Option<Vec<Entry>>;
 
-    /// The session `--resume` should reopen, if any.
     fn resume_id(&self) -> Option<String>;
     fn set_resume_id(&self, id: &str);
     fn clear_resume_id(&self);
@@ -129,9 +104,6 @@ impl Default for ContextOptions {
     }
 }
 
-/// Project entries into the LLM context. A compaction entry supersedes every
-/// message before it: the projection restarts from its summary plus the
-/// recent messages it retains. The entry list itself is never rewritten.
 pub fn context_messages(entries: &[Entry]) -> Vec<Message> {
     context_messages_with(entries, ContextOptions::default())
 }
@@ -436,9 +408,6 @@ fn load_resume_id(dir: &str) -> Option<String> {
     }
 }
 
-/// Write a continued session back into its original archive instead of
-/// forking a new one. Clears the live transcript so the next launch does
-/// not re-archive it as a duplicate.
 fn continue_archived(dir: &str, id: &str, entries: &[Entry]) -> std::io::Result<bool> {
     if !valid_id(id) || entries.is_empty() {
         return Ok(false);
@@ -547,11 +516,6 @@ fn list_sessions(dir: &str) -> Vec<SessionMeta> {
     out
 }
 
-/// Title and turn count for a session file, derived by streaming it one entry
-/// at a time so a large transcript is never held in memory. Shares
-/// `update_sidecar` so the listing agrees with the live and archived sidecars,
-/// and uses the same parser as the load path: a line the session cannot be
-/// loaded from does not count here either.
 fn session_summary(path: &Path) -> (String, usize) {
     use std::io::BufRead;
     let Ok(file) = std::fs::File::open(path) else {
@@ -665,8 +629,6 @@ fn load_by_id(dir: &str, id: &str) -> Option<Vec<Entry>> {
     Some(read_entries(&path))
 }
 
-/// The history as files: the live session beside its sidecar, and the archive
-/// as a directory of `<id>.jsonl` files with their own.
 pub struct FsStore {
     dir: String,
 }
@@ -790,9 +752,6 @@ fn read_live_sidecar(dir: &str, bytes: u64) -> Option<SessionSidecar> {
     read_sidecar(&live_sidecar_path(dir), bytes)
 }
 
-/// Apply one entry to a running turn count. A user message adds a turn; a
-/// compaction supersedes the count, which restarts at the checkpoint itself
-/// plus the user messages it retains.
 fn next_turns(turns: usize, entry: &Entry) -> usize {
     match entry {
         Entry::Message { message } if message.role == "user" => turns + 1,
@@ -846,14 +805,6 @@ fn read_sidecar(path: &Path, bytes: u64) -> Option<SessionSidecar> {
     Some(sidecar)
 }
 
-/// Drop tool-call exchanges the transcript never finished: an assistant
-/// message whose `tool_calls` lack matching tool results, together with the
-/// results it did produce. Providers reject such a sequence, and a crash
-/// mid-batch (or a session file written by an older version) can leave one
-/// anywhere in the transcript, not only at the end. Results are looked up by
-/// call id, so an exchange whose results landed apart from the call — a batch
-/// whose tools finish out of order — is rebuilt around it in call order
-/// instead of dropped. Complete exchanges are kept untouched.
 pub fn drop_incomplete_tool_calls(msgs: &mut Vec<Message>) {
     let mut results: HashMap<&str, usize> = HashMap::new();
     for (index, message) in msgs.iter().enumerate() {
@@ -1136,8 +1087,6 @@ fn request_summary(
         .map_err(|error| error.to_string())
 }
 
-/// Summarize the conversation in `entries`, returning the summary text, the
-/// provider-reported context tokens before compaction, and retained recent messages.
 pub fn compact(
     provider: &impl Provider,
     model: &str,
@@ -1184,7 +1133,6 @@ pub fn compact_with(
     Ok((summary, tokens_before, retained))
 }
 
-/// Provider error messages that indicate the context window was exceeded.
 const OVERFLOW_PATTERNS: [&str; 7] = [
     "prompt is too long",
     "exceeds the context window",
@@ -1195,7 +1143,6 @@ const OVERFLOW_PATTERNS: [&str; 7] = [
     "exceeds the model's maximum",
 ];
 
-/// Errors that look like overflow but are throttling or server failures.
 const NON_OVERFLOW_PATTERNS: [&str; 3] = ["throttling", "rate limit", "service unavailable"];
 
 pub fn is_overflow_error(err: &str) -> bool {
@@ -1277,9 +1224,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The listing streams the file when the sidecar is missing or stale, and
-    /// reads the sidecar otherwise. Both must report the same title and turn
-    /// count, which is why they share `update_sidecar`.
     #[test]
     fn session_summary_matches_the_sidecar() {
         let dir = std::env::temp_dir().join(format!("axe-summary-sidecar-{}", std::process::id()));
@@ -1399,9 +1343,6 @@ mod tests {
         }
     }
 
-    /// A torn batch append can leave an assistant tool_call missing some of its
-    /// results. Compaction must not retain such a sequence: the provider
-    /// rejects it. The bad exchange is dropped; the turn before it survives.
     #[test]
     fn compact_drops_incomplete_tool_calls_from_retained() {
         let mut tool_call = message("assistant", "");
@@ -1438,9 +1379,6 @@ mod tests {
         assert_eq!(retained[0].content, "latest");
     }
 
-    /// Tools of the same batch finish out of order and each result is appended
-    /// as it lands, so a result can sit far from the call that asked for it.
-    /// The exchange is rebuilt around its call instead of dropped.
     #[test]
     fn out_of_order_tool_results_go_back_with_their_calls() {
         let mut first = message("assistant", "");
@@ -1473,8 +1411,6 @@ mod tests {
         );
     }
 
-    /// A result whose call never made it into the transcript has nothing left
-    /// to answer, and the provider rejects it as it stands.
     #[test]
     fn a_tool_result_without_its_call_is_dropped() {
         let mut msgs = vec![

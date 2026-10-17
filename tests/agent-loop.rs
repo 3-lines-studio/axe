@@ -902,7 +902,6 @@ fn run_does_not_retry_after_events_were_emitted() {
 
 #[test]
 fn drop_incomplete_tool_calls() {
-    // A complete exchange is kept.
     let mut complete = vec![
         user("go"),
         call_tool("c1", "read", "{}"),
@@ -918,8 +917,6 @@ fn drop_incomplete_tool_calls() {
     axe::session::drop_incomplete_tool_calls(&mut complete);
     assert_eq!(complete.len(), 3);
 
-    // A partial exchange (2 calls, 1 result) is dropped whole, including
-    // its dangling assistant message.
     let mut partial = vec![
         user("go"),
         Message {
@@ -954,8 +951,6 @@ fn drop_incomplete_tool_calls() {
     assert_eq!(partial.len(), 1);
     assert_eq!(partial[0].role, "user");
 
-    // An incomplete exchange in the middle is dropped without discarding
-    // the finished turns around it.
     let mut middle = vec![
         user("go"),
         call_tool("c1", "read", "{}"),
@@ -985,8 +980,6 @@ struct NopSink;
 
 impl axe::run::Sink for NopSink {}
 
-/// Cancelling mid-batch must still produce a provider-valid transcript:
-/// every tool call gets a result, even the ones never executed.
 #[test]
 fn run_cancel_mid_batch_synthesizes_results() {
     struct CancelProvider;
@@ -1065,7 +1058,6 @@ fn run_cancel_mid_batch_synthesizes_results() {
         results[1].content
     );
 
-    // The transcript survives the pre-turn validity trim untouched.
     let mut trimmed = msgs.clone();
     axe::session::drop_incomplete_tool_calls(&mut trimmed);
     assert_eq!(trimmed.len(), msgs.len());

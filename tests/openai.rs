@@ -1,6 +1,3 @@
-//! Wire format round trip against a local HTTP server (plain http, no TLS
-//! needed for the test).
-
 use axe::openai::StreamEvent;
 use axe::{Image, Message, OpenAI, Provider, Request, ToolCall, new_tool};
 use std::io::{Read, Write};
@@ -78,7 +75,6 @@ fn openai_round_trip() {
             "data:image/png;base64,BBBB"
         );
         assert_eq!(msgs[3]["tool_call_id"], "c9");
-        // A tool result without images stays a plain string, including empty.
         assert_eq!(msgs[4]["role"], "tool");
         assert_eq!(msgs[4]["content"], "");
         assert_eq!(msgs[4]["tool_call_id"], "c11");

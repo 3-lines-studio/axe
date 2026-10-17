@@ -1,11 +1,3 @@
-//! Deterministic fuzz/stress harness for the axe library surface.
-//!
-//! Seeds come from the real ~/.config/axe data (config, SYSTEM.md, user
-//! commands, archived session transcripts) when present, plus built-in
-//! seeds. Every mutation is reproducible from a fixed seed.
-//!
-//! Run: cargo test --release --test stress
-
 use axe::openai::StreamEvent;
 use axe::session::{FsStore, Store};
 use axe::{Message, OpenAI, Request, new_tool};
@@ -560,7 +552,6 @@ fn read_offset_paging() {
     let args = serde_json::json!({"path": p, "offset": 2, "limit": 2}).to_string();
     let out = (read.run)(&args, &mut |_| {}).text;
     assert!(out.starts_with("line2\nline3"), "{out}");
-    // The file has exactly 4 lines, so one remains after reading 2-3.
     assert!(out.contains("1 more lines"), "{out}");
     assert!(out.contains("offset=4"), "{out}");
 
@@ -691,7 +682,6 @@ fn session_compaction_is_append_only() {
     ];
     store.save(&entries).unwrap();
 
-    // Compaction appends; nothing is rewritten or dropped from disk.
     entries.push(axe::session::Entry::Compaction {
         summary: "earlier work summarized".into(),
         tokens_before: 100,
@@ -704,7 +694,6 @@ fn session_compaction_is_append_only() {
     store.save(&entries).unwrap();
     assert_eq!(store.live().len(), 4, "history stays on disk");
 
-    // The projection supersedes everything before the summary.
     let msgs = axe::session::context_messages(&store.live());
     assert_eq!(msgs.len(), 3);
     assert!(msgs[0].content.contains("earlier work summarized"));
