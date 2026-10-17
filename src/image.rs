@@ -1,9 +1,5 @@
-//! Image attachments. A local file becomes an inline base64 data URL; an
-//! `http(s)` URL is passed through for the provider to fetch.
-
 use crate::Image;
 
-/// DeepSeek rejects an inline image above 32 MiB.
 pub const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
 pub fn attach(source: &str) -> Result<Image, String> {
@@ -32,15 +28,11 @@ pub fn attach_data(source: &str, data: &[u8]) -> Result<Image, String> {
     })
 }
 
-/// Attach bytes already in hand when they are a supported image, so a tool
-/// that read a file through a machine does not read it twice.
 pub fn attach_bytes(source: &str, data: &[u8]) -> Option<Image> {
     sniff(&data[..data.len().min(16)])?;
     attach_data(source, data).ok()
 }
 
-/// Attach `path` when its content is a supported image, so a tool can hand an
-/// image back to the model instead of dumping bytes into the context.
 pub fn attach_if_image(path: &str) -> Option<Image> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).ok()?;
@@ -50,7 +42,6 @@ pub fn attach_if_image(path: &str) -> Option<Image> {
     attach(path).ok()
 }
 
-/// Short label for a composer or transcript chip.
 pub fn label(image: &Image) -> String {
     let source = if image.path.is_empty() {
         &image.url
@@ -64,8 +55,6 @@ pub fn label(image: &Image) -> String {
     format!("{head}…")
 }
 
-/// True when the text names an existing image file, so a path dropped into the
-/// terminal can attach instead of being typed.
 pub fn is_image_path(text: &str) -> bool {
     if text.is_empty() || text.contains('\n') {
         return false;
@@ -80,8 +69,6 @@ pub fn is_image_path(text: &str) -> bool {
     std::path::Path::new(text).is_file()
 }
 
-/// Sniff the format from content, as both DeepSeek and OpenAI do, and fall
-/// back to the file extension.
 fn mime(data: &[u8], path: &str) -> &'static str {
     sniff(data).unwrap_or_else(|| by_extension(path))
 }

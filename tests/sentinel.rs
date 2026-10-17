@@ -1,7 +1,3 @@
-//! Sentinel coverage: real secret files must be redacted, real code must not
-//! be touched, and arbitrary input must never panic or leave the output
-//! in a state a second pass changes.
-
 use axe::sentinel::Sentinel;
 use axe::{Message, ToolCall};
 

@@ -1,13 +1,3 @@
-//! Outbound secret sentinel.
-//!
-//! Every request body the agent sends to the model passes through
-//! [`Sentinel::redact`], so a secret that reached the transcript (a `cat
-//! .env`, a pasted key, a tool error) never reaches the provider. Layers:
-//! known literal values, PEM blocks, credentials in URLs, provider token
-//! shapes, and sensitive `KEY=VALUE` / `"key": value` / `--flag value` /
-//! `key value` assignments. Replacement is exact and idempotent; the local
-//! transcript keeps the real value.
-
 use crate::Message;
 use std::sync::OnceLock;
 
@@ -25,7 +15,6 @@ impl Sentinel {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Literal values to replace verbatim, longest first.
     pub fn add_value(&mut self, value: impl Into<String>) {
         let value = value.into();
         if value.len() < MIN_KNOWN_LEN || self.values.iter().any(|v| v == &value) {
@@ -35,9 +24,6 @@ impl Sentinel {
         self.values.sort_by_key(|v| std::cmp::Reverse(v.len()));
     }
 
-    /// Harvest the process environment: a sensitive-named variable whose
-    /// value looks like a secret (long enough, not a path) is worth matching
-    /// verbatim even when it has no recognizable prefix.
     pub fn from_env() -> Self {
         let mut sentinel = Self::new();
         for (key, value) in std::env::vars() {
@@ -81,8 +67,6 @@ impl Sentinel {
 
 static GLOBAL: OnceLock<Sentinel> = OnceLock::new();
 
-/// Seed the process-wide sentinel with the provider key before first use, so
-/// the exact key is redacted wherever it appears, including a config file.
 pub fn seed(api_key: &str) {
     GLOBAL.get_or_init(|| {
         let mut sentinel = Sentinel::from_env();
@@ -91,7 +75,6 @@ pub fn seed(api_key: &str) {
     });
 }
 
-/// The process-wide sentinel, harvested from the environment on first use.
 pub fn global() -> &'static Sentinel {
     GLOBAL.get_or_init(Sentinel::from_env)
 }
@@ -326,9 +309,6 @@ fn bare_token(s: &str, start: usize) -> &str {
     &s[start..k]
 }
 
-/// A whitespace-separated value (no `=`/`:`), such as a `.netrc` password.
-/// Gated so prose (`the password is ...`) and code identifiers (`bare_token`)
-/// are left alone: a value must carry a digit or a known token prefix.
 fn looks_like_value(token: &str) -> bool {
     let has_digit = token.chars().any(|c| c.is_ascii_digit());
     let has_alpha = token.chars().any(|c| c.is_ascii_alphabetic());
@@ -343,7 +323,6 @@ fn starts_with_secret_prefix(token: &str) -> bool {
     })
 }
 
-/// An env-style key (`UPPER_CASE`), where a bare value is taken at face value.
 fn env_style_key(key: &str) -> bool {
     key.bytes().any(|c| c.is_ascii_alphabetic())
         && key
@@ -351,8 +330,6 @@ fn env_style_key(key: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
 }
 
-/// Split an identifier into lowercase words on separators and camelCase, so
-/// `KeyCode` is `[key, code]` and `input_tokens` is `[input, tokens]`.
 fn key_words(raw: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut cur = String::new();

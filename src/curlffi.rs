@@ -1,14 +1,3 @@
-//! Minimal libcurl FFI, dlopen'd lazily on first use.
-//!
-//! The binary has no DT_NEEDED on libcurl: exec only loads libc, and
-//! libcurl's dependency tree (openssl, krb5, zstd, brotli, nghttp2/3, ssh2,
-//! ...) is mapped only when the first HTTP request starts. Cold start is
-//! ~1.5 ms faster; the first request pays the dlopen once.
-//!
-//! The FFI is deliberately tiny: Easy + slist + a write/progress callback
-//! pair for streaming, plus the getinfo/strerror plumbing. All CURLOPT and
-//! CURLINFO values are stable public ABI from curl.h.
-
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_void};
 use std::sync::OnceLock;
 
@@ -170,8 +159,6 @@ impl Easy {
         if handle.is_null() {
             return Err("curl_easy_init failed".into());
         }
-        // Required for multi-threaded use: without it the sync DNS resolver
-        // can raise SIGALRM into arbitrary threads.
         setopt_long_raw(handle, CURLOPT_NOSIGNAL, 1)?;
         Ok(Easy {
             handle,
@@ -210,26 +197,19 @@ impl Easy {
         setopt(self, CURLOPT_USERAGENT, s.as_ptr())
     }
 
-    /// Ask for a compressed body; libcurl decompresses it before the write
-    /// callback. An empty string means every encoding it was built with.
     pub fn accept_encoding(&mut self, encodings: &str) -> Result<(), String> {
         let s = CString::new(encodings).map_err(|_| "encodings contain NUL".to_string())?;
         setopt(self, CURLOPT_ACCEPT_ENCODING, s.as_ptr())
     }
 
-    /// Cap the whole transfer, not just the connection attempt.
     pub fn timeout(&mut self, secs: c_long) -> Result<(), String> {
         setopt_long(self, CURLOPT_TIMEOUT, secs)
     }
 
-    /// Seconds to wait for the connection to be established. Without this a
-    /// server that accepts but never responds blocks the run forever.
     pub fn connect_timeout(&mut self, secs: c_long) -> Result<(), String> {
         setopt_long(self, CURLOPT_CONNECTTIMEOUT, secs)
     }
 
-    /// Abort when slower than `limit` bytes/s for `time` seconds: kills
-    /// stalled streams without capping long healthy ones.
     pub fn low_speed(&mut self, limit: c_long, time: c_long) -> Result<(), String> {
         setopt_long(self, CURLOPT_LOW_SPEED_LIMIT, limit)?;
         setopt_long(self, CURLOPT_LOW_SPEED_TIME, time)
@@ -271,7 +251,6 @@ impl Easy {
             .map(|value| value as u32)
     }
 
-    /// The URL after redirects. Valid until the handle is reused or dropped.
     pub fn effective_url(&self) -> Result<String, String> {
         self.getinfo_string(CURLINFO_EFFECTIVE_URL)
     }

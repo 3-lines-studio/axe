@@ -1,5 +1,3 @@
-//! OpenAI-compatible chat completions provider.
-
 use crate::{Error, Image, Message, Provider, Request, Response, StreamHandle, ToolCall, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -155,8 +153,6 @@ fn first_message_with_images(messages: &[Message]) -> usize {
     first
 }
 
-/// OpenAI `content` is a plain string, or a block array when the message
-/// carries images.
 fn message_content(m: &Message, images: &[Image]) -> Option<Value> {
     if images.is_empty() {
         if m.content.is_empty() && m.role != "assistant" && m.role != "tool" {
@@ -193,13 +189,9 @@ fn run_request(
     let easy = guard.as_mut().unwrap();
     easy.url(url).map_err(err)?;
     easy.post().map_err(err)?;
-    // SAFETY: curl may or may not copy POSTFIELDS; `body` outlives perform
-    // in every caller either way.
     easy.post_fields(body).map_err(err)?;
     easy.fail_on_error(false).map_err(err)?;
     easy.connect_timeout(10).map_err(err)?;
-    // Abort if the connection stalls (<1 byte/s for 60s): a slow-drip
-    // server must not hang the run forever.
     easy.low_speed(1, 60).map_err(err)?;
     easy.headers(headers).map_err(err)?;
 
@@ -241,9 +233,6 @@ fn run_request(
         if let Some(message) = &acc.stream_error {
             return Err(Error::Provider(format!("openai: {message}")));
         }
-        // A 200 with a body that never produced a recognized SSE event
-        // (plain JSON error, proxy page) must not become a silent empty
-        // assistant turn.
         if acc.events == 0 {
             let snippet = String::from_utf8_lossy(&acc.raw[..acc.raw.len().min(200)]).into_owned();
             return Err(Error::Provider(format!(
@@ -332,9 +321,7 @@ impl Provider for OpenAI {
 
 #[derive(Clone, Default)]
 struct StreamAcc {
-    /// Raw bytes as received; the body for non-stream mode.
     raw: Vec<u8>,
-    /// SSE event buffer (drained as events complete).
     buf: Vec<u8>,
     content: String,
     reasoning: String,
@@ -343,7 +330,6 @@ struct StreamAcc {
     out_tokens: usize,
     finish_reason: Option<String>,
     stream_error: Option<String>,
-    /// Recognized SSE events seen ([DONE] or a parsed chunk).
     events: usize,
 }
 
@@ -400,8 +386,6 @@ struct OaStreamChoice {
 
 const MAX_STREAM_TOOL_CALLS: usize = 64;
 
-/// The stream only keeps `raw` to report a non-200 body, so the cap has to
-/// clear the provider's whole error. SSE chunks are read from `buf`.
 const STREAM_RAW_LIMIT: usize = 64 * 1024;
 
 impl StreamAcc {
@@ -416,8 +400,6 @@ impl StreamAcc {
         self.raw
             .extend_from_slice(&data[..data.len().min(remaining)]);
         if data.contains(&b'\r') || self.buf.last() == Some(&b'\r') {
-            // Normalize CRLF to LF so event splitting works even when a
-            // chunk boundary lands between "\r" and "\n".
             let mut prev_cr = self.buf.last() == Some(&b'\r');
             for &b in data {
                 if b == b'\n' && prev_cr {
@@ -451,7 +433,6 @@ impl StreamAcc {
         for line in event.split(|&b| b == b'\n') {
             let line = std::str::from_utf8(line).unwrap_or("");
             if let Some(data) = line.strip_prefix("data:") {
-                // SSE joins multiple data: lines with a newline.
                 if !payload.is_empty() {
                     payload.push('\n');
                 }

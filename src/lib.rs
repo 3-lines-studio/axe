@@ -1,11 +1,3 @@
-//! Minimal LLM coding agent harness.
-//!
-//! The loop is the only logic: messages -> LLM -> tool calls -> results ->
-//! repeat. It lives in `run` and never mutates its input.
-//!
-//! Message/ToolCall serialize with PascalCase field names (session
-//! storage); the OpenAI provider maps them to the wire format.
-
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::sync::Arc;
@@ -25,8 +17,6 @@ pub mod web;
 
 pub use openai::OpenAI;
 
-/// Axe's built-in system prompt for a tool set: the tool list. Embedders
-/// compose the rest (identity, guidelines, working directory).
 pub fn system_prompt(tools: &[Tool]) -> String {
     let mut out = String::from("Available tools:\n");
     for t in tools {
@@ -37,7 +27,6 @@ pub fn system_prompt(tools: &[Tool]) -> String {
     out
 }
 
-/// The user's `SYSTEM.md` beside the config file, when present and non-empty.
 pub fn user_system_prompt() -> Option<String> {
     let path = config_dir()?.join("axe").join("SYSTEM.md");
     let text = std::fs::read_to_string(path).ok()?;
@@ -49,7 +38,6 @@ pub fn user_system_prompt() -> Option<String> {
     }
 }
 
-/// The axe config directory: `$XDG_CONFIG_HOME` or `$HOME/.config`.
 pub fn config_dir() -> Option<std::path::PathBuf> {
     if let Ok(x) = std::env::var("XDG_CONFIG_HOME")
         && !x.is_empty()
@@ -61,13 +49,8 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
         .map(|h| std::path::PathBuf::from(h).join(".config"))
 }
 
-/// Make this process non-dumpable so a same-uid child cannot read its initial
-/// environment (or memory) through `/proc/<pid>/environ`. Linux only; other
-/// platforms have no `/proc` and no-op.
 #[cfg(target_os = "linux")]
 pub fn set_non_dumpable() -> bool {
-    // SAFETY: prctl(PR_SET_DUMPABLE, 0) takes no pointers, cannot fail
-    // unsafely, and only lowers this process's ptrace reachability.
     unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) == 0 }
 }
 
@@ -76,8 +59,6 @@ pub fn set_non_dumpable() -> bool {
     false
 }
 
-/// Write via temp file + rename in the destination directory so a crash or
-/// full disk never leaves a truncated file behind.
 pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     atomic_write_with(path, |file| file.write_all(data))
@@ -127,12 +108,6 @@ pub(crate) fn atomic_write_with(
     res
 }
 
-/// Temp-file name for one write. Unique across processes and across calls:
-/// the destination directory can be shared (two axe instances on one project),
-/// so the process id and the per-process call counter both take part. Without
-/// the pid two processes could pick the same name at the same instant, and the
-/// loser's error cleanup would unlink the winner's temp file. `create_new`
-/// still guards the remaining sliver of pid reuse.
 fn temp_name(pid: u32, secs: u64, nanos: u32, tag: u64) -> String {
     format!(".axe-tmp-{pid}-{}-{tag}", u64::from(nanos) ^ secs)
 }
@@ -224,13 +199,9 @@ impl StreamHandle {
 
 #[derive(Debug)]
 pub enum Error {
-    /// Connection-level failure (DNS, TLS, refused, timeout): retryable.
     Transport(String),
     Provider(String),
-    Http {
-        status: u16,
-        message: String,
-    },
+    Http { status: u16, message: String },
 }
 
 impl std::fmt::Display for Error {
@@ -245,8 +216,6 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// What a tool hands back: text for the transcript, plus images the model
-/// should see. Providers that support vision attach them to the tool result.
 #[derive(Default)]
 pub struct ToolOutput {
     pub text: String,
@@ -272,10 +241,7 @@ pub struct Tool {
     pub name: &'static str,
     pub description: &'static str,
     pub parameters: Value,
-    /// One-line hint for the system prompt's tool list.
     pub snippet: &'static str,
-    /// When true, tool calls in a batch run one after another instead of in
-    /// parallel (used by file-mutating tools to avoid races).
     pub sequential: bool,
     #[allow(clippy::type_complexity)]
     pub run: Box<dyn Fn(&str, &mut dyn FnMut(&str)) -> ToolOutput + Send + Sync>,
@@ -294,8 +260,6 @@ where
     new_tool_with_progress(name, description, schema, move |args, _progress| run(args))
 }
 
-/// Like `new_tool`, but the run closure also receives a progress callback it
-/// can call with partial output while working (e.g. live bash output).
 pub fn new_tool_with_progress<T, R>(
     name: &'static str,
     description: &'static str,
@@ -331,9 +295,6 @@ where
     }
 }
 
-/// Coerce LLM arguments toward the declared JSON schema before deserializing.
-/// Models frequently send numbers as strings, booleans as 1/0, or null for
-/// optional fields; serde would reject those outright.
 fn coerce_args(args: &mut Value, schema: &Value) {
     if let Some(props) = schema.get("properties").and_then(|p| p.as_object())
         && let Value::Object(map) = args
@@ -572,10 +533,7 @@ mod tests {
 
     #[test]
     fn temp_name_distinguishes_processes_and_calls() {
-        // Two processes writing the same directory at the same instant must not
-        // pick the same temp file, or one's error cleanup unlinks the other's.
         assert_ne!(temp_name(1, 100, 7, 0), temp_name(2, 100, 7, 0));
-        // Successive writes in one process must differ too.
         assert_ne!(temp_name(1, 100, 7, 0), temp_name(1, 100, 7, 1));
         assert_ne!(temp_name(1, 100, 7, 0), temp_name(1, 101, 7, 0));
         assert_ne!(temp_name(1, 100, 7, 0), temp_name(1, 100, 8, 0));
@@ -589,9 +547,6 @@ mod tests {
         atomic_write(&path, payload.as_bytes()).unwrap();
     }
 
-    /// Concurrent processes targeting one destination must all succeed, and the
-    /// file must end up as exactly one writer's payload: atomic_write never
-    /// interleaves or truncates, and no writer's temp file is stolen.
     #[test]
     fn atomic_write_concurrent_processes() {
         let dir = std::env::temp_dir().join(format!("axe-aw-conc-{}", std::process::id()));

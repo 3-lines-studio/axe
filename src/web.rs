@@ -1,9 +1,3 @@
-//! Web tools over DeepSeek's Search and Fetch APIs.
-//!
-//! Both are JSON POSTs through `curlffi`, so there is no HTTP crate in the
-//! tree and no page parsing here: the provider answers with the results and
-//! the Markdown, and these tools only decide what the model reads.
-
 use crate::curlffi::Easy;
 use crate::{Tool, new_tool};
 use serde::{Deserialize, Serialize};
@@ -23,10 +17,6 @@ const MAX_MARKDOWN: usize = 32 * 1024;
 const MAX_DETAIL: usize = 300;
 const RETRIES: usize = 2;
 
-/// Credentials and endpoint for the two web tools.
-///
-/// `from_env` reads `DEEPSEEK_API_KEY` and, when set, `DEEPSEEK_BASE_URL`;
-/// the base URL carries no `/v1`, which belongs to each endpoint.
 #[derive(Clone)]
 pub struct Web {
     base_url: String,
@@ -137,7 +127,6 @@ fn retryable(status: u16) -> bool {
     status == 408 || status == 429 || status >= 500
 }
 
-/// The message of the provider's error body, when there is one.
 fn message(body: &[u8]) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let raw = value
@@ -384,8 +373,6 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
-    /// A local server that answers each request with the next canned reply
-    /// and hands back what it received.
     fn serve(replies: Vec<(u16, &str)>) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let replies: Vec<(u16, String)> = replies
             .into_iter()
