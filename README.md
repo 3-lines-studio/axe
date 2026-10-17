@@ -74,19 +74,24 @@ Sessions are scoped by project and stored under the same Axe config directory.
 
 ## Web
 
-Two tools, both in process over the system libcurl:
+Two tools, both in process over the system libcurl, backed by DeepSeek's
+Search and Fetch APIs:
 
-- `search QUERY` hits DuckDuckGo's HTML view and returns a numbered list of
-  titles, URLs, and snippets.
-- `fetch URL` downloads the page, runs it through readability extraction, and
-  returns the article as Markdown. The chrome, the navigation, and the script
-  tags do not reach the model.
+- `search QUERY` posts to `/v1/tools/search` and returns a numbered list of
+  results with title, URL, the long summary meant for a model, and the site
+  and date when the API knows them. It takes `count` (1 to 50, 8 by default);
+  the query supports `site:`, `-site:`, `"exact phrase"`, `-term`, `lang:`,
+  `after:` and `before:`.
+- `fetch URL` posts to `/v1/tools/fetch` and returns the page title and its
+  content as Markdown. The chrome, the navigation and the scripts never reach
+  the model.
 
-When the extracted text comes out nearly empty, the page probably builds
-itself with JavaScript, so Axe looks for `chromium`, `chromium-browser`,
-`google-chrome`, or `google-chrome-stable` on `PATH` and asks for the DOM after
-the scripts ran. If there is no browser installed, it returns what it read.
-Nothing is required: rendering is an upgrade, not a dependency.
+Both need a key: `DEEPSEEK_API_KEY`, plus `DEEPSEEK_BASE_URL` to point at a
+gateway. `web::Web` takes the same pair explicitly. Without one,
+`build_tools` leaves the two out and the model is offered only the machine
+tools. The provider bills $0.75 per 1,000 successful requests and limits each
+API to 5 requests per second per account; the tools retry 408, 429 and 5xx
+twice before giving up.
 
 ## Bash
 

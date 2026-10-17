@@ -11,20 +11,36 @@ const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The tools for a process that works in `dir`.
 pub fn build_tools(dir: &str) -> Vec<Tool> {
-    build_tools_on(std::sync::Arc::new(crate::machine::Local::new(dir)))
+    build_tools_with(
+        std::sync::Arc::new(crate::machine::Local::new(dir)),
+        crate::web::Web::from_env(),
+    )
 }
 
 /// The tools over a machine that is not necessarily this process's: a control
 /// plane brings its own volume and shell, and the tools cannot tell.
 pub fn build_tools_on(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Vec<Tool> {
-    vec![
+    build_tools_with(machine, crate::web::Web::from_env())
+}
+
+/// The same tools with the web ones configured explicitly. Without `web` the
+/// list keeps only what runs on the machine, so a model is never offered a
+/// search that cannot authenticate.
+pub fn build_tools_with(
+    machine: std::sync::Arc<dyn crate::machine::Machine>,
+    web: Option<crate::web::Web>,
+) -> Vec<Tool> {
+    let mut tools = vec![
         read(machine.clone()),
         write(machine.clone()),
         edit(machine.clone()),
         bash(machine),
-        crate::web::search(),
-        crate::web::fetch(),
-    ]
+    ];
+    if let Some(web) = web {
+        tools.push(crate::web::search(web.clone()));
+        tools.push(crate::web::fetch(web));
+    }
+    tools
 }
 
 /// Strip control characters (except tab/newline/CR) and Unicode format

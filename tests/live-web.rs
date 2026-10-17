@@ -1,14 +1,17 @@
-//! Live web tool tests. They hit the network and, for the rendering one, a
-//! headless browser, so they are ignored by default:
+//! Live web tool tests. They hit DeepSeek's Search and Fetch APIs and need
+//! `DEEPSEEK_API_KEY`, so they are ignored by default:
 //!
 //!     cargo test --test live-web -- --ignored --nocapture
 
-use axe::tools::build_tools;
-use std::io::{Read, Write};
-use std::net::TcpListener;
+use axe::tools::build_tools_with;
+use axe::web::Web;
 
 fn run(name: &str, args: &str) -> String {
-    let tools = build_tools("/tmp");
+    let web = Web::from_env().expect("DEEPSEEK_API_KEY");
+    let tools = build_tools_with(
+        std::sync::Arc::new(axe::machine::Local::new("/tmp")),
+        Some(web),
+    );
     let tool = tools.iter().find(|tool| tool.name == name).unwrap();
     let output = (tool.run)(args, &mut |_| {});
     output.text.clone()
@@ -17,61 +20,41 @@ fn run(name: &str, args: &str) -> String {
 #[test]
 #[ignore]
 fn searches_the_web() {
-    let text = run("search", r#"{"query":"rust programming language"}"#);
+    let text = run(
+        "search",
+        r#"{"query":"DeepSeek search api site:api-docs.deepseek.com","count":3}"#,
+    );
     println!("{text}");
-    assert!(text.contains("1. "), "{text}");
-    assert!(text.contains("http"), "{text}");
+    assert!(text.starts_with("1. "), "{text}");
+    assert!(text.contains("https://"), "{text}");
     assert!(!text.starts_with("error"), "{text}");
 }
 
 #[test]
 #[ignore]
-fn fetches_and_extracts_a_page() {
+fn fetches_a_page_as_markdown() {
     let text = run(
         "fetch",
-        r#"{"url":"https://emschwartz.me/comparing-13-rust-crates-for-extracting-text-from-html/"}"#,
+        r#"{"url":"https://api-docs.deepseek.com/guides/search"}"#,
     );
     println!("{}", text.chars().take(600).collect::<String>());
     println!("... {} caracteres", text.chars().count());
-    assert!(text.contains("dom_smoothie"), "{text}");
+    assert!(text.starts_with("# "), "sin título en markdown: {text}");
+    assert!(text.contains("v1/tools/search"), "{text}");
     assert!(!text.contains("<div"), "quedó html crudo: {text}");
     assert!(!text.starts_with("error"), "{text}");
-    assert!(text.contains("\n\n## Links\n"), "sin sección de links");
-    assert!(text.contains("- <https://"), "sin links absolutos");
 }
 
 #[test]
 #[ignore]
-fn renders_a_page_that_only_exists_after_javascript() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = std::thread::spawn(move || {
-        for _ in 0..4 {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut request = [0u8; 1024];
-            let _ = stream.read(&mut request);
-            let body = r#"<!doctype html><html><head><title>App</title></head><body>
-                <div id="root">cargando</div>
-                <script>
-                  document.getElementById('root').innerHTML =
-                    '<article><h1>Renderizado</h1>' +
-                    '<p>' + 'contenido que solo existe despues de correr el javascript. '.repeat(8) +
-                    '</p></article>';
-                </script></body></html>"#;
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-        }
-    });
-
-    let text = run("fetch", &format!(r#"{{"url":"http://127.0.0.1:{port}/"}}"#));
-    println!("{}", text.chars().take(300).collect::<String>());
-    server.join().ok().unwrap();
-    assert!(text.contains("Renderizado"), "{text}");
-    assert!(text.contains("despues de correr el javascript"), "{text}");
+fn a_missing_page_reports_it() {
+    let text = run(
+        "fetch",
+        r#"{"url":"https://api-docs.deepseek.com/no-such-page-axe-test"}"#,
+    );
+    println!("{text}");
+    assert!(
+        text.starts_with("error: DeepSeek could not read the page"),
+        "{text}"
+    );
 }
