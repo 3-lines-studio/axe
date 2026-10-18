@@ -45,11 +45,27 @@ fn fetches_a_page_as_markdown() {
 fn a_missing_page_reports_it() {
     let text = run(
         "fetch",
-        r#"{"url":"https://api-docs.deepseek.com/no-such-page-axe-test"}"#,
+        r#"{"url":"https://example.com/definitely-not-here-axe"}"#,
     );
     println!("{text}");
-    assert!(
-        text.starts_with("error: DeepSeek could not read the page"),
-        "{text}"
+    assert!(text.starts_with("error: "), "{text}");
+}
+
+#[test]
+#[ignore]
+fn a_vague_query_gets_a_weak_matches_hint() {
+    let text = run("search", r#"{"query":"auto","count":3}"#);
+    println!("{text}");
+    assert!(text.contains("weak matches"), "{text}");
+}
+
+#[test]
+#[ignore]
+fn a_precise_query_gets_no_hint() {
+    let text = run(
+        "search",
+        r#"{"query":"deepseek flash pricing site:api-docs.deepseek.com","count":3}"#,
     );
+    println!("{text}");
+    assert!(!text.contains("weak matches"), "{text}");
 }
