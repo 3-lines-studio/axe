@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
 pub mod curlffi;
+pub mod durable;
 mod http;
 pub mod image;
 pub mod machine;
