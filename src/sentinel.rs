@@ -1,5 +1,5 @@
 use crate::Message;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 const REDACTED: &str = "[REDACTED]";
 const MIN_KNOWN_LEN: usize = 4;
@@ -65,26 +65,39 @@ impl Sentinel {
     }
 }
 
-static GLOBAL: OnceLock<Sentinel> = OnceLock::new();
+static GLOBAL: OnceLock<RwLock<Sentinel>> = OnceLock::new();
 
 pub fn seed(api_key: &str) {
-    GLOBAL.get_or_init(|| {
-        let mut sentinel = Sentinel::from_env();
-        sentinel.add_value(api_key);
-        sentinel
-    });
+    add_preset(api_key);
 }
 
-pub fn global() -> &'static Sentinel {
-    GLOBAL.get_or_init(Sentinel::from_env)
+pub fn add(value: impl Into<String>) {
+    add_preset(value);
+}
+
+fn add_preset(value: impl Into<String>) {
+    global()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .add_value(value);
+}
+
+pub fn global() -> &'static RwLock<Sentinel> {
+    GLOBAL.get_or_init(|| RwLock::new(Sentinel::from_env()))
 }
 
 pub fn redact(text: &str) -> String {
-    global().redact(text)
+    global()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .redact(text)
 }
 
 pub fn redact_message(m: &Message) -> Message {
-    global().redact_message(m)
+    global()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .redact_message(m)
 }
 
 fn redact_pem(s: &str) -> String {
@@ -568,6 +581,13 @@ mod tests {
     fn ordinary_text_is_untouched() {
         let text = "let content = compute();\npath=/tmp/file\nkeyboard=us";
         assert_eq!(sentinel().redact(text), text);
+    }
+
+    #[test]
+    fn a_value_added_after_seed_is_redacted() {
+        crate::sentinel::add("valor-secreto-123");
+        let out = crate::sentinel::redact("la clave es valor-secreto-123, anotala");
+        assert_eq!(out, "la clave es [REDACTED], anotala");
     }
 
     #[test]
