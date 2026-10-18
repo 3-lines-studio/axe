@@ -18,7 +18,10 @@ fn the_effort_limits_and_user_id_are_accepted() {
         content: "di hola".into(),
         ..Default::default()
     }];
-    let provider = provider().effort("low").max_tokens(512).user_id("axe-live-test");
+    let provider = provider()
+        .effort("low")
+        .max_tokens(512)
+        .user_id("axe-live-test");
     let response = provider
         .complete(&Request {
             model: "deepseek-flash",

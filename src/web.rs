@@ -16,6 +16,7 @@ const MAX_RESPONSE: usize = 32 * 1024 * 1024;
 const MAX_MARKDOWN: usize = 32 * 1024;
 const MAX_DETAIL: usize = 300;
 const RETRIES: usize = 2;
+const HIGH_QUALITY: f64 = 1.5;
 
 #[derive(Clone)]
 pub struct Web {
@@ -70,6 +71,8 @@ struct Hit {
     title: String,
     url: String,
     #[serde(default)]
+    rerank_score: f64,
+    #[serde(default)]
     snippet: String,
     #[serde(default)]
     summary: String,
@@ -107,6 +110,8 @@ impl Reply {
         let why = match self.status {
             400 => "bad request".to_string(),
             402 => "the DeepSeek account has no balance".to_string(),
+            403 => "DeepSeek rejected the request by its security policy".to_string(),
+            404 => "DeepSeek could not fetch usable content from that URL".to_string(),
             408 => "the request timed out".to_string(),
             413 => "the request body is too large".to_string(),
             422 => "DeepSeek could not read the page".to_string(),
@@ -262,6 +267,9 @@ fn format_results(hits: &[Hit]) -> String {
     if hits.is_empty() {
         return "no results".to_string();
     }
+    let mut hits: Vec<&Hit> = hits.iter().collect();
+    hits.sort_by(|a, b| b.rerank_score.total_cmp(&a.rerank_score));
+    let best = hits.first().map(|hit| hit.rerank_score).unwrap_or(0.0);
     let mut out = String::new();
     for (index, hit) in hits.iter().enumerate() {
         let title = hit.title.trim();
@@ -295,6 +303,11 @@ fn format_results(hits: &[Hit]) -> String {
         if !summary.is_empty() {
             out.push_str(&format!("   {summary}\n"));
         }
+    }
+    if best > 0.0 && best < HIGH_QUALITY {
+        out.push_str(&format!(
+            "\nweak matches: the best hit scores {best:.2} of 3; narrow the query or fetch a URL you already know\n"
+        ));
     }
     out.trim_end().to_string()
 }
@@ -345,17 +358,53 @@ fn check_url(url: &str) -> Result<(), String> {
 }
 
 fn compose(page: &FetchReply) -> String {
-    let content = page.content.trim();
+    let content = unescape(page.content.trim());
+    let content = content.as_str();
     if content.is_empty() {
         return "the page has no readable content".to_string();
     }
-    let title = page.title.trim();
+    let title = unescape(page.title.trim());
+    let title = title.as_str();
     let text = if title.is_empty() {
         content.to_string()
     } else {
         format!("# {title}\n\n{content}")
     };
     truncate(text)
+}
+
+fn unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut fenced = false;
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        if line.starts_with("```") {
+            fenced = !fenced;
+            out.push_str(line);
+            continue;
+        }
+        if fenced {
+            out.push_str(line);
+            continue;
+        }
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.peek() {
+                Some(&next) if next.is_ascii_punctuation() => {
+                    out.push(next);
+                    chars.next();
+                }
+                _ => out.push('\\'),
+            }
+        }
+    }
+    out
 }
 
 fn truncate(text: String) -> String {
@@ -572,6 +621,101 @@ mod tests {
             text,
             "error: DeepSeek could not read the page: could not retrieve usable page content"
         );
+    }
+
+    #[test]
+    fn a_page_without_content_reports_it_as_such() {
+        let (base, server) = serve(vec![(
+            404,
+            r#"{"error":{"message":"failed to fetch URL (request_id: x)"}}"#,
+        )]);
+        let text = run(
+            &fetch(Web::at(&base, "k")),
+            r#"{"url":"https://example.com/missing"}"#,
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            text,
+            "error: DeepSeek could not fetch usable content from that URL: failed to fetch URL (request_id: x)"
+        );
+    }
+
+    #[test]
+    fn a_page_blocked_by_policy_reports_it_as_such() {
+        let (base, server) = serve(vec![(403, r#"{"error":{"message":"blocked"}}"#)]);
+        let text = run(
+            &fetch(Web::at(&base, "k")),
+            r#"{"url":"https://example.com/private"}"#,
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            text,
+            "error: DeepSeek rejected the request by its security policy: blocked"
+        );
+    }
+
+    #[test]
+    fn the_escaped_markdown_is_unwrapped() {
+        assert_eq!(
+            unescape(r"\[link\](https\://a\.b) \- \# head"),
+            "[link](https://a.b) - # head"
+        );
+    }
+
+    #[test]
+    fn code_blocks_keep_their_backslashes() {
+        let text = "a\\.b\n```\nx \\. y\n```\nc\\.d";
+        assert_eq!(unescape(text), "a.b\n```\nx \\. y\n```\nc.d");
+    }
+
+    #[test]
+    fn a_weak_result_set_says_so() {
+        let (base, server) = serve(vec![(
+            200,
+            r#"{"results":[{"title":"Junk","url":"https://junk.example/","rerank_score":0.4}]}"#,
+        )]);
+        let text = run(&search(Web::at(&base, "k")), r#"{"query":"x"}"#);
+        server.join().unwrap();
+        assert!(
+            text.ends_with("weak matches: the best hit scores 0.40 of 3; narrow the query or fetch a URL you already know"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_strong_result_set_has_no_hint() {
+        let (base, server) = serve(vec![(
+            200,
+            r#"{"results":[{"title":"Good","url":"https://good.example/","rerank_score":2.2}]}"#,
+        )]);
+        let text = run(&search(Web::at(&base, "k")), r#"{"query":"x"}"#);
+        server.join().unwrap();
+        assert!(!text.contains("weak matches"), "{text}");
+    }
+
+    #[test]
+    fn a_result_set_without_scores_has_no_hint() {
+        let (base, server) = serve(vec![(
+            200,
+            r#"{"results":[{"title":"T","url":"https://t.example/"}]}"#,
+        )]);
+        let text = run(&search(Web::at(&base, "k")), r#"{"query":"x"}"#);
+        server.join().unwrap();
+        assert!(!text.contains("weak matches"), "{text}");
+    }
+
+    #[test]
+    fn the_best_reranked_hit_comes_first() {
+        let (base, server) = serve(vec![(
+            200,
+            r#"{"results":[{"title":"Low","url":"https://low.example/","rerank_score":0.4},{"title":"High","url":"https://high.example/","rerank_score":2.9}]}"#,
+        )]);
+        let text = run(&search(Web::at(&base, "k")), r#"{"query":"x"}"#);
+        server.join().unwrap();
+        assert!(text.starts_with("1. High"), "{text}");
+        assert!(text.contains("2. Low"), "{text}");
     }
 
     #[test]
