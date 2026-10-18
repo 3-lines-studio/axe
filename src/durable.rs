@@ -245,9 +245,21 @@ impl Journal {
     }
 
     pub fn maybe_snapshot(&mut self) -> std::io::Result<()> {
+        self.maybe_snapshot_with(|_| {})
+    }
+
+    pub fn maybe_snapshot_with(
+        &mut self,
+        prune: impl FnOnce(&mut [Record]),
+    ) -> std::io::Result<()> {
         if self.bytes < SNAPSHOT_BYTES {
             return Ok(());
         }
+        self.snapshot_with(prune)
+    }
+
+    pub fn snapshot_with(&mut self, prune: impl FnOnce(&mut [Record])) -> std::io::Result<()> {
+        prune(&mut self.entries);
         self.snapshot()
     }
 
@@ -409,6 +421,20 @@ mod tests {
         assert_eq!(second.err().unwrap().kind(), std::io::ErrorKind::WouldBlock);
         drop(first);
         assert!(Journal::open(&dir).is_ok());
+    }
+
+    #[test]
+    fn a_snapshot_can_prune_the_entries_it_stores() {
+        let dir = dir("prune");
+        let mut journal = Journal::open(&dir).unwrap();
+        journal.append(vec![usage(1), usage(2)]).unwrap();
+        journal
+            .snapshot_with(|records| records[0].entry = usage(9))
+            .unwrap();
+        assert_eq!(inputs(&journal), [9, 2]);
+        drop(journal);
+        let journal = Journal::open(&dir).unwrap();
+        assert_eq!(inputs(&journal), [9, 2]);
     }
 
     #[test]
