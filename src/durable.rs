@@ -218,6 +218,10 @@ impl Journal {
         Ok(read(dir)?.1)
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn entries(&self) -> &[Record] {
         &self.entries
     }
