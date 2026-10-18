@@ -191,6 +191,10 @@ impl Journal {
         Ok(records)
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn entries(&self) -> &[Record] {
         &self.entries
     }
