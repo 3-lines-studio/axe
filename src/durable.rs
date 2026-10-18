@@ -133,6 +133,64 @@ impl Journal {
         })
     }
 
+    pub fn seed(dir: &Path, entries: Vec<Entry>) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        if dir.join(STATE).exists() || dir.join(JOURNAL).exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "the journal already has state",
+            ));
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let at = session::now_ms();
+        let records: Vec<Record> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(id, entry)| Record {
+                id: id as u64,
+                at,
+                entry,
+            })
+            .collect();
+        let snapshot = SnapshotOut {
+            version: VERSION,
+            seq: 1,
+            next_id: records.len() as u64,
+            entries: &records,
+        };
+        let bytes = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
+        crate::atomic_write(&dir.join(STATE), &bytes)
+    }
+
+    pub fn load(dir: &Path) -> std::io::Result<Vec<Record>> {
+        let snapshot = read_snapshot(dir)?;
+        let seq = snapshot.as_ref().map_or(0, |snapshot| snapshot.seq);
+        let mut records = snapshot
+            .map(|snapshot| snapshot.entries)
+            .unwrap_or_default();
+        let raw = match std::fs::read(dir.join(JOURNAL)) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(records),
+            Err(error) => return Err(error),
+        };
+        let keep = match raw.iter().rposition(|byte| *byte == b'\n') {
+            Some(at) => at + 1,
+            None => 0,
+        };
+        for line in raw[..keep]
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let commit: Commit = serde_json::from_slice(line).map_err(invalid)?;
+            if commit.seq > seq {
+                records.extend(commit.entries);
+            }
+        }
+        Ok(records)
+    }
+
     pub fn entries(&self) -> &[Record] {
         &self.entries
     }
@@ -347,6 +405,34 @@ mod tests {
         assert_eq!(second.err().unwrap().kind(), std::io::ErrorKind::WouldBlock);
         drop(first);
         assert!(Journal::open(&dir).is_ok());
+    }
+
+    #[test]
+    fn a_seed_becomes_the_first_snapshot() {
+        let dir = dir("seed");
+        Journal::seed(&dir, vec![usage(1), usage(2)]).unwrap();
+        assert!(Journal::seed(&dir, vec![usage(3)]).is_err());
+        let reader = Journal::load(&dir).unwrap();
+        assert_eq!(reader.len(), 2);
+        let mut journal = Journal::open(&dir).unwrap();
+        assert_eq!(journal.seq(), 1);
+        journal.append(vec![usage(3)]).unwrap();
+        assert_eq!(journal.seq(), 2);
+        assert_eq!(journal.entries()[2].id, 2);
+    }
+
+    #[test]
+    fn a_reader_sees_committed_entries_without_the_lease() {
+        let dir = dir("reader");
+        let mut journal = Journal::open(&dir).unwrap();
+        journal.append(vec![usage(1)]).unwrap();
+        let reader = Journal::load(&dir).unwrap();
+        assert_eq!(reader.len(), 1);
+        journal.append(vec![usage(2)]).unwrap();
+        journal.snapshot().unwrap();
+        journal.append(vec![usage(3)]).unwrap();
+        let reader = Journal::load(&dir).unwrap();
+        assert_eq!(reader.len(), 3);
     }
 
     #[test]
