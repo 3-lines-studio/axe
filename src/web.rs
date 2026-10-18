@@ -107,6 +107,8 @@ impl Reply {
         let why = match self.status {
             400 => "bad request".to_string(),
             402 => "the DeepSeek account has no balance".to_string(),
+            403 => "DeepSeek rejected the request by its security policy".to_string(),
+            404 => "DeepSeek could not fetch usable content from that URL".to_string(),
             408 => "the request timed out".to_string(),
             413 => "the request body is too large".to_string(),
             422 => "DeepSeek could not read the page".to_string(),
@@ -571,6 +573,39 @@ mod tests {
         assert_eq!(
             text,
             "error: DeepSeek could not read the page: could not retrieve usable page content"
+        );
+    }
+
+    #[test]
+    fn a_page_without_content_reports_it_as_such() {
+        let (base, server) = serve(vec![(
+            404,
+            r#"{"error":{"message":"failed to fetch URL (request_id: x)"}}"#,
+        )]);
+        let text = run(
+            &fetch(Web::at(&base, "k")),
+            r#"{"url":"https://example.com/missing"}"#,
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            text,
+            "error: DeepSeek could not fetch usable content from that URL: failed to fetch URL (request_id: x)"
+        );
+    }
+
+    #[test]
+    fn a_page_blocked_by_policy_reports_it_as_such() {
+        let (base, server) = serve(vec![(403, r#"{"error":{"message":"blocked"}}"#)]);
+        let text = run(
+            &fetch(Web::at(&base, "k")),
+            r#"{"url":"https://example.com/private"}"#,
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            text,
+            "error: DeepSeek rejected the request by its security policy: blocked"
         );
     }
 
