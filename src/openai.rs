@@ -12,11 +12,15 @@ pub struct OpenAI {
     base_url: String,
     api_key: String,
     easy: Arc<Mutex<Option<crate::curlffi::Easy>>>,
+    effort: String,
+    max_tokens: usize,
+    user_id: String,
 }
 
 type BuiltRequest = (String, Vec<(String, String)>, Vec<u8>);
 
 const MAX_IMAGE_URL_BYTES: usize = 24 * 1024 * 1024;
+const MAX_USER_ID: usize = 512;
 
 pub use crate::StreamEvent;
 
@@ -26,6 +30,42 @@ impl OpenAI {
             base_url: base_url.into(),
             api_key: api_key.into(),
             easy: Arc::new(Mutex::new(None)),
+            effort: String::new(),
+            max_tokens: 0,
+            user_id: String::new(),
+        }
+    }
+
+    pub fn effort(mut self, effort: &str) -> Self {
+        self.effort = effort.trim().to_lowercase();
+        self
+    }
+
+    pub fn max_tokens(mut self, max_tokens: usize) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn user_id(mut self, user_id: &str) -> Self {
+        self.user_id = user_id.chars().take(MAX_USER_ID).collect();
+        self
+    }
+
+    fn thinking(&self) -> Option<OaThinking> {
+        if self.effort.is_empty() {
+            return None;
+        }
+        let kind = match self.effort.as_str() {
+            "none" | "disabled" => "disabled",
+            _ => "enabled",
+        };
+        Some(OaThinking { kind })
+    }
+
+    fn reasoning_effort(&self) -> Option<&str> {
+        match self.effort.as_str() {
+            "" | "none" | "disabled" => None,
+            effort => Some(effort),
         }
     }
 
@@ -117,6 +157,10 @@ impl OpenAI {
             messages: msgs,
             tools,
             stream,
+            thinking: self.thinking(),
+            reasoning_effort: self.reasoning_effort(),
+            max_tokens: Some(self.max_tokens).filter(|max| *max > 0),
+            user_id: Some(self.user_id.as_str()).filter(|id| !id.is_empty()),
         })
         .map_err(err)?;
         let url = format!("{}/chat/completions", self.base_url);
@@ -612,6 +656,20 @@ struct OaRequest<'a> {
     tools: Vec<OaRequestTool<'a>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<OaThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct OaThinking {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(Serialize)]
@@ -721,6 +779,56 @@ struct OaError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn body_with(provider: &OpenAI) -> Value {
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "hola".into(),
+            ..Default::default()
+        }];
+        let req = Request {
+            model: "m",
+            system: "",
+            messages: &messages,
+            tools: &[],
+        };
+        let (_, _, body) = provider.build_request(&req, false).unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[test]
+    fn a_default_body_sends_no_extensions() {
+        let body = body_with(&OpenAI::new("http://localhost", "k"));
+        for field in ["thinking", "reasoning_effort", "max_tokens", "user_id"] {
+            assert!(body.get(field).is_none(), "{field} must stay absent");
+        }
+    }
+
+    #[test]
+    fn effort_limits_and_user_id_reach_the_body() {
+        let provider = OpenAI::new("http://localhost", "k")
+            .effort("low")
+            .max_tokens(384000)
+            .user_id("chat-1");
+        let body = body_with(&provider);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["max_tokens"], 384000);
+        assert_eq!(body["user_id"], "chat-1");
+    }
+
+    #[test]
+    fn effort_none_turns_thinking_off_without_the_effort_field() {
+        let body = body_with(&OpenAI::new("http://localhost", "k").effort("none"));
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn a_user_id_is_cut_at_the_spec_limit() {
+        let body = body_with(&OpenAI::new("http://localhost", "k").user_id(&"a".repeat(600)));
+        assert_eq!(body["user_id"].as_str().unwrap().len(), MAX_USER_ID);
+    }
 
     fn feed_all(acc: &mut StreamAcc, chunks: &[&[u8]]) -> Vec<StreamEvent> {
         let (tx, rx) = std::sync::mpsc::channel();

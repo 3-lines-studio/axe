@@ -434,7 +434,7 @@ fn stream<P: Provider>(
             }
         }
         match handle.join() {
-            Ok(resp) => {
+            Ok(resp) if !interrupted(&resp.stop_reason) => {
                 trace(format!(
                     "model request_done_ms={} attempt={}",
                     started.elapsed().as_millis(),
@@ -442,20 +442,26 @@ fn stream<P: Provider>(
                 ));
                 return Ok((resp, calls));
             }
+            Ok(resp) => {
+                if attempt >= MAX_RETRIES || forwarded > 0 {
+                    return Err(format!("provider interrupted: {}", resp.stop_reason));
+                }
+            }
             Err(e) => {
                 if attempt >= MAX_RETRIES || forwarded > 0 || !retryable(&e) {
                     return Err(e.to_string());
                 }
-                attempt += 1;
-                let delay = backoff(attempt);
-                trace(format!(
-                    "model retry={} backoff_ms={} error={}",
-                    attempt, delay, e
-                ));
-                sleep_with_cancel(delay, cancel).map_err(|e| e.to_string())?;
             }
         }
+        attempt += 1;
+        let delay = backoff(attempt);
+        trace(format!("model retry={} backoff_ms={}", attempt, delay));
+        sleep_with_cancel(delay, cancel).map_err(|e| e.to_string())?;
     }
+}
+
+fn interrupted(stop_reason: &str) -> bool {
+    matches!(stop_reason, "insufficient_system_resource" | "aborted")
 }
 
 fn exec(tools: &[Tool], call: &ToolCall, sink: &mut dyn Sink) -> (ToolOutput, Duration) {
@@ -465,5 +471,20 @@ fn exec(tools: &[Tool], call: &ToolCall, sink: &mut dyn Sink) -> (ToolOutput, Du
 fn trace(message: String) {
     if std::env::var_os("AXE_TRACE").is_some() {
         eprintln!("trace: {message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interrupted;
+
+    #[test]
+    fn the_provider_interruptions_are_retryable() {
+        assert!(interrupted("insufficient_system_resource"));
+        assert!(interrupted("aborted"));
+        assert!(!interrupted("stop"));
+        assert!(!interrupted("length"));
+        assert!(!interrupted("tool_calls"));
+        assert!(!interrupted("content_filter"));
     }
 }
