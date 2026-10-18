@@ -9,6 +9,7 @@ pub enum Entry {
     Message {
         message: Message,
     },
+    Reset,
     Compaction {
         summary: String,
         tokens_before: usize,
@@ -109,6 +110,7 @@ pub fn context_messages(entries: &[Entry]) -> Vec<Message> {
 }
 
 pub fn context_messages_with(entries: &[Entry], options: ContextOptions) -> Vec<Message> {
+    let entries = after_reset(entries);
     if !entries
         .iter()
         .any(|entry| matches!(entry, Entry::Compaction { .. }))
@@ -158,10 +160,20 @@ pub fn context_messages_with(entries: &[Entry], options: ContextOptions) -> Vec<
                 });
                 out.extend(retained.iter().cloned());
             }
+            Entry::Reset => out.clear(),
             Entry::Usage { .. } => {}
         }
     }
     out
+}
+
+fn after_reset(entries: &[Entry]) -> &[Entry] {
+    let start = entries
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::Reset))
+        .map(|at| at + 1)
+        .unwrap_or(0);
+    &entries[start..]
 }
 
 fn original_task(entries: &[Entry]) -> &str {
@@ -848,7 +860,7 @@ pub fn drop_incomplete_tool_calls(msgs: &mut Vec<Message>) {
 const RETAIN_TOKENS: usize = 20_000;
 
 pub fn latest_context_tokens(entries: &[Entry]) -> Option<usize> {
-    for entry in entries.iter().rev() {
+    for entry in after_reset(entries).iter().rev() {
         match entry {
             Entry::Usage {
                 context_input,
@@ -865,6 +877,7 @@ pub fn latest_context_tokens(entries: &[Entry]) -> Option<usize> {
 }
 
 fn split_retained(entries: &[Entry], options: ContextOptions) -> (Vec<Message>, Vec<Message>) {
+    let entries = after_reset(entries);
     let msgs = context_messages_with(entries, options);
     let Some(current_tokens) = latest_context_tokens(entries) else {
         return split_last_turn(msgs);
@@ -1190,6 +1203,51 @@ mod tests {
         let mut message = message("tool", "output");
         message.tool_call_id = id.into();
         message
+    }
+
+    #[test]
+    fn a_reset_drops_the_context_before_it() {
+        let entries = vec![
+            Entry::Message {
+                message: message("user", "old"),
+            },
+            Entry::Message {
+                message: message("assistant", "old answer"),
+            },
+            Entry::Reset,
+            Entry::Message {
+                message: message("user", "new"),
+            },
+            usage(10, 1),
+        ];
+        let messages = context_messages(&entries);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "new");
+        assert_eq!(latest_context_tokens(&entries), Some(11));
+    }
+
+    #[test]
+    fn a_compaction_after_a_reset_summarizes_only_what_follows() {
+        let mut entries = vec![
+            Entry::Message {
+                message: message("user", "forgotten"),
+            },
+            Entry::Reset,
+            Entry::Message {
+                message: message("user", "kept"),
+            },
+            usage(10, 1),
+        ];
+        entries.push(Entry::Compaction {
+            summary: "summary".into(),
+            tokens_before: 11,
+            timestamp: 0,
+            retained: Vec::new(),
+        });
+        let messages = context_messages(&entries);
+        assert_eq!(messages[0].role, "user");
+        assert!(messages[0].content.contains("summary"));
+        assert!(!messages[0].content.contains("forgotten"));
     }
 
     #[test]
