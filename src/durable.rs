@@ -1,5 +1,7 @@
 use crate::session::{self, Entry};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -19,12 +21,37 @@ pub struct Record {
     pub entry: Entry,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    Pending,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+    Blocked,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskRecord {
+    pub id: u64,
+    pub kind: String,
+    pub state: TaskState,
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub checkpoint: Value,
+    pub attempts: u32,
+    pub updated: i64,
+}
+
 #[derive(Deserialize)]
 struct Snapshot {
     version: u32,
     seq: u64,
     next_id: u64,
     entries: Vec<Record>,
+    #[serde(default)]
+    tasks: Vec<TaskRecord>,
 }
 
 #[derive(Serialize)]
@@ -33,12 +60,15 @@ struct SnapshotOut<'a> {
     seq: u64,
     next_id: u64,
     entries: &'a [Record],
+    tasks: &'a [TaskRecord],
 }
 
 #[derive(Deserialize)]
 struct Commit {
     seq: u64,
     entries: Vec<Record>,
+    #[serde(default)]
+    tasks: Vec<TaskRecord>,
 }
 
 #[derive(Serialize)]
@@ -46,6 +76,7 @@ struct Line<'a> {
     seq: u64,
     at: i64,
     entries: &'a [Record],
+    tasks: &'a [TaskRecord],
 }
 
 pub struct Journal {
@@ -54,8 +85,10 @@ pub struct Journal {
     journal: File,
     seq: u64,
     next_id: u64,
+    next_task: u64,
     bytes: u64,
     entries: Vec<Record>,
+    tasks: BTreeMap<u64, TaskRecord>,
 }
 
 impl Journal {
@@ -77,7 +110,9 @@ impl Journal {
 
         let mut seq = 0;
         let mut next_id = 0;
+        let mut next_task = 0;
         let mut entries = Vec::new();
+        let mut tasks = BTreeMap::new();
         if let Some(snapshot) = read_snapshot(dir)? {
             if snapshot.version != VERSION {
                 return Err(invalid(format!(
@@ -88,6 +123,10 @@ impl Journal {
             seq = snapshot.seq;
             next_id = snapshot.next_id;
             entries = snapshot.entries;
+            for task in snapshot.tasks {
+                next_task = next_task.max(task.id + 1);
+                tasks.insert(task.id, task);
+            }
         }
 
         let mut journal = OpenOptions::new()
@@ -120,6 +159,10 @@ impl Journal {
                 next_id = next_id.max(record.id + 1);
                 entries.push(record);
             }
+            for task in commit.tasks {
+                next_task = next_task.max(task.id + 1);
+                tasks.insert(task.id, task);
+            }
         }
 
         Ok(Self {
@@ -128,8 +171,10 @@ impl Journal {
             journal,
             seq,
             next_id,
+            next_task,
             bytes,
             entries,
+            tasks,
         })
     }
 
@@ -159,40 +204,18 @@ impl Journal {
             seq: 1,
             next_id: records.len() as u64,
             entries: &records,
+            tasks: &[],
         };
         let bytes = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
         crate::atomic_write(&dir.join(STATE), &bytes)
     }
 
     pub fn load(dir: &Path) -> std::io::Result<Vec<Record>> {
-        let snapshot = read_snapshot(dir)?;
-        let seq = snapshot.as_ref().map_or(0, |snapshot| snapshot.seq);
-        let mut records = snapshot
-            .map(|snapshot| snapshot.entries)
-            .unwrap_or_default();
-        let raw = match std::fs::read(dir.join(JOURNAL)) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(records),
-            Err(error) => return Err(error),
-        };
-        let keep = match raw.iter().rposition(|byte| *byte == b'\n') {
-            Some(at) => at + 1,
-            None => 0,
-        };
-        for line in raw[..keep]
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-        {
-            let commit: Commit = serde_json::from_slice(line).map_err(invalid)?;
-            if commit.seq > seq {
-                records.extend(commit.entries);
-            }
-        }
-        Ok(records)
+        Ok(read(dir)?.0)
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    pub fn load_tasks(dir: &Path) -> std::io::Result<Vec<TaskRecord>> {
+        Ok(read(dir)?.1)
     }
 
     pub fn entries(&self) -> &[Record] {
@@ -208,10 +231,18 @@ impl Journal {
     }
 
     pub fn append(&mut self, entries: Vec<Entry>) -> std::io::Result<u64> {
-        if entries.is_empty() {
+        self.commit(entries, Vec::new())
+    }
+
+    pub fn commit(&mut self, entries: Vec<Entry>, tasks: Vec<TaskRecord>) -> std::io::Result<u64> {
+        if entries.is_empty() && tasks.is_empty() {
             return Ok(self.seq);
         }
         let at = session::now_ms();
+        let mut tasks = tasks;
+        for task in &mut tasks {
+            task.updated = at;
+        }
         let mut records = Vec::with_capacity(entries.len());
         let mut id = self.next_id;
         for entry in entries {
@@ -223,6 +254,7 @@ impl Journal {
             seq,
             at,
             entries: &records,
+            tasks: &tasks,
         })
         .map_err(std::io::Error::other)?;
         line.push(b'\n');
@@ -241,7 +273,25 @@ impl Journal {
         self.seq = seq;
         self.next_id = id;
         self.entries.extend(records);
+        for task in tasks {
+            self.next_task = self.next_task.max(task.id + 1);
+            self.tasks.insert(task.id, task);
+        }
         Ok(seq)
+    }
+
+    pub fn task(&self, id: u64) -> Option<&TaskRecord> {
+        self.tasks.get(&id)
+    }
+
+    pub fn tasks(&self) -> impl Iterator<Item = &TaskRecord> {
+        self.tasks.values()
+    }
+
+    pub fn new_task(&mut self) -> u64 {
+        let id = self.next_task;
+        self.next_task += 1;
+        id
     }
 
     pub fn maybe_snapshot(&mut self) -> std::io::Result<()> {
@@ -264,11 +314,13 @@ impl Journal {
     }
 
     pub fn snapshot(&mut self) -> std::io::Result<()> {
+        let tasks: Vec<&TaskRecord> = self.tasks.values().collect();
         let snapshot = SnapshotOut {
             version: VERSION,
             seq: self.seq,
             next_id: self.next_id,
             entries: &self.entries,
+            tasks: &tasks.into_iter().cloned().collect::<Vec<TaskRecord>>(),
         };
         let bytes = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
         crate::atomic_write(&self.dir.join(STATE), &bytes)?;
@@ -283,6 +335,51 @@ impl Drop for Journal {
     fn drop(&mut self) {
         let _ = unsafe { libc::flock(self.lease.as_raw_fd(), libc::LOCK_UN) };
     }
+}
+
+fn read(dir: &Path) -> std::io::Result<(Vec<Record>, Vec<TaskRecord>)> {
+    let mut seq = 0;
+    let mut records = Vec::new();
+    let mut tasks = BTreeMap::new();
+    if let Some(snapshot) = read_snapshot(dir)? {
+        if snapshot.version != VERSION {
+            return Err(invalid(format!(
+                "journal version {} is not {VERSION}",
+                snapshot.version
+            )));
+        }
+        seq = snapshot.seq;
+        records = snapshot.entries;
+        for task in snapshot.tasks {
+            tasks.insert(task.id, task);
+        }
+    }
+    let raw = match std::fs::read(dir.join(JOURNAL)) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((records, tasks.into_values().collect()));
+        }
+        Err(error) => return Err(error),
+    };
+    let keep = match raw.iter().rposition(|byte| *byte == b'\n') {
+        Some(at) => at + 1,
+        None => 0,
+    };
+    for line in raw[..keep]
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let commit: Commit = serde_json::from_slice(line).map_err(invalid)?;
+        if commit.seq <= seq {
+            continue;
+        }
+        seq = commit.seq;
+        records.extend(commit.entries);
+        for task in commit.tasks {
+            tasks.insert(task.id, task);
+        }
+    }
+    Ok((records, tasks.into_values().collect()))
 }
 
 fn read_snapshot(dir: &Path) -> std::io::Result<Option<Snapshot>> {
@@ -421,6 +518,59 @@ mod tests {
         assert_eq!(second.err().unwrap().kind(), std::io::ErrorKind::WouldBlock);
         drop(first);
         assert!(Journal::open(&dir).is_ok());
+    }
+
+    fn task(id: u64) -> TaskRecord {
+        TaskRecord {
+            id,
+            kind: "turn".into(),
+            state: TaskState::Running,
+            phase: "request".into(),
+            checkpoint: Value::Null,
+            attempts: 0,
+            updated: 0,
+        }
+    }
+
+    #[test]
+    fn a_task_is_committed_with_its_entries() {
+        let dir = dir("tasks");
+        let mut journal = Journal::open(&dir).unwrap();
+        let id = journal.new_task();
+        journal.commit(vec![usage(1)], vec![task(id)]).unwrap();
+        assert_eq!(journal.task(id).unwrap().state, TaskState::Running);
+        assert_eq!(journal.tasks().count(), 1);
+        drop(journal);
+
+        let mut journal = Journal::open(&dir).unwrap();
+        assert_eq!(journal.task(id).unwrap().phase, "request");
+        assert_eq!(inputs(&journal), [1]);
+        assert_eq!(journal.new_task(), id + 1);
+    }
+
+    #[test]
+    fn a_task_update_survives_a_snapshot() {
+        let dir = dir("tasks-snapshot");
+        let id;
+        {
+            let mut journal = Journal::open(&dir).unwrap();
+            id = journal.new_task();
+            journal.commit(Vec::new(), vec![task(id)]).unwrap();
+        }
+        {
+            let mut journal = Journal::open(&dir).unwrap();
+            let mut updated = journal.task(id).unwrap().clone();
+            updated.state = TaskState::Done;
+            updated.attempts = 2;
+            journal.commit(Vec::new(), vec![updated]).unwrap();
+            journal.snapshot().unwrap();
+        }
+        let journal = Journal::open(&dir).unwrap();
+        let task = journal.task(id).unwrap();
+        assert_eq!(task.state, TaskState::Done);
+        assert_eq!(task.attempts, 2);
+        drop(journal);
+        assert_eq!(Journal::load_tasks(&dir).unwrap().len(), 1);
     }
 
     #[test]
