@@ -298,6 +298,12 @@ impl Journal {
         id
     }
 
+    pub fn retain_tasks(&mut self, mut keep: impl FnMut(&TaskRecord) -> bool) -> usize {
+        let before = self.tasks.len();
+        self.tasks.retain(|_, task| keep(task));
+        before - self.tasks.len()
+    }
+
     pub fn maybe_snapshot(&mut self) -> std::io::Result<()> {
         self.maybe_snapshot_with(|_| {})
     }
@@ -550,6 +556,27 @@ mod tests {
         assert_eq!(journal.task(id).unwrap().phase, "request");
         assert_eq!(inputs(&journal), [1]);
         assert_eq!(journal.new_task(), id + 1);
+    }
+
+    #[test]
+    fn retained_tasks_are_dropped_by_a_snapshot() {
+        let dir = dir("retain");
+        let kept;
+        {
+            let mut journal = Journal::open(&dir).unwrap();
+            let first = journal.new_task();
+            kept = journal.new_task();
+            journal
+                .commit(vec![], vec![task(first), task(kept)])
+                .unwrap();
+            assert_eq!(journal.retain_tasks(|task| task.id == kept), 1);
+            journal.snapshot().unwrap();
+        }
+        let journal = Journal::open(&dir).unwrap();
+        assert_eq!(
+            journal.tasks().map(|task| task.id).collect::<Vec<_>>(),
+            [kept]
+        );
     }
 
     #[test]
