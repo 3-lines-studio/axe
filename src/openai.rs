@@ -145,8 +145,8 @@ impl OpenAI {
             tools.push(OaRequestTool {
                 r#type: "function",
                 function: OaRequestToolFunction {
-                    name: t.name,
-                    description: t.description,
+                    name: &t.name,
+                    description: &t.description,
                     parameters: &t.parameters,
                 },
             });
