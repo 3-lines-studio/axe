@@ -259,7 +259,7 @@ pub fn search(web: Web) -> Tool {
             }
         },
     );
-    tool.snippet = "Search the web (DeepSeek): 1 to 50 results with summary and date";
+    tool.snippet = "Search the web (DeepSeek): 1 to 50 results with summary and date".to_string();
     tool
 }
 
@@ -335,7 +335,7 @@ pub fn fetch(web: Web) -> Tool {
             }
         },
     );
-    tool.snippet = "Fetch a URL as Markdown (DeepSeek)";
+    tool.snippet = "Fetch a URL as Markdown (DeepSeek)".to_string();
     tool
 }
 

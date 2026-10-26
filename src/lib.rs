@@ -239,18 +239,18 @@ impl From<String> for ToolOutput {
 }
 
 pub struct Tool {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub parameters: Value,
-    pub snippet: &'static str,
+    pub snippet: String,
     pub sequential: bool,
     #[allow(clippy::type_complexity)]
     pub run: Box<dyn Fn(&str, &mut dyn FnMut(&str)) -> ToolOutput + Send + Sync>,
 }
 
 pub fn new_tool<T, R>(
-    name: &'static str,
-    description: &'static str,
+    name: impl Into<String>,
+    description: impl Into<String>,
     schema: &'static str,
     run: impl Fn(T) -> R + Send + Sync + 'static,
 ) -> Tool
@@ -262,8 +262,8 @@ where
 }
 
 pub fn new_tool_with_progress<T, R>(
-    name: &'static str,
-    description: &'static str,
+    name: impl Into<String>,
+    description: impl Into<String>,
     schema: &'static str,
     run: impl Fn(T, &mut dyn FnMut(&str)) -> R + Send + Sync + 'static,
 ) -> Tool
@@ -271,13 +271,14 @@ where
     T: DeserializeOwned,
     R: Into<ToolOutput>,
 {
+    let name = name.into();
     let parameters: Value = serde_json::from_str(schema).unwrap_or(Value::Null);
     let schema = parameters.clone();
     Tool {
-        name,
-        description,
+        name: name.clone(),
+        description: description.into(),
         parameters,
-        snippet: "",
+        snippet: String::new(),
         sequential: false,
         run: Box::new(move |raw, progress| {
             let raw = if raw.trim().is_empty() { "{}" } else { raw };

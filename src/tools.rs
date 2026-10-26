@@ -323,7 +323,7 @@ pub fn bash(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
             machine.run(&a.command, timeout, progress)
         },
     );
-    t.snippet = "Execute bash commands (ls, grep, find, etc.)";
+    t.snippet = "Execute bash commands (ls, grep, find, etc.)".to_string();
     t
 }
 
@@ -859,7 +859,7 @@ pub fn read(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
             ToolOutput::text(read_text(&a, &data))
         },
     );
-    t.snippet = "Read file contents (truncated, use offset to continue); images are attached so you can see them";
+    t.snippet = "Read file contents (truncated, use offset to continue); images are attached so you can see them".to_string();
     t
 }
 
@@ -880,7 +880,7 @@ pub fn write(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
         },
     );
     t.sequential = true;
-    t.snippet = "Write content to a file";
+    t.snippet = "Write content to a file".to_string();
     t
 }
 
@@ -1453,6 +1453,6 @@ pub fn edit(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
         },
     );
     t.sequential = true;
-    t.snippet = "Make precise file edits with exact text replacement, including multiple disjoint edits in one call";
+    t.snippet = "Make precise file edits with exact text replacement, including multiple disjoint edits in one call".to_string();
     t
 }
