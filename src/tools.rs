@@ -334,6 +334,7 @@ fn status_str(st: std::process::ExitStatus) -> String {
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::{apply_edits, sanitize};
