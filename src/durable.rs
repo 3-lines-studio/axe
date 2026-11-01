@@ -49,6 +49,8 @@ struct Snapshot {
     version: u32,
     seq: u64,
     next_id: u64,
+    #[serde(default)]
+    next_task: u64,
     entries: Vec<Record>,
     #[serde(default)]
     tasks: Vec<TaskRecord>,
@@ -59,6 +61,7 @@ struct SnapshotOut<'a> {
     version: u32,
     seq: u64,
     next_id: u64,
+    next_task: u64,
     entries: &'a [Record],
     tasks: &'a [TaskRecord],
 }
@@ -110,6 +113,7 @@ impl Journal {
             }
             seq = snapshot.seq;
             next_id = snapshot.next_id;
+            next_task = snapshot.next_task;
             entries = snapshot.entries;
             for task in snapshot.tasks {
                 next_task = next_task.max(task.id + 1);
@@ -192,6 +196,7 @@ impl Journal {
             version: VERSION,
             seq: 1,
             next_id: records.len() as u64,
+            next_task: 0,
             entries: &records,
             tasks: &[],
         };
@@ -329,6 +334,7 @@ impl Journal {
             version: VERSION,
             seq: self.seq,
             next_id: self.next_id,
+            next_task: self.next_task,
             entries,
             tasks: &tasks,
         };
@@ -597,6 +603,22 @@ mod tests {
             journal.tasks().map(|task| task.id).collect::<Vec<_>>(),
             [kept]
         );
+    }
+
+    #[test]
+    fn task_ids_are_not_reused_after_pruning() {
+        let dir = dir("task-ids");
+        let id;
+        {
+            let mut journal = Journal::open(&dir).unwrap();
+            id = journal.new_task();
+            journal.commit(Vec::new(), vec![task(id)]).unwrap();
+            journal.retain_tasks(|_| false);
+            journal.snapshot().unwrap();
+        }
+        let mut journal = Journal::open(&dir).unwrap();
+        assert_eq!(journal.tasks().count(), 0);
+        assert_eq!(journal.new_task(), id + 1);
     }
 
     #[test]

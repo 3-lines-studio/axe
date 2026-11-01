@@ -564,6 +564,9 @@ def oneshot_prints_answer(h, axe):
             srv.requests[0]["headers"].get("Authorization") == "Bearer sk-test",
             "auth header wrong: %s" % srv.requests[0]["headers"],
         )
+        body = srv.requests[0]["json"]
+        check(body.get("reasoning_effort") == "max", "effort not max: %s" % body)
+        check(body.get("thinking") == {"type": "enabled"}, "thinking not enabled: %s" % body)
 
 
 @case
