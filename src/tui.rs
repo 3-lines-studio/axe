@@ -17,7 +17,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 use std::io::{self, Stdout, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -256,6 +256,17 @@ fn run_app(
 }
 
 impl App {
+    fn provider(&self) -> OpenAI {
+        OpenAI::new(self.cfg.base.clone(), self.cfg.api_key.clone()).effort("max")
+    }
+
+    fn tools(&self) -> Vec<crate::Tool> {
+        crate::tools::build_tools_with(
+            Arc::new(crate::machine::Local::new(&self.cfg.dir)),
+            crate::web::Web::for_key(&self.cfg.base, &self.cfg.api_key),
+        )
+    }
+
     fn on_exit(&mut self) {
         match self.resume_id.take() {
             Some(id) => {
@@ -402,6 +413,7 @@ impl App {
         if !self.follow {
             status.push_str(&format!(" · {}/{}", self.scroll, self.max_scroll));
         }
+        frame.render_widget(Clear, areas[4]);
         frame.render_widget(Paragraph::new(status).style(Style::default()), areas[4]);
         let (cursor_row, cursor_col) = self.cursor_position(input_width);
         let cursor_row = self.attachments.len() + cursor_row;
@@ -591,7 +603,7 @@ impl App {
         };
         self.resume_id = Some(id.clone());
         self.cfg.store.set_resume_id(&id);
-        let transcript = entries
+        let transcript = session::after_reset(&entries)
             .iter()
             .filter_map(|entry| match entry {
                 session::Entry::Message { message } => Some(message.clone()),
@@ -1414,7 +1426,7 @@ impl App {
                 .push(Entry::Notice("session too small to compact".into()));
             return;
         }
-        let provider = OpenAI::new(self.cfg.base.clone(), self.cfg.api_key.clone());
+        let provider = self.provider();
         let model = self.cfg.model.clone();
         let entries = self.cfg.store.live();
         let (sender, receiver) = mpsc::channel();
@@ -1431,10 +1443,10 @@ impl App {
 
     fn start_turn(&mut self) {
         let messages = self.messages.clone();
-        let provider = OpenAI::new(self.cfg.base.clone(), self.cfg.api_key.clone());
+        let provider = self.provider();
         let model = self.cfg.model.clone();
         let system = self.cfg.system.clone();
-        let tools = crate::tools::build_tools(&self.cfg.dir);
+        let tools = self.tools();
         let threshold = self
             .cfg
             .context_window

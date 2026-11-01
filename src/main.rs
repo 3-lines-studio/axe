@@ -57,7 +57,8 @@ fn main() {
         }
         #[cfg(feature = "tui")]
         {
-            let tools = axe::tools::build_tools(&cfg.dir);
+            let key = api_key(&fc);
+            let tools = build_tools(&cfg.dir, &cfg.base, &key);
             let store = Arc::new(axe::session::FsStore::new(axe::session::scope_dir(
                 &axe_root(),
                 std::path::Path::new(&work_dir(&cfg)),
@@ -68,7 +69,7 @@ fn main() {
                 system: resolve_system(&cfg, &tools),
                 dir: cfg.dir.clone(),
                 store,
-                api_key: api_key(&fc),
+                api_key: key,
                 resume: cfg.resume.clone(),
                 context_window: fc.context_window,
             };
@@ -102,12 +103,12 @@ fn main() {
 fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>), String> {
     let mut cfg = Config {
         base: if fc.base.is_empty() {
-            "https://api.openai.com/v1".into()
+            "https://api.deepseek.com".into()
         } else {
             fc.base.clone()
         },
         model: if fc.model.is_empty() {
-            "gpt-4.1-mini".into()
+            "deepseek-flash".into()
         } else {
             fc.model.clone()
         },
@@ -193,8 +194,8 @@ fn usage() {
          \n\
          Flags:\n\
          \x20 -V, --version  show the axe version\n\
-         \x20 -base URL    OpenAI-compatible API base URL (default \"https://api.openai.com/v1\")\n\
-         \x20 -model NAME  model name (default \"gpt-4.1-mini\")\n\
+         \x20 -base URL    OpenAI-compatible API base URL (default \"https://api.deepseek.com\")\n\
+         \x20 -model NAME  model name (default \"deepseek-flash\")\n\
          \x20 -system TEXT  system prompt (default: built-in)\n\
          \x20 -C DIR       working directory for tools\n\
          \x20 -i, --image SOURCE  attach an image to the prompt: a file path or an http(s) URL; repeatable\n\
@@ -305,9 +306,9 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     session_entries.push(axe::session::Entry::Message {
         message: history.last().unwrap().clone(),
     });
-    let tools = axe::tools::build_tools(&cfg.dir);
+    let tools = build_tools(&cfg.dir, &cfg.base, &api_key(fc));
     let system = resolve_system(cfg, &tools);
-    let provider = OpenAI::new(cfg.base.clone(), api_key(fc));
+    let provider = OpenAI::new(cfg.base.clone(), api_key(fc)).effort("max");
     let mut sink = CliSink {
         input: 0,
         output: 0,
@@ -440,12 +441,21 @@ fn compact_or_fail(
 }
 
 fn api_key(fc: &FileConfig) -> String {
-    if let Ok(k) = std::env::var("OPENAI_API_KEY")
-        && !k.is_empty()
-    {
-        return k;
+    for name in ["DEEPSEEK_API_KEY", "OPENAI_API_KEY"] {
+        if let Ok(k) = std::env::var(name)
+            && !k.trim().is_empty()
+        {
+            return k.trim().to_string();
+        }
     }
-    fc.api_key.clone()
+    fc.api_key.trim().to_string()
+}
+
+fn build_tools(dir: &str, base: &str, key: &str) -> Vec<Tool> {
+    axe::tools::build_tools_with(
+        Arc::new(axe::machine::Local::new(dir)),
+        axe::web::Web::for_key(base, key),
+    )
 }
 
 fn work_dir(cfg: &Config) -> String {

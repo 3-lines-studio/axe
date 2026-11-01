@@ -172,7 +172,7 @@ pub fn context_messages_with(entries: &[Entry], options: ContextOptions) -> Vec<
     out
 }
 
-fn after_reset(entries: &[Entry]) -> &[Entry] {
+pub(crate) fn after_reset(entries: &[Entry]) -> &[Entry] {
     let start = entries
         .iter()
         .rposition(|entry| matches!(entry, Entry::Reset))
@@ -778,6 +778,7 @@ fn next_turns(turns: usize, entry: &Entry) -> usize {
                 .filter(|message| message.role == "user")
                 .count()
         }
+        Entry::Reset => 0,
         _ => turns,
     }
 }
@@ -1229,6 +1230,20 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "new");
         assert_eq!(latest_context_tokens(&entries), Some(11));
+    }
+
+    #[test]
+    fn a_reset_restarts_the_turn_count() {
+        assert_eq!(next_turns(4, &Entry::Reset), 0);
+        assert_eq!(
+            next_turns(
+                0,
+                &Entry::Message {
+                    message: message("user", "new"),
+                }
+            ),
+            1
+        );
     }
 
     #[test]

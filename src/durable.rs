@@ -94,19 +94,7 @@ pub struct Journal {
 impl Journal {
     pub fn open(dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let lease = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(dir.join(LEASE))?;
-        let taken = unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if taken != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "the journal is held by another process",
-            ));
-        }
+        let lease = lock_dir(dir)?;
 
         let mut seq = 0;
         let mut next_id = 0;
@@ -180,6 +168,7 @@ impl Journal {
 
     pub fn seed(dir: &Path, entries: Vec<Entry>) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
+        let _lease = lock_dir(dir)?;
         if dir.join(STATE).exists() || dir.join(JOURNAL).exists() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -319,21 +308,35 @@ impl Journal {
     }
 
     pub fn snapshot_with(&mut self, prune: impl FnOnce(&mut [Record])) -> std::io::Result<()> {
-        prune(&mut self.entries);
-        self.snapshot()
+        let mut entries = self.entries.clone();
+        prune(&mut entries);
+        self.write_state(&entries)?;
+        self.entries = entries;
+        self.truncate_journal()
     }
 
     pub fn snapshot(&mut self) -> std::io::Result<()> {
-        let tasks: Vec<&TaskRecord> = self.tasks.values().collect();
+        let entries = std::mem::take(&mut self.entries);
+        let written = self.write_state(&entries);
+        self.entries = entries;
+        written?;
+        self.truncate_journal()
+    }
+
+    fn write_state(&mut self, entries: &[Record]) -> std::io::Result<()> {
+        let tasks: Vec<TaskRecord> = self.tasks.values().cloned().collect();
         let snapshot = SnapshotOut {
             version: VERSION,
             seq: self.seq,
             next_id: self.next_id,
-            entries: &self.entries,
-            tasks: &tasks.into_iter().cloned().collect::<Vec<TaskRecord>>(),
+            entries,
+            tasks: &tasks,
         };
         let bytes = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
-        crate::atomic_write(&self.dir.join(STATE), &bytes)?;
+        crate::atomic_write(&self.dir.join(STATE), &bytes)
+    }
+
+    fn truncate_journal(&mut self) -> std::io::Result<()> {
         self.journal.set_len(0)?;
         self.journal.sync_data()?;
         self.bytes = 0;
@@ -345,6 +348,23 @@ impl Drop for Journal {
     fn drop(&mut self) {
         let _ = unsafe { libc::flock(self.lease.as_raw_fd(), libc::LOCK_UN) };
     }
+}
+
+fn lock_dir(dir: &Path) -> std::io::Result<File> {
+    let lease = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join(LEASE))?;
+    let taken = unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if taken != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "the journal is held by another process",
+        ));
+    }
+    Ok(lease)
 }
 
 fn read(dir: &Path) -> std::io::Result<(Vec<Record>, Vec<TaskRecord>)> {
@@ -616,6 +636,20 @@ mod tests {
         drop(journal);
         let journal = Journal::open(&dir).unwrap();
         assert_eq!(inputs(&journal), [9, 2]);
+    }
+
+    #[test]
+    fn a_failed_prune_leaves_the_entries_alone() {
+        let dir = dir("prune-fail");
+        let mut journal = Journal::open(&dir).unwrap();
+        journal.append(vec![usage(1), usage(2)]).unwrap();
+        std::fs::create_dir_all(dir.join(STATE)).unwrap();
+        assert!(
+            journal
+                .snapshot_with(|records| records[0].entry = usage(9))
+                .is_err()
+        );
+        assert_eq!(inputs(&journal), [1, 2]);
     }
 
     #[test]

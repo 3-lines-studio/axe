@@ -340,7 +340,7 @@ pub fn rewind_entries(messages: &[Message], index: usize) -> Vec<Entry> {
 
 pub fn session_usage(entries: &[Entry]) -> SessionUsage {
     let mut usage = SessionUsage::default();
-    for entry in entries {
+    for entry in crate::session::after_reset(entries) {
         let Entry::Usage {
             input,
             output,
@@ -400,5 +400,31 @@ mod tests {
     fn builds_rewind_entries() {
         let messages = vec![Message::default(), Message::default()];
         assert_eq!(rewind_entries(&messages, 1).len(), 1);
+    }
+
+    #[test]
+    fn usage_before_a_reset_is_not_counted() {
+        let entries = vec![
+            Entry::Usage {
+                input: 10,
+                output: 2,
+                cached_input: 0,
+                context_input: 10,
+                context_output: 2,
+            },
+            Entry::Reset,
+            Entry::Usage {
+                input: 7,
+                output: 3,
+                cached_input: 1,
+                context_input: 7,
+                context_output: 3,
+            },
+        ];
+        let usage = session_usage(&entries);
+        assert_eq!(usage.input, 7);
+        assert_eq!(usage.output, 3);
+        assert_eq!(usage.cached_input, 1);
+        assert_eq!(usage.context_input, 7);
     }
 }

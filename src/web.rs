@@ -46,6 +46,19 @@ impl Web {
             std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         Some(Web::at(base_url, api_key))
     }
+
+    pub fn for_key(llm_base: &str, api_key: &str) -> Option<Web> {
+        if let Some(web) = Web::from_env() {
+            return Some(web);
+        }
+        let api_key = api_key.trim();
+        if api_key.is_empty() || !llm_base.to_ascii_lowercase().contains("deepseek") {
+            return None;
+        }
+        let base_url =
+            std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        Some(Web::at(base_url, api_key))
+    }
 }
 
 #[derive(Deserialize)]

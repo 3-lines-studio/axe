@@ -52,6 +52,99 @@ def strip_ansi(b):
     return ANSI_RE.sub("", b)
 
 
+def screen_text(data, cols, rows):
+    """Replay the cursor-addressed TUI output onto a grid.
+
+    The PTY stream only contains the cells ratatui changed, so searching it
+    for a status line misses characters that happened to be unchanged from
+    the previous frame. Search the replayed screen instead.
+    """
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", "replace")
+    grid = [[" "] * cols for _ in range(rows)]
+    row = col = 0
+    saved = (0, 0)
+    i = 0
+    while i < len(data):
+        ch = data[i]
+        if ch == "\x1b":
+            if data.startswith("\x1b[", i):
+                j = i + 2
+                while j < len(data) and not ("@" <= data[j] <= "~"):
+                    j += 1
+                if j >= len(data):
+                    break
+                seq, final = data[i + 2:j], data[j]
+                body = seq[1:] if seq.startswith("?") else seq
+                nums = [int(p) if p.isdigit() else 0 for p in body.split(";") if p]
+                n = nums[0] if nums else 0
+                if final in "Hf":
+                    row = (nums[0] if nums else 1) - 1
+                    col = (nums[1] if len(nums) > 1 else 1) - 1
+                elif final == "A":
+                    row -= max(n, 1)
+                elif final == "B":
+                    row += max(n, 1)
+                elif final == "C":
+                    col += max(n, 1)
+                elif final == "D":
+                    col -= max(n, 1)
+                elif final == "G":
+                    col = max(n, 1) - 1
+                elif final == "d":
+                    row = max(n, 1) - 1
+                elif final == "J" and n in (2, 3):
+                    grid = [[" "] * cols for _ in range(rows)]
+                elif final == "J" and n == 0:
+                    if 0 <= row < rows:
+                        for x in range(max(col, 0), cols):
+                            grid[row][x] = " "
+                    for y in range(row + 1, rows):
+                        grid[y] = [" "] * cols
+                elif final == "K":
+                    if 0 <= row < rows:
+                        lo, hi = (0, cols) if n == 2 else (max(col, 0), cols) if n == 0 else (0, max(col + 1, 0))
+                        for x in range(lo, min(hi, cols)):
+                            grid[row][x] = " "
+                elif final == "s":
+                    saved = (row, col)
+                elif final == "u":
+                    row, col = saved
+                i = j + 1
+                continue
+            if data.startswith("\x1b]", i):
+                j = i + 2
+                while j < len(data) and data[j] not in "\x07\x1b":
+                    j += 1
+                i = j + 1 if j < len(data) and data[j] == "\x07" else j + 2
+                continue
+            i += 2
+            continue
+        if ch == "\r":
+            col = 0
+        elif ch == "\n":
+            row = min(row + 1, rows - 1)
+        elif ch == "\b":
+            col = max(col - 1, 0)
+        elif ch == "\t":
+            col = min(((col // 8) + 1) * 8, cols - 1)
+        elif ch >= " ":
+            import unicodedata
+
+            width = 0 if unicodedata.combining(ch) else 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+            if 0 <= row < rows and 0 <= col < cols:
+                grid[row][col] = ch
+                if width == 2 and col + 1 < cols:
+                    grid[row][col + 1] = ""
+            col = min(col + width, cols - 1)
+        i += 1
+    row = max(0, min(row, rows - 1))
+    col = max(0, min(col, cols - 1))
+    if grid[row][col] == " ":
+        grid[row][col] = ""
+    return "\n".join("".join(line).rstrip() for line in grid)
+
+
 def check(cond, msg):
     if not cond:
         raise AssertionError(msg)
@@ -276,6 +369,8 @@ class Harness:
         )
         e.pop("TMUX", None)
         e.pop("OPENAI_API_KEY", None)
+        e.pop("DEEPSEEK_API_KEY", None)
+        e.pop("DEEPSEEK_BASE_URL", None)
         if api_key is not None:
             e["OPENAI_API_KEY"] = api_key
         if extra:
@@ -328,6 +423,8 @@ KEYS = {
 
 class Tui:
     def __init__(self, axe, env, args, cwd, cols=100, rows=30):
+        self.cols = cols
+        self.rows = rows
         self.master, slave = pty.openpty()
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         self.proc = subprocess.Popen(
@@ -372,7 +469,7 @@ class Tui:
 
     def output(self):
         with self._lock:
-            return strip_ansi(self.buf)
+            return screen_text(self.buf, self.cols, self.rows)
 
     def expect(self, text, timeout=20):
         deadline = time.time() + timeout

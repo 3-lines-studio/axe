@@ -40,7 +40,7 @@ Axe loads system libcurl at runtime.
 ## Use
 
 ```sh
-export OPENAI_API_KEY="..."
+export DEEPSEEK_API_KEY="..."
 axe
 axe -C /path/to/project
 axe "fix the failing tests"
@@ -77,12 +77,12 @@ Axe reads `~/.config/axe/config`, or `$XDG_CONFIG_HOME/axe/config` when `XDG_CON
 
 ```ini
 api_key = "..."
-model = "gpt-4.1-mini"
-base = "https://api.openai.com/v1"
-context_window = 128000
+model = "deepseek-flash"
+base = "https://api.deepseek.com"
+# context_window = 1000000
 ```
 
-`OPENAI_API_KEY` overrides `api_key`. The command-line `--model` and `--base` flags override the file. Set `context_window` to enable automatic compaction before the configured limit. Extra system instructions go in `SYSTEM.md` beside the config file; `--system` replaces the full built-in system prompt for that run.
+`DEEPSEEK_API_KEY` or `OPENAI_API_KEY` overrides `api_key`; the same key is used for the model and, when the base URL is DeepSeek, for the `search` and `fetch` tools. The command-line `--model` and `--base` flags override the file. Reasoning effort defaults to `max`. Set `context_window` to enable automatic compaction before the configured limit. Extra system instructions go in `SYSTEM.md` beside the config file; `--system` replaces the full built-in system prompt for that run.
 
 Sessions are scoped by project and stored under the same Axe config directory. Starting a fresh TUI archives the prior live session for that project.
 
@@ -96,7 +96,7 @@ axe = { git = "https://github.com/3-lines-studio/axe", rev = "<commit>" }
 ```rust
 let tools = axe::tools::build_tools("/tmp/project");
 let system = axe::system_prompt(&tools);
-let provider = axe::OpenAI::new("https://api.openai.com/v1", api_key);
+let provider = axe::OpenAI::new("https://api.deepseek.com", api_key).effort("max");
 let end = axe::run::run_stream(&provider, &opts, &history, &cancel, &mut sink);
 ```
 
@@ -121,13 +121,13 @@ python3 scripts/bench.py /path/to/baseline target/release/axe --runs 100
 Run live model evals separately:
 
 ```sh
-OPENAI_API_KEY="..." make eval
-python3 scripts/eval.py --model gpt-4.1 --runs 3
+DEEPSEEK_API_KEY="..." make eval
+python3 scripts/eval.py --model deepseek-flash --runs 3
 python3 scripts/eval.py --bin target/release/axe --runs 3
 python3 scripts/eval.py --agent axe --runs 3
 python3 scripts/eval.py --agent pi --runs 3
-OPENAI_API_KEY="..." make eval-compaction
-AXE_EVAL_MODEL=gpt-4.1-mini AXE_EVAL_COMPACTION_CYCLES=10 OPENAI_API_KEY="..." make eval-compaction
+DEEPSEEK_API_KEY="..." make eval-compaction
+AXE_EVAL_MODEL=deepseek-flash AXE_EVAL_COMPACTION_CYCLES=10 DEEPSEEK_API_KEY="..." make eval-compaction
 ```
 
 The agent eval loads the endpoint, model, and API key from `~/.config/axe/config` by default and compares Axe with `pi`. Use `--agent` to run one agent. The compaction eval checks required-fact recall and context size after every compaction cycle. Evals cost money and can vary by model, so `make check` does not run them.
@@ -139,7 +139,7 @@ Two tools over the system libcurl, backed by DeepSeek's tools API:
 - `search QUERY` returns ranked results with titles, URLs, and snippets.
 - `fetch URL` returns the page as Markdown, without the navigation, ads, and scripts.
 
-Both need `DEEPSEEK_API_KEY`; without it the tools are left out of the tool set. `DEEPSEEK_BASE_URL` overrides the endpoint (default `https://api.deepseek.com`). Weak search results are labelled so the model can tell a thin hit from a good one.
+Both use the same key as the model: `DEEPSEEK_API_KEY`, the axe config key, or `OPENAI_API_KEY`, as long as the base URL is DeepSeek. Without a key the tools are left out of the tool set. `DEEPSEEK_BASE_URL` overrides the web endpoint (default `https://api.deepseek.com`). Weak search results are labelled so the model can tell a thin hit from a good one.
 
 ## Bash
 
