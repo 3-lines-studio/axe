@@ -1,3 +1,4 @@
+use crate::ids::EntryId;
 use crate::{Message, Provider, Request};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -29,6 +30,13 @@ pub enum Entry {
         #[serde(default)]
         context_output: usize,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Record {
+    pub id: EntryId,
+    pub at: i64,
+    pub entry: Entry,
 }
 
 #[derive(Clone, Debug)]

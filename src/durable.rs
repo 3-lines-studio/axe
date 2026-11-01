@@ -1,4 +1,5 @@
-use crate::session::{self, Entry};
+use crate::ids::{EntryId, Seq, TaskId};
+use crate::session::{self, Entry, Record};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -14,13 +15,6 @@ const STATE: &str = "state.json";
 const JOURNAL: &str = "journal.jsonl";
 const LEASE: &str = "journal.lock";
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Record {
-    pub id: u64,
-    pub at: i64,
-    pub entry: Entry,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
@@ -34,7 +28,7 @@ pub enum TaskState {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskRecord {
-    pub id: u64,
+    pub id: TaskId,
     pub kind: String,
     pub state: TaskState,
     pub phase: String,
@@ -47,10 +41,10 @@ pub struct TaskRecord {
 #[derive(Deserialize)]
 struct Snapshot {
     version: u32,
-    seq: u64,
-    next_id: u64,
+    seq: Seq,
+    next_id: EntryId,
     #[serde(default)]
-    next_task: u64,
+    next_task: TaskId,
     entries: Vec<Record>,
     #[serde(default)]
     tasks: Vec<TaskRecord>,
@@ -59,16 +53,16 @@ struct Snapshot {
 #[derive(Serialize)]
 struct SnapshotOut<'a> {
     version: u32,
-    seq: u64,
-    next_id: u64,
-    next_task: u64,
+    seq: Seq,
+    next_id: EntryId,
+    next_task: TaskId,
     entries: &'a [Record],
     tasks: &'a [TaskRecord],
 }
 
 #[derive(Deserialize)]
 struct Commit {
-    seq: u64,
+    seq: Seq,
     entries: Vec<Record>,
     #[serde(default)]
     tasks: Vec<TaskRecord>,
@@ -76,7 +70,7 @@ struct Commit {
 
 #[derive(Serialize)]
 struct Line<'a> {
-    seq: u64,
+    seq: Seq,
     at: i64,
     entries: &'a [Record],
     tasks: &'a [TaskRecord],
@@ -86,12 +80,12 @@ pub struct Journal {
     dir: PathBuf,
     lease: File,
     journal: File,
-    seq: u64,
-    next_id: u64,
-    next_task: u64,
+    seq: Seq,
+    next_id: EntryId,
+    next_task: TaskId,
     bytes: u64,
     entries: Vec<Record>,
-    tasks: BTreeMap<u64, TaskRecord>,
+    tasks: BTreeMap<TaskId, TaskRecord>,
 }
 
 impl Journal {
@@ -99,9 +93,9 @@ impl Journal {
         std::fs::create_dir_all(dir)?;
         let lease = lock_dir(dir)?;
 
-        let mut seq = 0;
-        let mut next_id = 0;
-        let mut next_task = 0;
+        let mut seq = Seq(0);
+        let mut next_id = EntryId(0);
+        let mut next_task = TaskId(0);
         let mut entries = Vec::new();
         let mut tasks = BTreeMap::new();
         if let Some(snapshot) = read_snapshot(dir)? {
@@ -116,7 +110,7 @@ impl Journal {
             next_task = snapshot.next_task;
             entries = snapshot.entries;
             for task in snapshot.tasks {
-                next_task = next_task.max(task.id + 1);
+                next_task = next_task.max(task.id.next());
                 tasks.insert(task.id, task);
             }
         }
@@ -148,11 +142,11 @@ impl Journal {
             }
             seq = commit.seq;
             for record in commit.entries {
-                next_id = next_id.max(record.id + 1);
+                next_id = next_id.max(record.id.next());
                 entries.push(record);
             }
             for task in commit.tasks {
-                next_task = next_task.max(task.id + 1);
+                next_task = next_task.max(task.id.next());
                 tasks.insert(task.id, task);
             }
         }
@@ -187,16 +181,16 @@ impl Journal {
             .into_iter()
             .enumerate()
             .map(|(id, entry)| Record {
-                id: id as u64,
+                id: EntryId(id as u64),
                 at,
                 entry,
             })
             .collect();
         let snapshot = SnapshotOut {
             version: VERSION,
-            seq: 1,
-            next_id: records.len() as u64,
-            next_task: 0,
+            seq: Seq(1),
+            next_id: EntryId(records.len() as u64),
+            next_task: TaskId(0),
             entries: &records,
             tasks: &[],
         };
@@ -220,7 +214,7 @@ impl Journal {
         &self.entries
     }
 
-    pub fn seq(&self) -> u64 {
+    pub fn seq(&self) -> Seq {
         self.seq
     }
 
@@ -228,11 +222,11 @@ impl Journal {
         self.bytes
     }
 
-    pub fn append(&mut self, entries: Vec<Entry>) -> std::io::Result<u64> {
+    pub fn append(&mut self, entries: Vec<Entry>) -> std::io::Result<Seq> {
         self.commit(entries, Vec::new())
     }
 
-    pub fn commit(&mut self, entries: Vec<Entry>, tasks: Vec<TaskRecord>) -> std::io::Result<u64> {
+    pub fn commit(&mut self, entries: Vec<Entry>, tasks: Vec<TaskRecord>) -> std::io::Result<Seq> {
         if entries.is_empty() && tasks.is_empty() {
             return Ok(self.seq);
         }
@@ -245,9 +239,9 @@ impl Journal {
         let mut id = self.next_id;
         for entry in entries {
             records.push(Record { id, at, entry });
-            id += 1;
+            id = id.next();
         }
-        let seq = self.seq + 1;
+        let seq = self.seq.next();
         let mut line = serde_json::to_vec(&Line {
             seq,
             at,
@@ -272,13 +266,13 @@ impl Journal {
         self.next_id = id;
         self.entries.extend(records);
         for task in tasks {
-            self.next_task = self.next_task.max(task.id + 1);
+            self.next_task = self.next_task.max(task.id.next());
             self.tasks.insert(task.id, task);
         }
         Ok(seq)
     }
 
-    pub fn task(&self, id: u64) -> Option<&TaskRecord> {
+    pub fn task(&self, id: TaskId) -> Option<&TaskRecord> {
         self.tasks.get(&id)
     }
 
@@ -286,9 +280,9 @@ impl Journal {
         self.tasks.values()
     }
 
-    pub fn new_task(&mut self) -> u64 {
+    pub fn new_task(&mut self) -> TaskId {
         let id = self.next_task;
-        self.next_task += 1;
+        self.next_task = self.next_task.next();
         id
     }
 
@@ -374,7 +368,7 @@ fn lock_dir(dir: &Path) -> std::io::Result<File> {
 }
 
 fn read(dir: &Path) -> std::io::Result<(Vec<Record>, Vec<TaskRecord>)> {
-    let mut seq = 0;
+    let mut seq = Seq(0);
     let mut records = Vec::new();
     let mut tasks = BTreeMap::new();
     if let Some(snapshot) = read_snapshot(dir)? {
@@ -475,8 +469,8 @@ mod tests {
         }
         let journal = Journal::open(&dir).unwrap();
         assert_eq!(inputs(&journal), [1, 2]);
-        assert_eq!(journal.seq(), 2);
-        assert_eq!(journal.entries()[1].id, 1);
+        assert_eq!(journal.seq(), Seq(2));
+        assert_eq!(journal.entries()[1].id, EntryId(1));
     }
 
     #[test]
@@ -501,7 +495,7 @@ mod tests {
 
         let journal = Journal::open(&dir).unwrap();
         assert_eq!(inputs(&journal), [1, 2]);
-        assert_eq!(journal.seq(), 2);
+        assert_eq!(journal.seq(), Seq(2));
     }
 
     #[test]
@@ -542,8 +536,8 @@ mod tests {
         let mut journal = Journal::open(&dir).unwrap();
         assert_eq!(inputs(&journal), [1, 2]);
         journal.append(vec![usage(3)]).unwrap();
-        assert_eq!(journal.seq(), 3);
-        assert_eq!(journal.entries()[2].id, 2);
+        assert_eq!(journal.seq(), Seq(3));
+        assert_eq!(journal.entries()[2].id, EntryId(2));
     }
 
     #[test]
@@ -556,7 +550,7 @@ mod tests {
         assert!(Journal::open(&dir).is_ok());
     }
 
-    fn task(id: u64) -> TaskRecord {
+    fn task(id: TaskId) -> TaskRecord {
         TaskRecord {
             id,
             kind: "turn".into(),
@@ -581,7 +575,7 @@ mod tests {
         let mut journal = Journal::open(&dir).unwrap();
         assert_eq!(journal.task(id).unwrap().phase, "request");
         assert_eq!(inputs(&journal), [1]);
-        assert_eq!(journal.new_task(), id + 1);
+        assert_eq!(journal.new_task(), id.next());
     }
 
     #[test]
@@ -618,7 +612,7 @@ mod tests {
         }
         let mut journal = Journal::open(&dir).unwrap();
         assert_eq!(journal.tasks().count(), 0);
-        assert_eq!(journal.new_task(), id + 1);
+        assert_eq!(journal.new_task(), id.next());
     }
 
     #[test]
@@ -682,10 +676,10 @@ mod tests {
         let reader = Journal::load(&dir).unwrap();
         assert_eq!(reader.len(), 2);
         let mut journal = Journal::open(&dir).unwrap();
-        assert_eq!(journal.seq(), 1);
+        assert_eq!(journal.seq(), Seq(1));
         journal.append(vec![usage(3)]).unwrap();
-        assert_eq!(journal.seq(), 2);
-        assert_eq!(journal.entries()[2].id, 2);
+        assert_eq!(journal.seq(), Seq(2));
+        assert_eq!(journal.entries()[2].id, EntryId(2));
     }
 
     #[test]

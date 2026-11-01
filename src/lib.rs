@@ -9,6 +9,7 @@ pub mod app;
 pub mod curlffi;
 pub mod durable;
 mod http;
+pub mod ids;
 pub mod image;
 pub mod machine;
 pub mod openai;
@@ -20,6 +21,7 @@ pub mod tools;
 pub mod tui;
 pub mod web;
 
+pub use ids::{EntryId, Seq, SessionId, TaskId};
 pub use openai::OpenAI;
 
 pub fn system_prompt(tools: &[Tool]) -> String {
