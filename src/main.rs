@@ -608,7 +608,7 @@ mod tests {
 
     fn tool(name: &'static str, snippet: &'static str) -> Tool {
         let mut tool = new_tool(name, "", "{}", |_: ()| String::new());
-        tool.snippet = snippet;
+        tool.snippet = snippet.to_string();
         tool
     }
 
