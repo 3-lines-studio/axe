@@ -348,13 +348,51 @@ class Harness:
     def seed_session(self, sid, title, content):
         self.seed_session_msgs(sid, title, [{"Role": "user", "Content": content}])
 
+    def state_entries(self, sid=None):
+        root = self.session_root()
+        entries = []
+        path = root / "state.json"
+        if path.exists():
+            entries.extend(json.loads(path.read_text()).get("entries", []))
+        journal = root / "journal.jsonl"
+        if journal.exists():
+            for line in journal.read_text().splitlines():
+                if line.strip():
+                    entries.extend(json.loads(line).get("entries", []))
+        if sid is not None:
+            entries = [entry for entry in entries if entry.get("session") == sid]
+        return entries
+
     def seed_session_msgs(self, sid, title, msgs):
-        d = self.session_root() / "sessions"
-        d.mkdir(parents=True, exist_ok=True)
-        out = "".join(json.dumps({"type": "message", "message": m}) + "\n" for m in msgs)
-        (d / (sid + ".jsonl")).write_text(out)
-        if title:
-            (d / (sid + ".title")).write_text(title)
+        root = self.session_root()
+        root.mkdir(parents=True, exist_ok=True)
+        entries = [
+            entry
+            for entry in self.state_entries()
+            if entry.get("session") != sid
+        ]
+        for msg in msgs:
+            entries.append(
+                {
+                    "id": len(entries),
+                    "at": len(entries),
+                    "session": sid,
+                    "entry": {"type": "message", "message": msg},
+                }
+            )
+        for index, entry in enumerate(entries):
+            entry["id"] = index
+        state = {
+            "version": 1,
+            "seq": 1,
+            "next_id": len(entries),
+            "next_task": 0,
+            "entries": entries,
+            "tasks": [],
+        }
+        (root / "state.json").write_text(json.dumps(state))
+        (root / "journal.jsonl").write_text("")
+        (root / "session.current").write_text(sid)
 
     def env(self, api_key="sk-test", extra=None):
         e = dict(os.environ)
@@ -903,10 +941,7 @@ def tui_full_turn(h, axe):
             check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
         finally:
             t.close()
-        sessions = list((h.session_root() / "sessions").glob("*.jsonl"))
-        check(len(sessions) == 1, "expected 1 archived session, got %d" % len(sessions))
-        check(not (h.session_root() / "session.jsonl").exists(), "live session not archived")
-        text = sessions[0].read_text()
+        text = json.dumps(h.state_entries())
         check("check the tool" in text, "user message missing: %s" % text)
         check("echo hello" in text, "tool call missing: %s" % text)
         check("Done" in text, "answer missing: %s" % text)
@@ -926,9 +961,7 @@ def usage_persisted(h, axe):
             check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
         finally:
             t.close()
-    sessions = list((h.session_root() / "sessions").glob("*.jsonl"))
-    check(len(sessions) == 1, "expected 1 archived session, got %d" % len(sessions))
-    usage = [e for e in entries_of(sessions[0]) if e.get("type") == "usage"]
+    usage = [e["entry"] for e in h.state_entries() if e["entry"].get("type") == "usage"]
     check(len(usage) == 1, "tui: expected 1 usage entry, got %d" % len(usage))
     check(usage[0]["input"] == 30, "tui: billed input: %s" % usage[0])
     check(usage[0]["output"] == 13, "tui: billed output: %s" % usage[0])
@@ -939,8 +972,7 @@ def usage_persisted(h, axe):
     with h.mock(ANSWER_SCENARIO) as srv:
         p = h.oneshot(axe, ["--resume", "111", "continue"], base=srv.base_url)
         check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
-    path = h.session_root() / "sessions" / "111.jsonl"
-    usage = [e for e in entries_of(path) if e.get("type") == "usage"]
+    usage = [e["entry"] for e in h.state_entries("111") if e["entry"].get("type") == "usage"]
     check(len(usage) == 1, "oneshot: expected 1 usage entry, got %d" % len(usage))
     check(usage[0]["input"] == 20, "oneshot: billed input: %s" % usage[0])
     check(usage[0]["context_input"] == 20, "oneshot: context_input: %s" % usage[0])
@@ -1028,11 +1060,8 @@ def oneshot_resume_last(h, axe):
         users = body_msg(srv, 0, "user")
         check(any("prior work" in m.get("content", "") for m in users), "history not sent: %s" % users)
         check(users[-1]["content"] == "continue it", "prompt not appended: %s" % users)
-        sessions = list((h.session_root() / "sessions").glob("*.jsonl"))
-        check(len(sessions) == 1, "expected 1 session, got %d" % len(sessions))
-        text = sessions[0].read_text()
+        text = json.dumps(h.state_entries("111"))
         check("continue it" in text, "resumed prompt not saved: %s" % text)
-        check(not (h.session_root() / "session.jsonl").exists(), "live leftover")
 
 
 @case
@@ -1047,30 +1076,29 @@ def oneshot_resume_persists_on_failure(h, axe):
     h.seed_session("111", "old", "prior work")
     p = h.oneshot(axe, ["--resume", "111", "keep this"], base="http://127.0.0.1:1")
     check(p.returncode == 1, "expected exit 1, got %s" % p.returncode)
-    text = (h.session_root() / "sessions" / "111.jsonl").read_text()
+    text = json.dumps(h.state_entries("111"))
     check("keep this" in text, "failed resume not saved: %s" % text)
     check("prior work" in text, "history dropped: %s" % text)
-    check(not (h.session_root() / "session.jsonl").exists(), "live leftover")
 
 
 @case
 def oneshot_resume_last_flushes_live(h, axe):
-    h.seed_session("111", "old", "prior work")
-    root = h.session_root()
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "session.jsonl").write_text(
-        json.dumps({"type": "message", "message": {"Role": "user", "Content": "live extra"}}) + "\n"
+    h.seed_session_msgs(
+        "111",
+        "old",
+        [
+            {"Role": "user", "Content": "prior work"},
+            {"Role": "user", "Content": "live extra"},
+        ],
     )
-    (root / "session.resume_id").write_text("111")
     with h.mock(ANSWER_SCENARIO) as srv:
         p = h.oneshot(axe, ["--resume", "last", "continue it"], base=srv.base_url)
         check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
         users = body_msg(srv, 0, "user")
         check(any("live extra" in m.get("content", "") for m in users), "live not flushed: %s" % users)
         check(users[-1]["content"] == "continue it", "prompt not appended: %s" % users)
-        text = (root / "sessions" / "111.jsonl").read_text()
+        text = json.dumps(h.state_entries("111"))
         check("live extra" in text and "continue it" in text, "archive missing live: %s" % text)
-        check(not (root / "session.jsonl").exists(), "live leftover")
 
 
 @case
@@ -1122,9 +1150,7 @@ def tui_rewind(h, axe):
             check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
         finally:
             t.close()
-        sessions = list((h.session_root() / "sessions").glob("*.jsonl"))
-        check(len(sessions) == 1, "expected 1 archived session, got %d" % len(sessions))
-        text = sessions[0].read_text()
+        text = json.dumps(h.state_entries())
         check("first question" in text, "kept user message missing: %s" % text)
         check("FIRST ANSWER" in text, "kept answer missing: %s" % text)
         check("second question" not in text, "rewound turn not truncated: %s" % text)

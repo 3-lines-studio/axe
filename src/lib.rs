@@ -11,6 +11,7 @@ pub mod durable;
 mod http;
 pub mod ids;
 pub mod image;
+pub mod journal_store;
 pub mod machine;
 pub mod openai;
 pub mod run;

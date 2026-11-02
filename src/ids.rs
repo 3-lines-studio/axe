@@ -76,6 +76,17 @@ impl fmt::Display for TaskId {
 pub struct SessionId(String);
 
 impl SessionId {
+    pub fn generate() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let tag = COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self(format!("{now:016x}{tag:04x}"))
+    }
+
     pub fn new(value: impl Into<String>) -> Option<Self> {
         let value = value.into();
         if valid_id(&value) {

@@ -1,4 +1,4 @@
-use crate::ids::{EntryId, Seq, TaskId};
+use crate::ids::{EntryId, Seq, SessionId, TaskId};
 use crate::session::{self, Entry, Record};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -183,6 +183,7 @@ impl Journal {
             .map(|(id, entry)| Record {
                 id: EntryId(id as u64),
                 at,
+                session: SessionId::default(),
                 entry,
             })
             .collect();
@@ -227,6 +228,15 @@ impl Journal {
     }
 
     pub fn commit(&mut self, entries: Vec<Entry>, tasks: Vec<TaskRecord>) -> std::io::Result<Seq> {
+        self.commit_session(&SessionId::default(), entries, tasks)
+    }
+
+    pub fn commit_session(
+        &mut self,
+        session: &SessionId,
+        entries: Vec<Entry>,
+        tasks: Vec<TaskRecord>,
+    ) -> std::io::Result<Seq> {
         if entries.is_empty() && tasks.is_empty() {
             return Ok(self.seq);
         }
@@ -238,7 +248,12 @@ impl Journal {
         let mut records = Vec::with_capacity(entries.len());
         let mut id = self.next_id;
         for entry in entries {
-            records.push(Record { id, at, entry });
+            records.push(Record {
+                id,
+                at,
+                session: session.clone(),
+                entry,
+            });
             id = id.next();
         }
         let seq = self.seq.next();
@@ -270,6 +285,55 @@ impl Journal {
             self.tasks.insert(task.id, task);
         }
         Ok(seq)
+    }
+
+    pub fn replace_session(
+        &mut self,
+        session: &SessionId,
+        entries: Vec<Entry>,
+    ) -> std::io::Result<()> {
+        let mut kept: Vec<Record> = self
+            .entries
+            .iter()
+            .filter(|record| &record.session != session)
+            .cloned()
+            .collect();
+        let at = session_now_ms();
+        let mut id = self.next_id;
+        for entry in entries {
+            kept.push(Record {
+                id,
+                at,
+                session: session.clone(),
+                entry,
+            });
+            id = id.next();
+        }
+        let seq = self.seq.next();
+        self.write_state_at(&kept, seq, id)?;
+        self.entries = kept;
+        self.seq = seq;
+        self.next_id = id;
+        self.truncate_journal()
+    }
+
+    pub fn records_for<'a>(
+        &'a self,
+        session: &'a SessionId,
+    ) -> impl Iterator<Item = &'a Record> + 'a {
+        self.entries
+            .iter()
+            .filter(move |record| &record.session == session)
+    }
+
+    pub fn sessions(&self) -> Vec<SessionId> {
+        let mut out = Vec::new();
+        for record in &self.entries {
+            if !out.contains(&record.session) {
+                out.push(record.session.clone());
+            }
+        }
+        out
     }
 
     pub fn task(&self, id: TaskId) -> Option<&TaskRecord> {
@@ -323,11 +387,20 @@ impl Journal {
     }
 
     fn write_state(&mut self, entries: &[Record]) -> std::io::Result<()> {
+        self.write_state_at(entries, self.seq, self.next_id)
+    }
+
+    fn write_state_at(
+        &mut self,
+        entries: &[Record],
+        seq: Seq,
+        next_id: EntryId,
+    ) -> std::io::Result<()> {
         let tasks: Vec<TaskRecord> = self.tasks.values().cloned().collect();
         let snapshot = SnapshotOut {
             version: VERSION,
-            seq: self.seq,
-            next_id: self.next_id,
+            seq,
+            next_id,
             next_task: self.next_task,
             entries,
             tasks: &tasks,
@@ -421,6 +494,10 @@ fn read_snapshot(dir: &Path) -> std::io::Result<Option<Snapshot>> {
     };
     let snapshot = serde_json::from_slice(&bytes).map_err(invalid)?;
     Ok(Some(snapshot))
+}
+
+fn session_now_ms() -> i64 {
+    session::now_ms()
 }
 
 fn invalid(error: impl std::fmt::Display) -> std::io::Error {

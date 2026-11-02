@@ -1,5 +1,6 @@
+use axe::journal_store::JournalStore;
 use axe::openai::StreamEvent;
-use axe::session::{FsStore, Store};
+use axe::session::Store;
 use axe::{Message, OpenAI, Request, new_tool};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -182,8 +183,8 @@ fn fuzz_session(_rng: &mut Rng, seed: u64, input: &[u8]) {
     let dir =
         std::env::temp_dir().join(format!("axe-stress-session-{seed}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join("session.jsonl"), input);
-    let store = FsStore::new(dir.to_str().unwrap());
+    let _ = std::fs::write(dir.join("journal.jsonl"), input);
+    let store = JournalStore::new(dir.to_str().unwrap());
     guard("session load_live", seed, || {
         let msgs = store.live();
         assert!(msgs.len() <= input.iter().filter(|&&b| b == b'\n').count() + 1);
@@ -402,7 +403,7 @@ fn session_large_roundtrip() {
     let dir = std::env::temp_dir().join(format!("axe-session-large-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let d = dir.to_str().unwrap();
-    let store = FsStore::new(d);
+    let store = JournalStore::new(d);
     let n = 50_000;
     let message = Message {
         role: "user".into(),
@@ -444,19 +445,19 @@ fn sse_huge_index_capped() {
 #[test]
 fn session_load_by_id_sanitizes_paths() {
     let dir = std::env::temp_dir().join(format!("axe-loadid-{}", std::process::id()));
-    let store = dir.join("sessions");
-    std::fs::create_dir_all(&store).unwrap();
-    std::fs::write(
-        store.join("123.jsonl"),
-        "{\"type\":\"message\",\"message\":{\"Role\":\"user\",\"Content\":\"hi\"}}\n",
-    )
-    .unwrap();
-    std::fs::write(dir.join("secret.jsonl"), "not a session").unwrap();
     let d = dir.to_str().unwrap();
-    let fs = FsStore::new(d);
-
-    let ok = fs.load("123").expect("valid id loads");
-    let msgs = axe::session::context_messages(&ok);
+    let fs = JournalStore::new(d);
+    let entry = axe::session::Entry::Message {
+        message: Message {
+            role: "user".into(),
+            content: "hi".into(),
+            ..Message::default()
+        },
+    };
+    fs.save(&[entry]).unwrap();
+    let id = fs.list()[0].id.clone();
+    let loaded = fs.load(&id).expect("valid id loads");
+    let msgs = axe::session::context_messages(&loaded);
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].content, "hi");
 
@@ -614,7 +615,7 @@ fn session_compaction_roundtrip() {
     let dir = std::env::temp_dir().join(format!("axe-session-entries-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let d = dir.to_str().unwrap();
-    let store = FsStore::new(d);
+    let store = JournalStore::new(d);
 
     let entry = axe::session::Entry::Compaction {
         summary: "done stuff".into(),
@@ -662,7 +663,7 @@ fn session_compaction_is_append_only() {
     let dir = std::env::temp_dir().join(format!("axe-compact-append-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let d = dir.to_str().unwrap();
-    let store = FsStore::new(d);
+    let store = JournalStore::new(d);
 
     let msg = |role: &str, content: &str| Message {
         role: role.into(),

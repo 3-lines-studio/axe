@@ -1,4 +1,4 @@
-use crate::ids::EntryId;
+use crate::ids::{EntryId, SessionId};
 use crate::{Message, Provider, Request};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -36,6 +36,7 @@ pub enum Entry {
 pub struct Record {
     pub id: EntryId,
     pub at: i64,
+    pub session: SessionId,
     pub entry: Entry,
 }
 
@@ -567,6 +568,14 @@ fn session_summary(path: &Path) -> (String, usize) {
         update_sidecar(&mut sidecar, std::slice::from_ref(&entry));
     }
     (sidecar.title, sidecar.turns)
+}
+
+pub(crate) fn summarize(records: &[Record]) -> (String, usize, i64) {
+    let entries: Vec<Entry> = records.iter().map(|record| record.entry.clone()).collect();
+    let title = title_from_entries(&entries);
+    let turns = entry_turns(&entries);
+    let updated = records.iter().map(|record| record.at).max().unwrap_or(0);
+    (title, turns, updated)
 }
 
 fn title_from_entries(entries: &[Entry]) -> String {

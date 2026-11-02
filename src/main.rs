@@ -59,10 +59,9 @@ fn main() {
         {
             let key = api_key(&fc);
             let tools = build_tools(&cfg.dir, &cfg.base, &key);
-            let store = Arc::new(axe::session::FsStore::new(axe::session::scope_dir(
-                &axe_root(),
-                std::path::Path::new(&work_dir(&cfg)),
-            )));
+            let store = Arc::new(axe::journal_store::JournalStore::new(
+                axe::session::scope_dir(&axe_root(), std::path::Path::new(&work_dir(&cfg))),
+            ));
             let tui_cfg = axe::tui::TuiConfig {
                 base: cfg.base.clone(),
                 model: cfg.model.clone(),
@@ -277,7 +276,7 @@ fn fail_oneshot(
 
 fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     let start = Instant::now();
-    let store = axe::session::FsStore::new(axe::session::scope_dir(
+    let store = axe::journal_store::JournalStore::new(axe::session::scope_dir(
         &axe_root(),
         std::path::Path::new(&work_dir(cfg)),
     ));
