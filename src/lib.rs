@@ -180,10 +180,90 @@ impl<'de> Deserialize<'de> for Image {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Role {
+    System,
+    #[default]
+    User,
+    Assistant,
+    Tool,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        }
+    }
+}
+
+impl From<&str> for Role {
+    fn from(value: &str) -> Self {
+        match value {
+            "system" => Role::System,
+            "assistant" => Role::Assistant,
+            "tool" => Role::Tool,
+            _ => Role::User,
+        }
+    }
+}
+
+impl From<String> for Role {
+    fn from(value: String) -> Self {
+        Role::from(value.as_str())
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<str> for Role {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for Role {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl Serialize for Role {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Role {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "system" => Ok(Role::System),
+            "user" => Ok(Role::User),
+            "assistant" => Ok(Role::Assistant),
+            "tool" => Ok(Role::Tool),
+            other => Err(serde::de::Error::custom(format!("unknown role: {other}"))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     #[serde(rename = "Role")]
-    pub role: String,
+    pub role: Role,
     #[serde(rename = "Content")]
     pub content: String,
     #[serde(rename = "ToolCalls", default, skip_serializing_if = "Vec::is_empty")]
@@ -248,6 +328,37 @@ impl ModelSpec {
         let input_cost = (usage.input as u128 * input as u128) / 1_000_000;
         let output_cost = ((usage.output + usage.reasoning) as u128 * output as u128) / 1_000_000;
         Some((input_cost + output_cost) as u64)
+    }
+}
+
+impl Message {
+    pub fn new(role: Role, content: impl Into<String>) -> Self {
+        Message {
+            role,
+            content: content.into(),
+            ..Message::default()
+        }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Message::new(Role::User, content)
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Message::new(Role::Assistant, content)
+    }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Message::new(Role::System, content)
+    }
+
+    pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Message {
+            role: Role::Tool,
+            content: content.into(),
+            tool_call_id: call_id.into(),
+            ..Message::default()
+        }
     }
 }
 
@@ -774,6 +885,20 @@ mod tests {
                 .any(|entry| entry.file_name().to_string_lossy().starts_with(".axe-tmp-"))
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn roles_round_trip_as_wire_strings_and_reject_unknown_ones() {
+        assert_eq!(
+            serde_json::to_string(&Role::Assistant).unwrap(),
+            "\"assistant\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Role>("\"tool\"").unwrap(),
+            Role::Tool
+        );
+        assert!(serde_json::from_str::<Role>("\"nope\"").is_err());
+        assert_eq!(Message::user("hi").role, Role::User);
     }
 
     #[test]

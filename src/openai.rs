@@ -125,7 +125,7 @@ impl OpenAI {
                 )
             };
             msgs.push(OaRequestMessage {
-                role: &m.role,
+                role: m.role.as_str(),
                 content: message_content(m, images),
                 reasoning_content: if m.reasoning.is_empty() {
                     None
@@ -312,7 +312,7 @@ fn run_request(
     }
     Ok(Response {
         message: Message {
-            role: "assistant".into(),
+            role: crate::Role::Assistant,
             content: om.content.clone().unwrap_or_default(),
             tool_calls: calls,
             tool_call_id: String::new(),
@@ -574,7 +574,7 @@ impl StreamAcc {
     fn response(&self) -> Response {
         Response {
             message: Message {
-                role: "assistant".into(),
+                role: crate::Role::Assistant,
                 content: self.content.clone(),
                 tool_calls: self.tool_calls(),
                 tool_call_id: String::new(),
@@ -937,7 +937,7 @@ mod tests {
             },
             image_message(0, 1024),
             Message {
-                role: "assistant".into(),
+                role: crate::Role::Assistant,
                 content: "ya la vi".into(),
                 ..Default::default()
             },

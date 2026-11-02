@@ -302,7 +302,7 @@ pub fn rewind_items(messages: &[Message]) -> Vec<RewindItem> {
             }
             Some(RewindItem {
                 message_index,
-                role: message.role.clone(),
+                role: message.role.to_string(),
                 preview,
             })
         })
