@@ -2,9 +2,9 @@
 
 #![forbid(unsafe_code)]
 
-use axe::run::{self, Outcome, RunOptions, Sink};
+use axe::run::{self, AgentEvent, Control, Observer, Outcome, RunOptions};
 use axe::session::Store;
-use axe::{Image, Message, OpenAI, Tool, ToolCall, Usage};
+use axe::{Image, Message, OpenAI, Tool, ToolCall};
 use std::io::{IsTerminal, Read};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -210,28 +210,41 @@ fn usage() {
     );
 }
 
-struct CliSink {
+struct CliObserver {
     input: usize,
     output: usize,
+}
+
+impl Observer for CliObserver {
+    fn event(&mut self, event: AgentEvent<'_>) {
+        match event {
+            AgentEvent::Assistant {
+                turn,
+                message,
+                usage,
+            } => {
+                self.input += usage.input;
+                self.output += usage.output;
+                if !message.content.is_empty() && !message.tool_calls.is_empty() {
+                    eprintln!("{}", message.content);
+                }
+                for call in &message.tool_calls {
+                    eprintln!("[{turn}] {} {}", call.name, render_args(call));
+                }
+            }
+            AgentEvent::Tool { turn, message } => {
+                eprintln!("[{turn}] -> {}", render_result(&message.content));
+            }
+            _ => {}
+        }
+    }
+}
+
+struct CliControl {
     threshold: Option<usize>,
 }
 
-impl Sink for CliSink {
-    fn assistant(&mut self, turn: usize, message: &Message, usage: Usage) {
-        self.input += usage.input;
-        self.output += usage.output;
-        if !message.content.is_empty() && !message.tool_calls.is_empty() {
-            eprintln!("{}", message.content);
-        }
-        for call in &message.tool_calls {
-            eprintln!("[{turn}] {} {}", call.name, render_args(call));
-        }
-    }
-
-    fn tool(&mut self, turn: usize, message: &Message) {
-        eprintln!("[{turn}] -> {}", render_result(&message.content));
-    }
-
+impl Control for CliControl {
     fn should_compact(&mut self, input: usize, output: usize) -> bool {
         self.threshold
             .is_some_and(|threshold| input.saturating_add(output) > threshold)
@@ -309,9 +322,11 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     let tools = build_tools(&cfg.dir, &cfg.base, &api_key(fc));
     let system = resolve_system(cfg, &tools);
     let provider = OpenAI::new(cfg.base.clone(), api_key(fc)).effort("max");
-    let mut sink = CliSink {
+    let mut observer = CliObserver {
         input: 0,
         output: 0,
+    };
+    let mut control = CliControl {
         threshold: fc.context_window.map(|window| window.saturating_sub(16384)),
     };
     let opts = RunOptions {
@@ -324,7 +339,14 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     let mut overflow_retried = false;
     let msgs;
     loop {
-        let end = run::run_stream(&provider, &opts, &history, &cancel, &mut sink);
+        let end = run::run_stream_with(
+            &provider,
+            &opts,
+            &history,
+            &cancel,
+            &mut observer,
+            &mut control,
+        );
         session_entries.extend(
             end.messages[history.len()..]
                 .iter()
@@ -397,11 +419,11 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
         eprintln!("error: save session: {e}");
         std::process::exit(1);
     }
-    if sink.input + sink.output > 0 {
+    if observer.input + observer.output > 0 {
         eprintln!(
             "tokens: {} in / {} out · {}",
-            tok(sink.input),
-            tok(sink.output),
+            tok(observer.input),
+            tok(observer.output),
             fmt_dur(start.elapsed())
         );
     }

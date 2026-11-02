@@ -1109,3 +1109,64 @@ fn run_compacts_after_complete_tool_batch() {
     assert_eq!(end.messages[2].tool_call_id, "call-1");
     assert_eq!(end.messages[2].content, "DONE");
 }
+
+#[derive(Default)]
+struct RecordingObserver {
+    events: Vec<String>,
+}
+
+impl run::Observer for RecordingObserver {
+    fn event(&mut self, event: run::AgentEvent<'_>) {
+        self.events.push(match event {
+            run::AgentEvent::AssistantDelta(text) => format!("delta:{text}"),
+            run::AgentEvent::AssistantDone => "done".into(),
+            run::AgentEvent::ToolStart(call) => format!("tool-start:{}", call.name),
+            run::AgentEvent::ToolDelta { text, .. } => format!("tool-delta:{text}"),
+            run::AgentEvent::ToolResult { call, .. } => format!("tool-result:{}", call.name),
+            run::AgentEvent::Tokens { input, output, .. } => format!("tokens:{input}/{output}"),
+            run::AgentEvent::Assistant { turn, .. } => format!("assistant:{turn}"),
+            run::AgentEvent::Tool { turn, .. } => format!("tool:{turn}"),
+        });
+    }
+}
+
+struct NoControl;
+
+impl run::Control for NoControl {}
+
+#[test]
+fn the_observer_sees_streamed_and_completed_events() {
+    let p = Fake {
+        responses: RefCell::new(VecDeque::from([Response {
+            message: assistant("hola"),
+            usage: Usage {
+                input: 3,
+                output: 2,
+                cached_input: 0,
+            },
+            stop_reason: Default::default(),
+        }])),
+        ..Default::default()
+    };
+    let opts = run::RunOptions {
+        model: "m",
+        system: "",
+        tools: &[],
+        max_turns: usize::MAX,
+    };
+    let mut observer = RecordingObserver::default();
+    let mut control = NoControl;
+    let end = run::run_stream_with(
+        &p,
+        &opts,
+        &[user("go")],
+        &Arc::new(AtomicBool::new(false)),
+        &mut observer,
+        &mut control,
+    );
+    assert!(matches!(end.outcome, run::Outcome::Done));
+    assert_eq!(
+        observer.events,
+        ["delta:hola", "tokens:3/2", "assistant:0", "done"]
+    );
+}

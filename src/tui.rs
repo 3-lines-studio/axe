@@ -1,8 +1,8 @@
 use crate::app;
 use crate::openai::OpenAI;
-use crate::run::{self, Outcome, RunOptions, Sink};
+use crate::run::{self, AgentEvent, Control, Observer, Outcome, RunOptions};
 use crate::session::{self, Store};
-use crate::{Image, Message, ToolCall, ToolOutput, Usage};
+use crate::{Image, Message, Usage};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
@@ -1461,12 +1461,12 @@ impl App {
         self.turn_started = Instant::now();
         std::thread::spawn(move || {
             let end = {
-                let mut sink = RatatuiSink {
-                    sender: &sender,
+                let mut observer = RatatuiObserver { sender: &sender };
+                let mut control = TuiControl {
                     steer: steer_receiver,
                     threshold,
                 };
-                run::run_stream(
+                run::run_stream_with(
                     &provider,
                     &RunOptions {
                         model: &model,
@@ -1476,7 +1476,8 @@ impl App {
                     },
                     &messages,
                     &cancel,
-                    &mut sink,
+                    &mut observer,
+                    &mut control,
                 )
             };
             let compact = matches!(end.outcome, Outcome::Compact);
@@ -2065,48 +2066,58 @@ fn dropped_image_path(text: &str) -> Option<String> {
     crate::image::is_image_path(&unquoted).then_some(unquoted)
 }
 
-struct RatatuiSink<'a> {
+struct RatatuiObserver<'a> {
     sender: &'a Sender<TurnEvent>,
+}
+
+impl Observer for RatatuiObserver<'_> {
+    fn event(&mut self, event: AgentEvent<'_>) {
+        match event {
+            AgentEvent::AssistantDelta(text) => {
+                let _ = self.sender.send(TurnEvent::AssistantDelta(text.into()));
+            }
+            AgentEvent::ToolStart(call) => {
+                let _ = self
+                    .sender
+                    .send(TurnEvent::ToolStart(app::tool_label(call, true)));
+            }
+            AgentEvent::ToolDelta { text, .. } => {
+                let _ = self.sender.send(TurnEvent::ToolDelta(text.into()));
+            }
+            AgentEvent::ToolResult { call, .. } => {
+                let _ = self
+                    .sender
+                    .send(TurnEvent::ToolResult(app::tool_label(call, false)));
+            }
+            AgentEvent::Tokens {
+                input,
+                output,
+                cached_input,
+            } => {
+                let _ = self.sender.send(TurnEvent::Tokens(Usage {
+                    input,
+                    output,
+                    cached_input,
+                }));
+            }
+            AgentEvent::AssistantDone | AgentEvent::Assistant { .. } | AgentEvent::Tool { .. } => {}
+        }
+    }
+}
+
+struct TuiControl {
     steer: Receiver<String>,
     threshold: Option<usize>,
 }
 
-impl Sink for RatatuiSink<'_> {
-    fn assistant_delta(&mut self, text: &str) {
-        let _ = self.sender.send(TurnEvent::AssistantDelta(text.into()));
-    }
-
-    fn tool_start(&mut self, call: &ToolCall) {
-        let _ = self
-            .sender
-            .send(TurnEvent::ToolStart(app::tool_label(call, true)));
-    }
-
-    fn tool_delta(&mut self, _call: &ToolCall, text: &str) {
-        let _ = self.sender.send(TurnEvent::ToolDelta(text.into()));
-    }
-
-    fn tool_result(&mut self, call: &ToolCall, _output: &ToolOutput, _elapsed: Duration) {
-        let _ = self
-            .sender
-            .send(TurnEvent::ToolResult(app::tool_label(call, false)));
-    }
-
-    fn tokens(&mut self, input: usize, output: usize, cached_input: usize) {
-        let _ = self.sender.send(TurnEvent::Tokens(Usage {
-            input,
-            output,
-            cached_input,
-        }));
+impl Control for TuiControl {
+    fn pending_user_input(&mut self) -> Option<String> {
+        self.steer.try_recv().ok()
     }
 
     fn should_compact(&mut self, input: usize, output: usize) -> bool {
         self.threshold
             .is_some_and(|threshold| input.saturating_add(output) > threshold)
-    }
-
-    fn pending_user_input(&mut self) -> Option<String> {
-        self.steer.try_recv().ok()
     }
 }
 

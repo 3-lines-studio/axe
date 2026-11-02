@@ -64,6 +64,115 @@ pub trait Sink {
     }
 }
 
+#[derive(Debug)]
+pub enum AgentEvent<'a> {
+    AssistantDelta(&'a str),
+    AssistantDone,
+    ToolStart(&'a ToolCall),
+    ToolDelta {
+        call: &'a ToolCall,
+        text: &'a str,
+    },
+    ToolResult {
+        call: &'a ToolCall,
+        output: &'a ToolOutput,
+        elapsed: Duration,
+    },
+    Tokens {
+        input: usize,
+        output: usize,
+        cached_input: usize,
+    },
+    Assistant {
+        turn: usize,
+        message: &'a Message,
+        usage: Usage,
+    },
+    Tool {
+        turn: usize,
+        message: &'a Message,
+    },
+}
+
+pub trait Observer {
+    fn event(&mut self, event: AgentEvent<'_>);
+}
+
+pub trait Control {
+    fn pending_user_input(&mut self) -> Option<String> {
+        None
+    }
+
+    fn should_compact(&mut self, _input: usize, _output: usize) -> bool {
+        false
+    }
+}
+
+pub trait RuntimeHooks: Observer + Control {}
+impl<T: Observer + Control + ?Sized> RuntimeHooks for T {}
+
+struct SinkAdapter<'a> {
+    sink: &'a mut dyn Sink,
+}
+
+impl Observer for SinkAdapter<'_> {
+    fn event(&mut self, event: AgentEvent<'_>) {
+        match event {
+            AgentEvent::AssistantDelta(text) => self.sink.assistant_delta(text),
+            AgentEvent::AssistantDone => self.sink.assistant_done(),
+            AgentEvent::ToolStart(call) => self.sink.tool_start(call),
+            AgentEvent::ToolDelta { call, text } => self.sink.tool_delta(call, text),
+            AgentEvent::ToolResult {
+                call,
+                output,
+                elapsed,
+            } => self.sink.tool_result(call, output, elapsed),
+            AgentEvent::Tokens {
+                input,
+                output,
+                cached_input,
+            } => self.sink.tokens(input, output, cached_input),
+            AgentEvent::Assistant {
+                turn,
+                message,
+                usage,
+            } => self.sink.assistant(turn, message, usage),
+            AgentEvent::Tool { turn, message } => self.sink.tool(turn, message),
+        }
+    }
+}
+
+impl Control for SinkAdapter<'_> {
+    fn pending_user_input(&mut self) -> Option<String> {
+        self.sink.pending_user_input()
+    }
+
+    fn should_compact(&mut self, input: usize, output: usize) -> bool {
+        self.sink.should_compact(input, output)
+    }
+}
+
+struct HooksPair<'a> {
+    observer: &'a mut dyn Observer,
+    control: &'a mut dyn Control,
+}
+
+impl Observer for HooksPair<'_> {
+    fn event(&mut self, event: AgentEvent<'_>) {
+        self.observer.event(event);
+    }
+}
+
+impl Control for HooksPair<'_> {
+    fn pending_user_input(&mut self) -> Option<String> {
+        self.control.pending_user_input()
+    }
+
+    fn should_compact(&mut self, input: usize, output: usize) -> bool {
+        self.control.should_compact(input, output)
+    }
+}
+
 pub struct RunOptions<'a> {
     pub model: &'a str,
     pub system: &'a str,
@@ -93,6 +202,29 @@ pub fn run_stream<P: Provider>(
     cancel: &Arc<AtomicBool>,
     sink: &mut dyn Sink,
 ) -> RunEnd {
+    let mut hooks = SinkAdapter { sink };
+    run_inner(provider, opts, msgs, cancel, &mut hooks)
+}
+
+pub fn run_stream_with<P: Provider>(
+    provider: &P,
+    opts: &RunOptions,
+    msgs: &[Message],
+    cancel: &Arc<AtomicBool>,
+    observer: &mut dyn Observer,
+    control: &mut dyn Control,
+) -> RunEnd {
+    let mut hooks = HooksPair { observer, control };
+    run_inner(provider, opts, msgs, cancel, &mut hooks)
+}
+
+fn run_inner<P: Provider>(
+    provider: &P,
+    opts: &RunOptions,
+    msgs: &[Message],
+    cancel: &Arc<AtomicBool>,
+    hooks: &mut dyn RuntimeHooks,
+) -> RunEnd {
     let started = Instant::now();
     let mut h: Vec<Message> = msgs.iter().map(sentinel::redact_message).collect();
     let mut usage = Usage::default();
@@ -113,10 +245,10 @@ pub fn run_stream<P: Provider>(
                 outcome: Outcome::Cancelled,
             };
         }
-        if let Some(text) = sink.pending_user_input() {
+        if let Some(text) = hooks.pending_user_input() {
             h.push(user_message(text));
         }
-        let (resp, calls) = match stream(provider, opts, &h, cancel, sink) {
+        let (resp, calls) = match stream(provider, opts, &h, cancel, hooks) {
             Ok(x) => x,
             Err(e) => {
                 if cancelled(cancel) {
@@ -151,10 +283,14 @@ pub fn run_stream<P: Provider>(
         };
         context = resp.usage;
         h.push(resp.message);
-        sink.assistant(turn, h.last().unwrap(), resp.usage);
-        sink.assistant_done();
+        hooks.event(AgentEvent::Assistant {
+            turn,
+            message: h.last().unwrap(),
+            usage: resp.usage,
+        });
+        hooks.event(AgentEvent::AssistantDone);
         if calls.is_empty() {
-            if let Some(text) = sink.pending_user_input() {
+            if let Some(text) = hooks.pending_user_input() {
                 h.push(user_message(text));
                 continue;
             }
@@ -174,7 +310,7 @@ pub fn run_stream<P: Provider>(
             };
         }
         let truncated = resp.stop_reason.is_length();
-        if !run_tool_batch(opts.tools, calls, truncated, turn, cancel, sink, &mut h) {
+        if !run_tool_batch(opts.tools, calls, truncated, turn, cancel, hooks, &mut h) {
             return RunEnd {
                 messages: h,
                 usage,
@@ -182,8 +318,8 @@ pub fn run_stream<P: Provider>(
                 outcome: Outcome::Cancelled,
             };
         }
-        if sink.should_compact(resp.usage.input, resp.usage.output) {
-            if let Some(text) = sink.pending_user_input() {
+        if hooks.should_compact(resp.usage.input, resp.usage.output) {
+            if let Some(text) = hooks.pending_user_input() {
                 h.push(user_message(text));
             }
             return RunEnd {
@@ -219,7 +355,7 @@ fn run_tool_batch(
     truncated: bool,
     turn: usize,
     cancel: &Arc<AtomicBool>,
-    sink: &mut dyn Sink,
+    hooks: &mut dyn RuntimeHooks,
     h: &mut Vec<Message>,
 ) -> bool {
     let any_sequential = calls.iter().any(|c| {
@@ -233,7 +369,7 @@ fn run_tool_batch(
         let mut interrupted = false;
         for call in calls {
             interrupted |= cancelled(cancel);
-            sink.tool_start(&call);
+            hooks.event(AgentEvent::ToolStart(&call));
             let (output, elapsed) = if interrupted {
                 (
                     ToolOutput::text("error: tool call not executed: the run was interrupted."),
@@ -247,15 +383,22 @@ fn run_tool_batch(
                     Duration::ZERO,
                 )
             } else {
-                exec(tools, &call, sink)
+                exec(tools, &call, hooks)
             };
-            sink.tool_result(&call, &output, elapsed);
+            hooks.event(AgentEvent::ToolResult {
+                call: &call,
+                output: &output,
+                elapsed,
+            });
             push_tool_result(h, call, output);
-            sink.tool(turn, h.last().unwrap());
+            hooks.event(AgentEvent::Tool {
+                turn,
+                message: h.last().unwrap(),
+            });
         }
         !cancelled(cancel)
     } else {
-        run_parallel(tools, calls, turn, cancel, sink, h)
+        run_parallel(tools, calls, turn, cancel, hooks, h)
     }
 }
 
@@ -287,11 +430,11 @@ fn run_parallel(
     calls: Vec<ToolCall>,
     turn: usize,
     cancel: &Arc<AtomicBool>,
-    sink: &mut dyn Sink,
+    hooks: &mut dyn RuntimeHooks,
     h: &mut Vec<Message>,
 ) -> bool {
     for call in &calls {
-        sink.tool_start(call);
+        hooks.event(AgentEvent::ToolStart(call));
     }
     let (ptx, prx) = std::sync::mpsc::channel::<ParallelMsg>();
     let mut outputs: Vec<Option<(ToolOutput, Duration)>> = (0..calls.len()).map(|_| None).collect();
@@ -325,7 +468,7 @@ fn run_parallel(
             match msg {
                 ParallelMsg::Delta { idx, text } => {
                     if let Some(call) = calls.get(idx) {
-                        sink.tool_delta(call, &text);
+                        hooks.event(AgentEvent::ToolDelta { call, text: &text });
                     }
                 }
                 ParallelMsg::Done {
@@ -340,9 +483,16 @@ fn run_parallel(
         let (content, elapsed) = outputs[idx]
             .take()
             .expect("scoped tool thread always reports a result");
-        sink.tool_result(call, &content, elapsed);
+        hooks.event(AgentEvent::ToolResult {
+            call,
+            output: &content,
+            elapsed,
+        });
         push_tool_result(h, call.clone(), content);
-        sink.tool(turn, h.last().unwrap());
+        hooks.event(AgentEvent::Tool {
+            turn,
+            message: h.last().unwrap(),
+        });
     }
     !cancelled(cancel)
 }
@@ -384,7 +534,7 @@ fn stream<P: Provider>(
     opts: &RunOptions,
     h: &[Message],
     cancel: &Arc<AtomicBool>,
-    sink: &mut dyn Sink,
+    hooks: &mut dyn RuntimeHooks,
 ) -> Result<(Response, Vec<ToolCall>), String> {
     let req = Request {
         model: opts.model,
@@ -410,7 +560,7 @@ fn stream<P: Provider>(
                         first_event = true;
                     }
                     forwarded += 1;
-                    sink.assistant_delta(&d);
+                    hooks.event(AgentEvent::AssistantDelta(&d));
                 }
                 StreamEvent::ToolCall(c) => {
                     if !first_event {
@@ -428,7 +578,11 @@ fn stream<P: Provider>(
                     output,
                     cached_input,
                 } => {
-                    sink.tokens(input, output, cached_input);
+                    hooks.event(AgentEvent::Tokens {
+                        input,
+                        output,
+                        cached_input,
+                    });
                 }
                 StreamEvent::Done => break,
             }
@@ -460,8 +614,10 @@ fn stream<P: Provider>(
     }
 }
 
-fn exec(tools: &[Tool], call: &ToolCall, sink: &mut dyn Sink) -> (ToolOutput, Duration) {
-    run_tool(tools, call, &mut |text| sink.tool_delta(call, text))
+fn exec(tools: &[Tool], call: &ToolCall, hooks: &mut dyn RuntimeHooks) -> (ToolOutput, Duration) {
+    run_tool(tools, call, &mut |text| {
+        hooks.event(AgentEvent::ToolDelta { call, text })
+    })
 }
 
 fn trace(message: String) {

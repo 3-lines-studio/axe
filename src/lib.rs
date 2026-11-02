@@ -265,7 +265,7 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ToolOutput {
     pub text: String,
     pub images: Vec<Image>,
