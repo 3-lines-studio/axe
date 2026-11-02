@@ -115,6 +115,7 @@ impl App {
             text: raw,
             images: images.iter().map(crate::image::label).collect(),
         });
+        self.transcript_dirty_full = true;
         if self.running {
             if let Some(steer) = &self.steer {
                 let _ = steer.send(content);
@@ -143,6 +144,7 @@ impl App {
     pub(super) fn run_command(&mut self, input: &str) {
         let argument = input.split_once(' ').map(|(_, argument)| argument.trim());
         let command = app::parse_command(input);
+        self.transcript_dirty_full = true;
         if self.running
             && matches!(
                 command,
@@ -186,6 +188,7 @@ impl App {
     }
 
     pub(super) fn attach(&mut self, argument: Option<&str>) {
+        self.transcript_dirty_full = true;
         let Some(argument) = argument.filter(|argument| !argument.is_empty()) else {
             let attached = self
                 .attachments
@@ -221,6 +224,7 @@ impl App {
     }
 
     pub(super) fn clear_session(&mut self) {
+        self.transcript_dirty_full = true;
         self.entries.clear();
         self.messages.clear();
         self.input_tokens = 0;
@@ -258,7 +262,9 @@ impl App {
     }
 
     pub(super) fn copy_last(&mut self) {
-        let Some(text) = app::last_assistant_response(&self.messages) else {
+        let Some(text) =
+            app::last_assistant_response(&self.messages).or_else(|| self.last_assistant_source())
+        else {
             self.entries
                 .push(Entry::Notice("no assistant response to copy".into()));
             return;
@@ -303,7 +309,8 @@ impl App {
     }
 
     pub(super) fn start_turn(&mut self) {
-        let messages = self.messages.clone();
+        let messages = std::mem::take(&mut self.messages);
+        self.turn_base_len = messages.len();
         let provider = self.provider();
         let model = self.cfg.model.clone();
         let system = self.cfg.system.clone();
@@ -328,7 +335,7 @@ impl App {
                     steer: steer_receiver,
                     threshold,
                 };
-                run::run_stream_with(
+                run::run_stream_owned(
                     &provider,
                     &RunOptions {
                         model: &model,
@@ -336,7 +343,7 @@ impl App {
                         tools: &tools,
                         max_turns: usize::MAX,
                     },
-                    &messages,
+                    messages,
                     &cancel,
                     &mut observer,
                     &mut control,

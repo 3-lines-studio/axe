@@ -137,6 +137,12 @@ fn run_app(
         esc_armed: None,
         resume_id: None,
         markdown_dirty: false,
+        turn_base_len: 0,
+        transcript_dirty_full: true,
+        transcript_cache_width: 0,
+        transcript_cache_entries: 0,
+        transcript_cache: Vec::new(),
+        pending_rewind: false,
     };
     if let Some(id) = app.cfg.resume.clone() {
         if id.is_empty() {
@@ -236,6 +242,82 @@ struct App {
     esc_armed: Option<Instant>,
     resume_id: Option<String>,
     markdown_dirty: bool,
+    turn_base_len: usize,
+    transcript_dirty_full: bool,
+    transcript_cache_width: usize,
+    transcript_cache_entries: usize,
+    transcript_cache: Vec<Line<'static>>,
+    pending_rewind: bool,
+}
+
+fn push_transcript_header(lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::from(vec![
+        Span::styled(
+            "axe",
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        ),
+        Span::styled(
+            format!(" v{VERSION} · Run /help for commands"),
+            Style::default(),
+        ),
+    ]));
+    lines.push(Line::default());
+}
+
+fn push_transcript_entry(lines: &mut Vec<Line<'static>>, entry: &Entry, width: usize) {
+    match entry {
+        Entry::User { text, images } => {
+            for label in images {
+                lines.push(Line::from(vec![
+                    Span::styled("┃ ", Style::default()),
+                    Span::styled(
+                        format!("[image {label}]"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
+                ]));
+            }
+            for line in text.lines() {
+                for chunk in wrap_input_line(line, width.saturating_sub(2)) {
+                    lines.push(Line::from(vec![
+                        Span::styled("┃ ", Style::default()),
+                        Span::styled(chunk, Style::default().add_modifier(Modifier::BOLD)),
+                    ]));
+                }
+            }
+        }
+        Entry::Assistant { rendered, .. } => {
+            for line in rendered {
+                lines.extend(wrap_markdown_line(line, width));
+            }
+        }
+        Entry::Tool(calls) => {
+            let style = Style::default().add_modifier(Modifier::DIM);
+            if calls.len() == 1 {
+                lines.push(Line::from(vec![
+                    Span::styled("● ", style),
+                    Span::styled(truncate(&calls[0], width.saturating_sub(2)), style),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("● ", style),
+                    Span::styled(format!("{} tool calls", calls.len()), style),
+                ]));
+                for (index, call) in calls.iter().enumerate() {
+                    let branch = if index + 1 == calls.len() {
+                        "└"
+                    } else {
+                        "├"
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("{branch} {}", truncate(call, width.saturating_sub(2))),
+                        style,
+                    )));
+                }
+            }
+        }
+        Entry::Notice(text) => lines.push(Line::from(Span::styled(text.clone(), Style::default()))),
+    }
+    lines.push(Line::default());
 }
 
 impl App {
@@ -488,6 +570,10 @@ impl App {
     }
 
     fn open_rewind(&mut self) {
+        if self.running {
+            self.pending_rewind = true;
+            return;
+        }
         self.rewind_items = app::rewind_items(&self.messages);
         self.catalog_query.clear();
         self.rewind_selected = self.rewind_items.len().saturating_sub(1);
@@ -536,11 +622,13 @@ impl App {
     }
 
     fn rebuild_transcript(&mut self) {
+        self.transcript_dirty_full = true;
         let messages = self.messages.clone();
         self.rebuild_transcript_from(&messages);
     }
 
     fn rebuild_transcript_from(&mut self, messages: &[Message]) {
+        self.transcript_dirty_full = true;
         self.entries.clear();
         for message in messages {
             match message.role.as_str() {
@@ -598,76 +686,27 @@ impl App {
         }
     }
 
-    fn transcript(&self, width: usize) -> Text<'static> {
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    "axe",
-                    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
-                ),
-                Span::styled(
-                    format!(" v{VERSION} · Run /help for commands"),
-                    Style::default(),
-                ),
-            ]),
-            Line::default(),
-        ];
-        for entry in &self.entries {
-            match entry {
-                Entry::User { text, images } => {
-                    for label in images {
-                        lines.push(Line::from(vec![
-                            Span::styled("┃ ", Style::default()),
-                            Span::styled(
-                                format!("[image {label}]"),
-                                Style::default().add_modifier(Modifier::DIM),
-                            ),
-                        ]));
-                    }
-                    for line in text.lines() {
-                        for chunk in wrap_input_line(line, width.saturating_sub(2)) {
-                            lines.push(Line::from(vec![
-                                Span::styled("┃ ", Style::default()),
-                                Span::styled(chunk, Style::default().add_modifier(Modifier::BOLD)),
-                            ]));
-                        }
-                    }
-                }
-                Entry::Assistant { rendered, .. } => {
-                    for line in rendered {
-                        lines.extend(wrap_markdown_line(line, width));
-                    }
-                }
-                Entry::Tool(calls) => {
-                    let style = Style::default().add_modifier(Modifier::DIM);
-                    if calls.len() == 1 {
-                        lines.push(Line::from(vec![
-                            Span::styled("● ", style),
-                            Span::styled(truncate(&calls[0], width.saturating_sub(2)), style),
-                        ]));
-                    } else {
-                        lines.push(Line::from(vec![
-                            Span::styled("● ", style),
-                            Span::styled(format!("{} tool calls", calls.len()), style),
-                        ]));
-                        for (index, call) in calls.iter().enumerate() {
-                            let branch = if index + 1 == calls.len() {
-                                "└"
-                            } else {
-                                "├"
-                            };
-                            lines.push(Line::from(Span::styled(
-                                format!("{branch} {}", truncate(call, width.saturating_sub(2))),
-                                style,
-                            )));
-                        }
-                    }
-                }
-                Entry::Notice(text) => {
-                    lines.push(Line::from(Span::styled(text.clone(), Style::default())))
-                }
-            }
-            lines.push(Line::default());
+    fn transcript(&mut self, width: usize) -> Text<'static> {
+        let last_is_assistant = matches!(self.entries.last(), Some(Entry::Assistant { .. }));
+        let prefix = self.entries.len() - usize::from(last_is_assistant);
+        let reset = self.transcript_dirty_full
+            || self.transcript_cache_width != width
+            || self.transcript_cache_entries > prefix;
+        if reset {
+            self.transcript_cache.clear();
+            push_transcript_header(&mut self.transcript_cache);
+            self.transcript_cache_width = width;
+            self.transcript_cache_entries = 0;
+            self.transcript_dirty_full = false;
+        }
+        while self.transcript_cache_entries < prefix {
+            let entry = &self.entries[self.transcript_cache_entries];
+            push_transcript_entry(&mut self.transcript_cache, entry, width);
+            self.transcript_cache_entries += 1;
+        }
+        let mut lines = self.transcript_cache.clone();
+        if last_is_assistant {
+            push_transcript_entry(&mut lines, &self.entries[prefix], width);
         }
         Text::from(lines)
     }

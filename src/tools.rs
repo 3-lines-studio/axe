@@ -436,6 +436,29 @@ mod tests {
     }
 
     #[test]
+    fn edit_fuzzy_applies_multiple_groups() {
+        let text = "alpha\u{a0}one\nkeep\nbeta\u{a0}two\n";
+        let edits = [
+            super::EditArg {
+                old_text: "alpha one".into(),
+                new_text: "ALPHA".into(),
+            },
+            super::EditArg {
+                old_text: "beta two".into(),
+                new_text: "BETA".into(),
+            },
+        ];
+        let applied = apply_edits("f.txt", text, &edits).unwrap();
+        assert_eq!(applied.content, "ALPHA\nkeep\nBETA\n");
+        assert!(
+            applied.patch.contains("-alpha\u{a0}one"),
+            "{}",
+            applied.patch
+        );
+        assert!(applied.patch.contains("+ALPHA"), "{}", applied.patch);
+    }
+
+    #[test]
     fn edit_accepts_quirk_inputs() {
         let parse = |s: &str| serde_json::from_str::<super::EditArgs>(s).unwrap();
         assert_eq!(
@@ -769,20 +792,21 @@ pub(crate) fn read_text_reader<R: std::io::BufRead>(
             total += usize::from(skipped_partial);
             break;
         }
-        let mut consumed = buf.len();
-        for (index, byte) in buf.iter().enumerate() {
-            if *byte == b'\n' {
-                total += 1;
-                skipped_partial = false;
-                if total == start {
-                    consumed = index + 1;
-                    break;
-                }
-            } else {
-                skipped_partial = true;
-            }
+        let newlines = memchr::memchr_iter(b'\n', buf).count();
+        if total + newlines < start {
+            total += newlines;
+            skipped_partial = !buf.ends_with(b"\n");
+            let len = buf.len();
+            reader.consume(len);
+            continue;
         }
-        reader.consume(consumed);
+        let need = start - total;
+        let at = memchr::memchr_iter(b'\n', buf)
+            .nth(need - 1)
+            .expect("enough newlines after the count");
+        total = start;
+        skipped_partial = false;
+        reader.consume(at + 1);
     }
     let mut shown = 0usize;
     let mut overflow = false;
@@ -798,7 +822,7 @@ pub(crate) fn read_text_reader<R: std::io::BufRead>(
                 if buf.is_empty() {
                     break;
                 }
-                total += buf.iter().filter(|&&byte| byte == b'\n').count();
+                total += memchr::memchr_iter(b'\n', buf).count();
                 trailing = buf.last().is_some_and(|&byte| byte != b'\n');
                 let len = buf.len();
                 reader.consume(len);
@@ -1104,44 +1128,30 @@ struct Matched {
     new_text: String,
 }
 
-struct Group {
-    start: usize,
-    end: usize,
-    edits: Vec<usize>,
-}
-
 fn normalize_fuzzy(s: &str) -> String {
-    s.split('\n')
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .chars()
-        .map(|c| match c {
-            '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => '\'',
-            '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => '"',
-            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
-            | '\u{2212}' => '-',
-            '\u{a0}' | '\u{2002}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' => ' ',
-            '\u{ff01}'..='\u{ff5e}' => char::from_u32(c as u32 - 0xfee0).unwrap_or(c),
-            _ => c,
-        })
-        .collect()
-}
-
-fn line_spans(content: &str) -> Vec<(usize, usize)> {
-    let bytes = content.as_bytes();
-    let mut spans = Vec::new();
-    let mut start = 0;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'\n' {
-            spans.push((start, i + 1));
-            start = i + 1;
+    let mut out = String::with_capacity(s.len());
+    for (index, line) in s.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let line = line.trim_end();
+        if line.is_ascii() {
+            out.push_str(line);
+            continue;
+        }
+        for c in line.chars() {
+            out.push(match c {
+                '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => '\'',
+                '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => '"',
+                '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+                | '\u{2212}' => '-',
+                '\u{a0}' | '\u{2002}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' => ' ',
+                '\u{ff01}'..='\u{ff5e}' => char::from_u32(c as u32 - 0xfee0).unwrap_or(c),
+                _ => c,
+            });
         }
     }
-    if start < bytes.len() {
-        spans.push((start, bytes.len()));
-    }
-    spans
+    out
 }
 
 fn split_lines(s: &str) -> Vec<&str> {
@@ -1150,26 +1160,6 @@ fn split_lines(s: &str) -> Vec<&str> {
         lines.pop();
     }
     lines
-}
-
-fn fuzzy_find(content: &str, old: &str) -> Option<(usize, usize)> {
-    if let Some(start) = content.find(old) {
-        return Some((start, old.len()));
-    }
-    let fuzzy_content = normalize_fuzzy(content);
-    let fuzzy_old = normalize_fuzzy(old);
-    fuzzy_content
-        .find(&fuzzy_old)
-        .map(|start| (start, fuzzy_old.len()))
-}
-
-fn count_occurrences(content: &str, old: &str) -> usize {
-    let fuzzy_content = normalize_fuzzy(content);
-    let fuzzy_old = normalize_fuzzy(old);
-    if fuzzy_old.is_empty() {
-        return 0;
-    }
-    fuzzy_content.matches(fuzzy_old.as_str()).count()
 }
 
 fn find_exact(
@@ -1212,17 +1202,18 @@ fn find_fuzzy(
     let total = olds.len();
     let mut matched = Vec::with_capacity(total);
     for (i, old) in olds.iter().enumerate() {
-        let Some((start, len)) = fuzzy_find(base, old) else {
+        let fuzzy_old = normalize_fuzzy(old);
+        let Some(start) = base.find(fuzzy_old.as_str()) else {
             return Err(not_found_error(path, i, total));
         };
-        let n = count_occurrences(base, old);
+        let n = base.matches(fuzzy_old.as_str()).count();
         if n > 1 {
             return Err(duplicate_error(path, i, total, n));
         }
         matched.push(Matched {
             edit: i,
             start,
-            len,
+            len: fuzzy_old.len(),
             new_text: news[i].clone(),
         });
     }
@@ -1240,18 +1231,6 @@ fn check_overlap(path: &str, matched: &mut [Matched]) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn line_range(spans: &[(usize, usize)], start: usize, end: usize) -> Option<(usize, usize)> {
-    let start_line = spans.iter().position(|&(s, e)| start >= s && start < e)?;
-    let mut end_line = start_line;
-    while end_line < spans.len() && spans[end_line].1 < end {
-        end_line += 1;
-    }
-    if end_line >= spans.len() {
-        return None;
-    }
-    Some((start_line, end_line + 1))
 }
 
 struct ExactGroup {
@@ -1298,8 +1277,168 @@ fn exact_group_block(source: &str, group: &ExactGroup, matched: &[Matched]) -> S
     block
 }
 
+struct FuzzyGroup {
+    start: usize,
+    end: usize,
+    start_line: usize,
+    end_line: usize,
+    edits: Vec<usize>,
+}
+
+fn line_start(content: &str, pos: usize) -> usize {
+    content[..pos].rfind('\n').map_or(0, |p| p + 1)
+}
+
+fn line_end(content: &str, end: usize) -> usize {
+    if content.as_bytes()[end - 1] == b'\n' {
+        end
+    } else {
+        content[end..]
+            .find('\n')
+            .map_or(content.len(), |p| end + p + 1)
+    }
+}
+
+fn fuzzy_group_regions(content: &str, matched: &[Matched]) -> Vec<FuzzyGroup> {
+    let mut groups: Vec<FuzzyGroup> = Vec::new();
+    for (i, m) in matched.iter().enumerate() {
+        let start = line_start(content, m.start);
+        let end = line_end(content, m.start + m.len);
+        if let Some(cur) = groups.last_mut()
+            && start < cur.end
+        {
+            cur.end = cur.end.max(end);
+            cur.edits.push(i);
+            continue;
+        }
+        groups.push(FuzzyGroup {
+            start,
+            end,
+            start_line: 0,
+            end_line: 0,
+            edits: vec![i],
+        });
+    }
+    let mut line = 0;
+    let mut cursor = 0;
+    for group in &mut groups {
+        line += line_count(&content[cursor..group.start]);
+        cursor = group.start;
+        group.start_line = line;
+        group.end_line = line + line_count(&content[group.start..group.end]);
+    }
+    groups
+}
+
+fn line_offsets(text: &str, boundaries: &[usize]) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(boundaries.len());
+    let mut line = 0;
+    let mut pos = 0;
+    for &target in boundaries {
+        while line < target {
+            let Some(next) = memchr::memchr(b'\n', &bytes[pos..]) else {
+                pos = bytes.len();
+                line = target;
+                break;
+            };
+            pos += next + 1;
+            line += 1;
+        }
+        out.push(pos);
+    }
+    out
+}
+
+struct FuzzyEdit {
+    exact: Vec<ExactGroup>,
+    blocks: Vec<String>,
+    groups: Vec<FuzzyGroup>,
+    boundaries: Vec<usize>,
+    body_offsets: Vec<usize>,
+}
+
+fn fuzzy_groups(
+    path: &str,
+    normalized: &str,
+    body: &str,
+    base: &str,
+    matched: &[Matched],
+) -> Result<FuzzyEdit, String> {
+    if line_count(body) != line_count(base) {
+        return Err(format!(
+            "error: cannot match edits in {path}: the file mixes line endings in a way that prevents safe reconstruction."
+        ));
+    }
+    let groups = fuzzy_group_regions(base, matched);
+    let mut boundaries: Vec<usize> = groups
+        .iter()
+        .flat_map(|group| [group.start_line, group.end_line])
+        .collect();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let base_offsets = line_offsets(base, &boundaries);
+    let body_offsets = line_offsets(body, &boundaries);
+    let normalized_offsets = line_offsets(normalized, &boundaries);
+    let at = |offsets: &[usize], line: usize| {
+        offsets[boundaries
+            .binary_search(&line)
+            .expect("group boundary was indexed")]
+    };
+    let mut exact = Vec::with_capacity(groups.len());
+    let mut blocks = Vec::with_capacity(groups.len());
+    for group in &groups {
+        let start = at(&base_offsets, group.start_line);
+        let end = at(&base_offsets, group.end_line);
+        let mut block = base[start..end].to_string();
+        for &i in group.edits.iter().rev() {
+            let m = &matched[i];
+            let s = m.start - start;
+            block.replace_range(s..s + m.len, &m.new_text);
+        }
+        blocks.push(block);
+        exact.push(ExactGroup {
+            start: at(&normalized_offsets, group.start_line),
+            end: at(&normalized_offsets, group.end_line),
+            edits: group.edits.clone(),
+        });
+    }
+    Ok(FuzzyEdit {
+        exact,
+        blocks,
+        groups,
+        boundaries,
+        body_offsets,
+    })
+}
+
+fn apply_fuzzy(
+    body: &str,
+    groups: &[FuzzyGroup],
+    blocks: &[String],
+    boundaries: &[usize],
+    body_offsets: &[usize],
+) -> String {
+    let mut out = String::new();
+    let mut cursor = 0;
+    for (index, group) in groups.iter().enumerate() {
+        let at = |line: usize| {
+            body_offsets[boundaries
+                .binary_search(&line)
+                .expect("group boundary was indexed")]
+        };
+        let bs = at(group.start_line);
+        let be = at(group.end_line);
+        out.push_str(&body[cursor..bs]);
+        out.push_str(&with_ending(&blocks[index], region_ending(body, bs, be)));
+        cursor = be;
+    }
+    out.push_str(&body[cursor..]);
+    out
+}
+
 fn line_count(text: &str) -> usize {
-    text.bytes().filter(|&b| b == b'\n').count()
+    memchr::memchr_iter(b'\n', text.as_bytes()).count()
         + usize::from(!text.is_empty() && !text.ends_with('\n'))
 }
 
@@ -1378,48 +1517,6 @@ fn exact_unified_patch(path: &str, old: &str, groups: &[ExactGroup], blocks: &[S
     truncate_patch(out)
 }
 
-fn group_regions(spans: &[(usize, usize)], matched: &[Matched]) -> Vec<Group> {
-    let mut order: Vec<usize> = (0..matched.len()).collect();
-    order.sort_by_key(|&i| matched[i].start);
-    let mut groups: Vec<Group> = Vec::new();
-    for i in order {
-        let m = &matched[i];
-        let Some((start, end)) = line_range(spans, m.start, m.start + m.len) else {
-            continue;
-        };
-        if let Some(cur) = groups.last_mut()
-            && start < cur.end
-        {
-            cur.end = cur.end.max(end);
-            cur.edits.push(i);
-            continue;
-        }
-        groups.push(Group {
-            start,
-            end,
-            edits: vec![i],
-        });
-    }
-    groups
-}
-
-fn group_block(
-    source: &str,
-    spans: &[(usize, usize)],
-    group: &Group,
-    matched: &[Matched],
-) -> String {
-    let start = spans[group.start].0;
-    let end = spans[group.end - 1].1;
-    let mut block = source[start..end].to_string();
-    for &i in group.edits.iter().rev() {
-        let m = &matched[i];
-        let s = m.start - start;
-        block.replace_range(s..s + m.len, &m.new_text);
-    }
-    block
-}
-
 fn apply_exact(body: &str, matched: &[Matched]) -> String {
     let map = body.contains('\r').then(|| lf_map(body));
     let mut out = body.to_string();
@@ -1431,29 +1528,6 @@ fn apply_exact(body: &str, matched: &[Matched]) -> String {
         let replacement = with_ending(&m.new_text, region_ending(body, bs, be));
         out.replace_range(bs..be, &replacement);
     }
-    out
-}
-
-fn apply_groups(
-    body: &str,
-    body_lines: &[(usize, usize)],
-    base: &str,
-    base_lines: &[(usize, usize)],
-    groups: &[Group],
-    matched: &[Matched],
-) -> String {
-    let mut out = String::new();
-    let mut line = 0;
-    for group in groups {
-        out.push_str(&body[body_lines[line].0..body_lines[group.start].0]);
-        let block = group_block(base, base_lines, group, matched);
-        let bs = body_lines[group.start].0;
-        let be = body_lines[group.end - 1].1;
-        out.push_str(&with_ending(&block, region_ending(body, bs, be)));
-        line = group.end;
-    }
-    let tail = body_lines.get(line).map_or(body.len(), |l| l.0);
-    out.push_str(&body[tail..]);
     out
 }
 
@@ -1478,59 +1552,6 @@ fn truncate_patch(patch: String) -> String {
         out.push('\n');
     }
     out
-}
-
-fn unified_patch(
-    path: &str,
-    old: &str,
-    spans: &[(usize, usize)],
-    groups: &[Group],
-    blocks: &[String],
-) -> String {
-    const CONTEXT: usize = 4;
-    let line_text = |i: usize| -> &str {
-        let (s, e) = spans[i];
-        let e = if old.as_bytes()[e - 1] == b'\n' {
-            e - 1
-        } else {
-            e
-        };
-        &old[s..e]
-    };
-    let mut out = format!("--- {path}\n+++ {path}\n");
-    let mut new_offset: isize = 0;
-    for (index, group) in groups.iter().enumerate() {
-        let prev_end = if index == 0 { 0 } else { groups[index - 1].end };
-        let next_start = groups.get(index + 1).map_or(spans.len(), |n| n.start);
-        let old_start = group.start.saturating_sub(CONTEXT).max(prev_end);
-        let old_end = (group.end + CONTEXT).min(next_start);
-        let before = group.start - old_start;
-        let after = old_end - group.end;
-        let added = split_lines(&blocks[index]);
-        let old_count = before + (group.end - group.start) + after;
-        let new_start = (old_start as isize + new_offset + 1).max(1);
-        out.push_str(&format!(
-            "@@ -{},{} +{},{} @@\n",
-            old_start + 1,
-            old_count,
-            new_start,
-            before + added.len() + after
-        ));
-        for i in old_start..group.start {
-            out.push_str(&format!(" {}\n", line_text(i)));
-        }
-        for i in group.start..group.end {
-            out.push_str(&format!("-{}\n", line_text(i)));
-        }
-        for line in &added {
-            out.push_str(&format!("+{line}\n"));
-        }
-        for i in group.end..old_end {
-            out.push_str(&format!(" {}\n", line_text(i)));
-        }
-        new_offset += added.len() as isize - (group.end - group.start) as isize;
-    }
-    truncate_patch(out)
 }
 
 fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<Applied, String> {
@@ -1573,21 +1594,15 @@ fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<Applied, 
     let base = normalize_fuzzy(&normalized);
     let mut matched = find_fuzzy(path, &base, &olds, &news)?;
     check_overlap(path, &mut matched)?;
-    let body_lines = line_spans(body);
-    let base_lines = line_spans(&base);
-    if body_lines.len() != base_lines.len() {
-        return Err(format!(
-            "error: cannot match edits in {path}: the file mixes line endings in a way that prevents safe reconstruction."
-        ));
-    }
-    let groups = group_regions(&base_lines, &matched);
-    let blocks: Vec<String> = groups
-        .iter()
-        .map(|g| group_block(&base, &base_lines, g, &matched))
-        .collect();
-    let spans = line_spans(&normalized);
-    let patch = unified_patch(path, &normalized, &spans, &groups, &blocks);
-    let out = apply_groups(body, &body_lines, &base, &base_lines, &groups, &matched);
+    let fuzzy = fuzzy_groups(path, &normalized, body, &base, &matched)?;
+    let patch = exact_unified_patch(path, &normalized, &fuzzy.exact, &fuzzy.blocks);
+    let out = apply_fuzzy(
+        body,
+        &fuzzy.groups,
+        &fuzzy.blocks,
+        &fuzzy.boundaries,
+        &fuzzy.body_offsets,
+    );
     if out == body {
         return Err(no_change_error(path, edits.len()));
     }

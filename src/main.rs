@@ -354,16 +354,17 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     let mut overflow_retried = false;
     let msgs;
     loop {
-        let end = run::run_stream_with(
+        let context_len = history.len();
+        let end = run::run_stream_owned(
             &provider,
             &opts,
-            &history,
+            history,
             &cancel,
             &mut observer,
             &mut control,
         );
         session_entries.extend(
-            end.messages[history.len()..]
+            end.messages[context_len..]
                 .iter()
                 .cloned()
                 .map(|message| axe::session::Entry::Message { message }),

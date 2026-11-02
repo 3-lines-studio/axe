@@ -27,6 +27,7 @@ parser.add_argument(
         "read-large-offset",
         "edit-large",
         "edit-large-end",
+        "edit-fuzzy-large",
         "all",
     ),
     default="all"
@@ -99,9 +100,10 @@ class Handler(BaseHTTPRequestHandler):
                     {"path": str(large_file), "offset": 4_999_999, "limit": 1}
                 )
                 tool = {"name": "read", "arguments": arguments}
-            elif user_content in ("Edit large.", "Edit large end."):
+            elif user_content in ("Edit large.", "Edit large end.", "Edit fuzzy large."):
+                old = "old line\n" if user_content == "Edit fuzzy large." else "old\n"
                 arguments = json.dumps(
-                    {"path": "large.txt", "edits": [{"oldText": "old\n", "newText": "new\n"}]}
+                    {"path": "large.txt", "edits": [{"oldText": old, "newText": "new\n"}]}
                 )
                 tool = {"name": "edit", "arguments": arguments}
             elif user_content == "Run true.":
@@ -163,6 +165,7 @@ def run(binary, index, scenario):
         "read-large-offset": "Read large offset.",
         "edit-large": "Edit large.",
         "edit-large-end": "Edit large end.",
+        "edit-fuzzy-large": "Edit fuzzy large.",
     }
     prompt = prompts[scenario]
     with tempfile.TemporaryDirectory(prefix="axe-bench-") as tmp:
@@ -170,6 +173,8 @@ def run(binary, index, scenario):
             Path(tmp, "large.txt").write_bytes(b"old\n" + b"x\n" * 5_000_000)
         if scenario == "edit-large-end":
             Path(tmp, "large.txt").write_bytes(b"x\n" * 5_000_000 + b"old\n")
+        if scenario == "edit-fuzzy-large":
+            Path(tmp, "large.txt").write_bytes("old\u00a0line\n".encode() + b"x\n" * 5_000_000)
         env = os.environ.copy()
         env["OPENAI_API_KEY"] = run_id
         env["XDG_CONFIG_HOME"] = str(Path(tmp) / ".config")
@@ -203,6 +208,7 @@ def run(binary, index, scenario):
         valid = scenario != "write" or output.read_text() == "ok\n"
         valid = valid and (scenario != "edit-large" or edited.read_bytes().startswith(b"new\n"))
         valid = valid and (scenario != "edit-large-end" or edited.read_bytes().endswith(b"new\n"))
+        valid = valid and (scenario != "edit-fuzzy-large" or edited.read_bytes().startswith(b"new\n"))
         if code != 0 or not valid:
             raise RuntimeError(f"{binary} failed {scenario} run {index + 1}")
     with lock:

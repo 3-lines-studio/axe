@@ -507,6 +507,13 @@ impl App {
             .map_or(self.input.len(), |index| self.cursor + index)
     }
 
+    pub(super) fn last_assistant_source(&self) -> Option<&str> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            Entry::Assistant { source, .. } if !source.is_empty() => Some(source.as_str()),
+            _ => None,
+        })
+    }
+
     pub(super) fn drain_events(&mut self) -> bool {
         let Some(receiver) = self.events.take() else {
             return false;
@@ -531,6 +538,7 @@ impl App {
                 }
                 TurnEvent::ToolDelta(output) => self.tool_live = Some(output),
                 TurnEvent::ToolResult(label) => {
+                    self.transcript_dirty_full = true;
                     self.tool_running = None;
                     self.tool_live = None;
                     if let Some(Entry::Tool(calls)) = self.entries.last_mut() {
@@ -546,6 +554,7 @@ impl App {
                     self.output_tokens = usage.output;
                 }
                 TurnEvent::Compacted(result) => {
+                    self.transcript_dirty_full = true;
                     self.compacting = false;
                     match result {
                         Ok((summary, tokens_before, retained, mut entries)) => {
@@ -582,7 +591,8 @@ impl App {
                     error,
                     compact,
                 } => {
-                    let entries: Vec<_> = messages[self.messages.len()..]
+                    self.transcript_dirty_full = true;
+                    let entries: Vec<_> = messages[self.turn_base_len..]
                         .iter()
                         .cloned()
                         .map(|message| session::Entry::Message { message })
@@ -594,6 +604,7 @@ impl App {
                             .push(Entry::Notice(format!("error: save session: {error}")));
                     }
                     self.messages = messages;
+                    self.turn_base_len = 0;
                     self.session_state = state;
                     self.session_input = self.session_state.input;
                     self.session_output = self.session_state.output;
@@ -601,6 +612,11 @@ impl App {
                     self.output_tokens = self.session_state.context_output;
                     self.running = false;
                     self.steer = None;
+                    let rewinding = self.pending_rewind;
+                    if rewinding {
+                        self.pending_rewind = false;
+                        self.open_rewind();
+                    }
                     compact_after = compact
                         || error.as_deref().is_some_and(session::is_overflow_error)
                             && !self.overflow_retried;
@@ -609,6 +625,10 @@ impl App {
                         self.overflow_retried = true;
                     } else if let Some(error) = error {
                         self.entries.push(Entry::Notice(format!("error: {error}")));
+                    }
+                    if rewinding {
+                        compact_after = false;
+                        turn_after = false;
                     }
                 }
             }

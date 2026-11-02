@@ -145,19 +145,32 @@ pub fn run_stream_with<P: Provider>(
     observer: &mut dyn Observer,
     control: &mut dyn Control,
 ) -> RunEnd {
+    let messages = msgs.iter().map(sentinel::redact_message).collect();
     let mut hooks = HooksPair { observer, control };
-    run_inner(provider, opts, msgs, cancel, &mut hooks)
+    run_inner(provider, opts, messages, cancel, &mut hooks)
+}
+
+/// Run with messages that the caller already redacted.
+pub fn run_stream_owned<P: Provider>(
+    provider: &P,
+    opts: &RunOptions,
+    messages: Vec<Message>,
+    cancel: &Arc<AtomicBool>,
+    observer: &mut dyn Observer,
+    control: &mut dyn Control,
+) -> RunEnd {
+    let mut hooks = HooksPair { observer, control };
+    run_inner(provider, opts, messages, cancel, &mut hooks)
 }
 
 fn run_inner<P: Provider>(
     provider: &P,
     opts: &RunOptions,
-    msgs: &[Message],
+    mut h: Vec<Message>,
     cancel: &Arc<AtomicBool>,
     hooks: &mut dyn RuntimeHooks,
 ) -> RunEnd {
     let started = Instant::now();
-    let mut h: Vec<Message> = msgs.iter().map(sentinel::redact_message).collect();
     let mut usage = Usage::default();
     let mut context_usage = Usage::default();
     let tool_context = crate::ToolContext {
@@ -165,7 +178,7 @@ fn run_inner<P: Provider>(
     };
     trace(format!(
         "run start messages={} system_bytes={} tools={}",
-        msgs.len(),
+        h.len(),
         opts.system.len(),
         opts.tools.len()
     ));

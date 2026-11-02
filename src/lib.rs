@@ -106,7 +106,7 @@ pub(crate) fn atomic_write_with(
             if let Some(permissions) = permissions {
                 file.set_permissions(permissions)?;
             }
-            file.sync_all()
+            file.sync_data()
         })
         .and_then(|()| std::fs::rename(&tmp, path))
         .and_then(|()| std::fs::File::open(parent)?.sync_all());
