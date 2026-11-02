@@ -210,7 +210,7 @@ pub fn context_messages_with(entries: &[Entry], options: ContextOptions) -> Vec<
                     role: "user".into(),
                     content,
                     tool_calls: Vec::new(),
-                    tool_call_id: String::new(),
+                    tool_call_id: Default::default(),
                     reasoning: String::new(),
                     images: Vec::new(),
                 });
@@ -650,7 +650,7 @@ fn request_summary(
         role: "user".into(),
         content: prompt,
         tool_calls: Vec::new(),
-        tool_call_id: String::new(),
+        tool_call_id: Default::default(),
         reasoning: String::new(),
         images: Vec::new(),
     };
@@ -734,7 +734,7 @@ mod tests {
             role: role.into(),
             content: content.into(),
             tool_calls: Vec::new(),
-            tool_call_id: String::new(),
+            tool_call_id: Default::default(),
             reasoning: String::new(),
             images: Vec::new(),
         }

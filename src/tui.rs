@@ -1282,7 +1282,7 @@ impl App {
             role: "user".into(),
             content,
             tool_calls: Vec::new(),
-            tool_call_id: String::new(),
+            tool_call_id: Default::default(),
             reasoning: String::new(),
             images,
         });

@@ -8,7 +8,7 @@ fn message(role: &str, content: impl Into<String>) -> Message {
         role: role.into(),
         content: content.into(),
         tool_calls: Vec::new(),
-        tool_call_id: String::new(),
+        tool_call_id: Default::default(),
         reasoning: String::new(),
         images: Vec::new(),
     }

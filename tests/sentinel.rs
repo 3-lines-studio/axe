@@ -106,7 +106,7 @@ fn redact_message_leaves_what_the_agent_writes_alone() {
             name: "write".into(),
             arguments: r#"{"api_key":"hunter2-secret-value"}"#.into(),
         }],
-        tool_call_id: String::new(),
+        tool_call_id: Default::default(),
         reasoning: "use hunter2-secret-value".into(),
         images: Vec::new(),
     };
@@ -123,7 +123,7 @@ fn redact_message_covers_what_the_user_writes_and_what_tools_return() {
             role: role.into(),
             content: "my key is hunter2-secret-value".into(),
             tool_calls: Vec::new(),
-            tool_call_id: String::new(),
+            tool_call_id: Default::default(),
             reasoning: String::new(),
             images: Vec::new(),
         };

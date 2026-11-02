@@ -292,7 +292,7 @@ fn fuzz_sse(_rng: &mut Rng, seed: u64, payloads: &[Vec<u8>]) {
             role: "user".into(),
             content: "go".into(),
             tool_calls: Vec::new(),
-            tool_call_id: String::new(),
+            tool_call_id: Default::default(),
             reasoning: String::new(),
             images: Vec::new(),
         }],
@@ -308,7 +308,7 @@ fn fuzz_sse(_rng: &mut Rng, seed: u64, payloads: &[Vec<u8>]) {
             if let Ok(Ok(r)) = resp {
                 assert_sane("sse content", seed, &r.message.content);
                 for c in &r.message.tool_calls {
-                    assert_sane("sse call name", seed, &c.name);
+                    assert_sane("sse call name", seed, c.name.as_str());
                     assert_sane("sse call args", seed, &c.arguments);
                 }
             }
@@ -409,7 +409,7 @@ fn session_large_roundtrip() {
         role: "user".into(),
         content: "x".repeat(180),
         tool_calls: Vec::new(),
-        tool_call_id: String::new(),
+        tool_call_id: Default::default(),
         reasoning: String::new(),
         images: Vec::new(),
     };
@@ -625,7 +625,7 @@ fn session_compaction_roundtrip() {
             role: "assistant".into(),
             content: "recent".into(),
             tool_calls: Vec::new(),
-            tool_call_id: String::new(),
+            tool_call_id: Default::default(),
             reasoning: String::new(),
             images: Vec::new(),
         }],
@@ -662,7 +662,7 @@ fn session_compaction_is_append_only() {
         role: role.into(),
         content: content.into(),
         tool_calls: Vec::new(),
-        tool_call_id: String::new(),
+        tool_call_id: Default::default(),
         reasoning: String::new(),
         images: Vec::new(),
     };

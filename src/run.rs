@@ -356,7 +356,7 @@ fn user_message(text: String) -> Message {
         role: "user".into(),
         content: sentinel::redact(&text),
         tool_calls: Vec::new(),
-        tool_call_id: String::new(),
+        tool_call_id: Default::default(),
         reasoning: String::new(),
         images: Vec::new(),
     }
@@ -376,7 +376,7 @@ fn run_tool_batch(
     let any_sequential = calls.iter().any(|c| {
         tools
             .iter()
-            .find(|t| t.name == c.name)
+            .find(|t| t.name == c.name.as_str())
             .map(|t| t.sequential)
             .unwrap_or(false)
     });
@@ -523,7 +523,7 @@ fn run_tool(
 ) -> (ToolOutput, Duration) {
     let started = Instant::now();
     for t in tools {
-        if t.name == call.name {
+        if t.name == call.name.as_str() {
             let output = match (t.run)(&call.arguments, context, progress) {
                 Ok(output) => output,
                 Err(error) => output_from_error(error),

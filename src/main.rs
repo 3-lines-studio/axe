@@ -324,7 +324,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
         role: "user".into(),
         content: axe::sentinel::redact(&prompt.join(" ")),
         tool_calls: Vec::new(),
-        tool_call_id: String::new(),
+        tool_call_id: Default::default(),
         reasoning: String::new(),
         images: cfg.images.clone(),
     });
@@ -744,7 +744,7 @@ mod tests {
         ];
         for (name, args, want) in cases {
             let call = ToolCall {
-                id: String::new(),
+                id: Default::default(),
                 name: name.into(),
                 arguments: args.into(),
             };

@@ -114,10 +114,10 @@ impl OpenAI {
                     m.tool_calls
                         .iter()
                         .map(|c| OaRequestToolCall {
-                            id: &c.id,
+                            id: c.id.as_str(),
                             r#type: "function",
                             function: OaRequestFunction {
-                                name: &c.name,
+                                name: c.name.as_str(),
                                 arguments: &c.arguments,
                             },
                         })
@@ -136,7 +136,7 @@ impl OpenAI {
                 tool_call_id: if m.tool_call_id.is_empty() {
                     None
                 } else {
-                    Some(&m.tool_call_id)
+                    Some(m.tool_call_id.as_str())
                 },
             });
         }
@@ -304,8 +304,8 @@ fn run_request(
     if let Some(cs) = &om.tool_calls {
         for c in cs {
             calls.push(ToolCall {
-                id: c.id.clone(),
-                name: c.function.name.clone(),
+                id: c.id.clone().into(),
+                name: c.function.name.clone().into(),
                 arguments: c.function.arguments.clone(),
             });
         }
@@ -315,7 +315,7 @@ fn run_request(
             role: crate::Role::Assistant,
             content: om.content.clone().unwrap_or_default(),
             tool_calls: calls,
-            tool_call_id: String::new(),
+            tool_call_id: Default::default(),
             reasoning: om.reasoning_content.clone().unwrap_or_default(),
             images: Vec::new(),
         },
@@ -547,12 +547,13 @@ impl StreamAcc {
         self.calls
             .iter()
             .map(|call| ToolCall {
-                id: call.id.clone().unwrap_or_default(),
+                id: call.id.clone().unwrap_or_default().into(),
                 name: call
                     .function
                     .as_ref()
                     .and_then(|f| f.name.clone())
-                    .unwrap_or_default(),
+                    .unwrap_or_default()
+                    .into(),
                 arguments: call
                     .function
                     .as_ref()
@@ -577,7 +578,7 @@ impl StreamAcc {
                 role: crate::Role::Assistant,
                 content: self.content.clone(),
                 tool_calls: self.tool_calls(),
-                tool_call_id: String::new(),
+                tool_call_id: Default::default(),
                 reasoning: self.reasoning.clone(),
                 images: Vec::new(),
             },
@@ -892,7 +893,7 @@ mod tests {
         Message {
             role: "tool".into(),
             content: format!("Attached /tmp/{index}.jpg for viewing."),
-            tool_call_id: format!("call_{index}"),
+            tool_call_id: format!("call_{index}").into(),
             images: vec![Image {
                 path: format!("/tmp/{index}.jpg"),
                 url: format!("data:image/jpeg;base64,{}", "A".repeat(bytes)),

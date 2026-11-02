@@ -120,12 +120,67 @@ fn temp_name(pid: u32, secs: u64, nanos: u32, tag: u64) -> String {
     format!(".axe-tmp-{pid}-{}-{tag}", u64::from(nanos) ^ secs)
 }
 
+macro_rules! string_id {
+    ($name:ident) => {
+        #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.0.is_empty()
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(value: &str) -> Self {
+                Self(value.to_string())
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
+            }
+        }
+    };
+}
+
+string_id!(ToolCallId);
+string_id!(ToolName);
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     #[serde(rename = "ID")]
-    pub id: String,
+    pub id: ToolCallId,
     #[serde(rename = "Name")]
-    pub name: String,
+    pub name: ToolName,
     #[serde(rename = "Arguments")]
     pub arguments: String,
 }
@@ -271,9 +326,9 @@ pub struct Message {
     #[serde(
         rename = "ToolCallID",
         default,
-        skip_serializing_if = "String::is_empty"
+        skip_serializing_if = "ToolCallId::is_empty"
     )]
-    pub tool_call_id: String,
+    pub tool_call_id: ToolCallId,
     #[serde(
         rename = "Reasoning",
         default,
@@ -352,7 +407,7 @@ impl Message {
         Message::new(Role::System, content)
     }
 
-    pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn tool(call_id: impl Into<ToolCallId>, content: impl Into<String>) -> Self {
         Message {
             role: Role::Tool,
             content: content.into(),
