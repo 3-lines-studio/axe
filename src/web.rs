@@ -1,7 +1,6 @@
-use crate::curlffi::Easy;
 use crate::{Tool, new_tool};
 use serde::{Deserialize, Serialize};
-use std::ffi::{c_char, c_void};
+use std::sync::Arc;
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const SEARCH_PATH: &str = "/v1/tools/search";
@@ -22,6 +21,7 @@ const HIGH_QUALITY: f64 = 1.5;
 pub struct Web {
     base_url: String,
     api_key: String,
+    client: Arc<crate::http::Client>,
 }
 
 impl Web {
@@ -33,6 +33,7 @@ impl Web {
         Web {
             base_url: base_url.into(),
             api_key: api_key.into(),
+            client: crate::http::Client::new(),
         }
     }
 
@@ -185,66 +186,43 @@ impl Web {
     }
 
     fn post_once(&self, url: &str, body: &[u8]) -> Result<Reply, String> {
-        let mut easy = Easy::new()?;
-        easy.url(url)?;
-        easy.post()?;
-        easy.post_fields(body)?;
-        easy.fail_on_error(false)?;
-        easy.connect_timeout(CONNECT_TIMEOUT)?;
-        easy.timeout(TRANSFER_TIMEOUT)?;
-        easy.low_speed(1, 30)?;
-        easy.headers(&[
+        let headers = [
             ("Content-Type".to_string(), "application/json".to_string()),
             ("Accept".to_string(), "application/json".to_string()),
             (
                 "Authorization".to_string(),
                 format!("Bearer {}", self.api_key),
             ),
-        ])?;
-
-        let mut collector = Collector {
-            body: Vec::new(),
-            overflow: false,
-        };
-        let performed = {
-            let mut transfer = easy.transfer();
-            transfer.write_function(collect, &mut collector as *mut Collector as *mut c_void);
-            transfer.perform()
-        };
-        if collector.overflow {
+        ];
+        let mut collected = Vec::new();
+        let status = self
+            .client
+            .send(
+                &crate::http::Request {
+                    url,
+                    headers: &headers,
+                    body,
+                    options: crate::http::Options {
+                        connect_timeout: CONNECT_TIMEOUT,
+                        transfer_timeout: TRANSFER_TIMEOUT,
+                        low_speed_time: 30,
+                    },
+                },
+                None,
+                &mut |chunk| collected.extend_from_slice(chunk),
+            )
+            .map_err(|error| error.to_string())?;
+        if collected.len() > MAX_RESPONSE {
             return Err(format!(
                 "response exceeds {} MiB",
                 MAX_RESPONSE / (1024 * 1024)
             ));
         }
-        performed?;
         Ok(Reply {
-            status: easy.response_code()? as u16,
-            body: collector.body,
+            status,
+            body: collected,
         })
     }
-}
-
-struct Collector {
-    body: Vec<u8>,
-    overflow: bool,
-}
-
-unsafe extern "C" fn collect(
-    chunk: *mut c_char,
-    size: usize,
-    count: usize,
-    data: *mut c_void,
-) -> usize {
-    let len = size * count;
-    let collector = unsafe { &mut *(data as *mut Collector) };
-    if collector.body.len() + len > MAX_RESPONSE {
-        collector.overflow = true;
-        return 0;
-    }
-    let slice = unsafe { std::slice::from_raw_parts(chunk as *const u8, len) };
-    collector.body.extend_from_slice(slice);
-    len
 }
 
 pub fn search(web: Web) -> Tool {

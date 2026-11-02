@@ -4,16 +4,15 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
-use std::ffi::{c_char, c_int, c_void};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
 
 pub struct OpenAI {
     base_url: String,
     api_key: String,
-    easy: Arc<Mutex<Option<crate::curlffi::Easy>>>,
+    client: Arc<crate::http::Client>,
     effort: String,
     max_tokens: usize,
     user_id: String,
@@ -31,7 +30,7 @@ impl OpenAI {
         OpenAI {
             base_url: base_url.into(),
             api_key: api_key.into(),
-            easy: Arc::new(Mutex::new(None)),
+            client: crate::http::Client::new(),
             effort: String::new(),
             max_tokens: 0,
             user_id: String::new(),
@@ -79,11 +78,11 @@ impl OpenAI {
     ) -> std::thread::JoinHandle<Result<Response, Error>> {
         match self.build_request(req, true) {
             Ok((url, headers, body)) => {
-                let easy = self.easy.clone();
+                let client = self.client.clone();
                 let c2 = cancel.clone();
                 let tx2 = tx.clone();
                 std::thread::spawn(move || {
-                    run_request(&easy, &url, &headers, &body, true, &c2, Some(&tx2))
+                    run_request(&client, &url, &headers, &body, true, &c2, Some(&tx2))
                 })
             }
             Err(e) => std::thread::spawn(move || Err(e)),
@@ -220,7 +219,7 @@ fn message_content(m: &Message, images: &[Image]) -> Option<Value> {
 }
 
 fn run_request(
-    shared_easy: &Mutex<Option<crate::curlffi::Easy>>,
+    client: &crate::http::Client,
     url: &str,
     headers: &[(String, String)],
     body: &[u8],
@@ -228,90 +227,73 @@ fn run_request(
     cancel: &Arc<AtomicBool>,
     tx: Option<&Sender<StreamEvent>>,
 ) -> Result<Response, Error> {
-    let mut guard = shared_easy.lock().unwrap();
-    if guard.is_none() {
-        *guard = Some(crate::curlffi::Easy::new().map_err(Error::Transport)?);
-    }
-    let easy = guard.as_mut().unwrap();
-    easy.url(url).map_err(err)?;
-    easy.post().map_err(err)?;
-    easy.post_fields(body).map_err(err)?;
-    easy.fail_on_error(false).map_err(err)?;
-    easy.connect_timeout(10).map_err(err)?;
-    easy.low_speed(1, 60).map_err(err)?;
-    easy.headers(headers).map_err(err)?;
-
-    let (status, acc) = {
-        let acc = Rc::new(RefCell::new(StreamAcc::default()));
-        let mut state = ReqState {
-            acc: acc.clone(),
-            cancel: cancel.clone(),
-            tx: tx.cloned(),
-            stream,
-        };
-        let mut transfer = easy.transfer();
-        transfer.write_function(write_cb, &mut state as *mut ReqState as *mut c_void);
+    let acc = Rc::new(RefCell::new(StreamAcc::default()));
+    let mut collected = Vec::new();
+    let mut on_data = |chunk: &[u8]| {
         if stream {
-            transfer.progress_function(progress_cb, &mut state as *mut ReqState as *mut c_void);
+            acc.borrow_mut().feed(chunk, tx, true);
+        } else {
+            collected.extend_from_slice(chunk);
         }
-        transfer.perform().map_err(|e| {
-            if cancel.load(Ordering::Relaxed) {
-                Error::Provider("interrupted".into())
-            } else {
-                Error::Transport(e)
-            }
-        })?;
-        if std::env::var_os("AXE_TRACE").is_some() {
-            eprintln!(
-                "trace: http new_connections={}",
-                easy.new_connections().map_err(err)?
-            );
-        }
-        let status = easy.response_code().map_err(err)? as u16;
-        let acc = match Rc::try_unwrap(acc) {
-            Ok(cell) => cell.into_inner(),
-            Err(rc) => rc.borrow().clone(),
-        };
-        (status, acc)
     };
+    let status = client
+        .send(
+            &crate::http::Request {
+                url,
+                headers,
+                body,
+                options: crate::http::Options::default(),
+            },
+            Some(cancel),
+            &mut on_data,
+        )
+        .map_err(|error| match error {
+            crate::http::Error::Cancelled => Error::Provider("interrupted".into()),
+            crate::http::Error::Transport(message) => Error::Transport(message),
+        })?;
 
     if stream && status == 200 {
-        if let Some(message) = &acc.stream_error {
-            return Err(Error::Provider(format!("openai: {message}")));
-        }
-        if acc.events == 0 {
-            let snippet = String::from_utf8_lossy(&acc.raw[..acc.raw.len().min(200)]).into_owned();
-            return Err(Error::Provider(format!(
-                "openai: invalid response body: {snippet}"
-            )));
-        }
-        let response = acc.response();
-        acc.finish(tx);
+        let response = {
+            let acc = acc.borrow();
+            if let Some(message) = &acc.stream_error {
+                return Err(Error::Provider(format!("openai: {message}")));
+            }
+            if acc.events == 0 {
+                let snippet =
+                    String::from_utf8_lossy(&acc.raw[..acc.raw.len().min(200)]).into_owned();
+                return Err(Error::Provider(format!(
+                    "openai: invalid response body: {snippet}"
+                )));
+            }
+            acc.response()
+        };
+        acc.borrow().finish(tx);
         return Ok(response);
     }
-    let resp = crate::http::Response {
-        status,
-        body: acc.raw,
+    let body = if stream {
+        acc.borrow().raw.clone()
+    } else {
+        collected
     };
 
-    if resp.status != 200 {
+    if status != 200 {
         let mut msg = String::new();
-        if let Ok(e) = serde_json::from_slice::<OaError>(&resp.body) {
+        if let Ok(e) = serde_json::from_slice::<OaError>(&body) {
             msg = e.error.message;
         }
         if !msg.is_empty() {
             return Err(Error::Http {
-                status: resp.status,
-                message: format!("openai: {}: {}", resp.status, msg),
+                status,
+                message: format!("openai: {status}: {msg}"),
             });
         }
         return Err(Error::Http {
-            status: resp.status,
-            message: format!("openai: unexpected status {}", resp.status),
+            status,
+            message: format!("openai: unexpected status {status}"),
         });
     }
 
-    let parsed: OaResponse = serde_json::from_slice(&resp.body).map_err(err)?;
+    let parsed: OaResponse = serde_json::from_slice(&body).map_err(err)?;
     if parsed.choices.is_empty() {
         return Err(Error::Provider("openai: no choices in response".into()));
     }
@@ -349,7 +331,7 @@ impl Provider for OpenAI {
     fn complete(&self, req: &Request) -> Result<Response, Error> {
         let (url, headers, body) = self.build_request(req, false)?;
         run_request(
-            &self.easy,
+            &self.client,
             &url,
             &headers,
             &body,
@@ -610,40 +592,6 @@ impl StreamAcc {
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-struct ReqState {
-    acc: Rc<RefCell<StreamAcc>>,
-    cancel: Arc<AtomicBool>,
-    tx: Option<Sender<StreamEvent>>,
-    stream: bool,
-}
-
-unsafe extern "C" fn write_cb(
-    ptr: *mut c_char,
-    size: usize,
-    nmemb: usize,
-    userdata: *mut c_void,
-) -> usize {
-    let st = unsafe { &mut *(userdata as *mut ReqState) };
-    let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, size * nmemb) };
-    st.acc.borrow_mut().feed(data, st.tx.as_ref(), st.stream);
-    size * nmemb
-}
-
-unsafe extern "C" fn progress_cb(
-    userdata: *mut c_void,
-    _dltotal: f64,
-    _dlnow: f64,
-    _ultotal: f64,
-    _ulnow: f64,
-) -> c_int {
-    let st = unsafe { &mut *(userdata as *mut ReqState) };
-    if st.cancel.load(Ordering::Relaxed) {
-        1
-    } else {
-        0
-    }
 }
 
 fn err(e: impl std::fmt::Display) -> Error {
