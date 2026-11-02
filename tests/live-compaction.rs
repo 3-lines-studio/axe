@@ -130,12 +130,19 @@ fn live_model_continues_through_repeated_compaction() {
         .unwrap_or(5);
     let provider = OpenAI::new(base, key);
     let mut entries = seed_entries();
+    let state = session::SessionState::default();
     let mut failures = Vec::new();
 
     for cycle in 1..=cycles {
         add_cycle(&mut entries, cycle);
-        let (summary, tokens_before, retained) =
-            session::compact(&provider, &model, &entries).expect("compaction");
+        let (summary, tokens_before, retained) = session::compact_with_state(
+            &provider,
+            &model,
+            &entries,
+            &state,
+            session::ContextOptions::default(),
+        )
+        .expect("compaction");
         entries.push(session::Entry::Compaction {
             summary,
             tokens_before,
@@ -238,6 +245,7 @@ fn live_agent_finishes_a_repository_task_across_forced_compactions() {
     }];
     let tools = tools::build_tools(root.to_str().expect("project path"));
     let mut sink = ForcedCompactionSink::default();
+    let mut state = session::SessionState::default();
     let mut compactions = 0;
     let mut restarts = 0;
 
@@ -256,21 +264,20 @@ fn live_agent_finishes_a_repository_task_across_forced_compactions() {
             &mut sink,
         );
         append_run(&mut entries, context.len(), &end.messages);
-        entries.push(session::Entry::Usage {
-            input: end.usage.input,
-            output: end.usage.output,
-            cached_input: end.context.cached_input,
-            context_input: end.context.input,
-            context_output: end.context.output,
-        });
+        state.record(&end.usage, &end.context);
+        state.point(entries.len() - 1, state.context_tokens());
         match end.outcome {
             run::Outcome::Done => break,
             run::Outcome::Compact => {
                 restarts += 1;
                 assert!(restarts <= 16, "forced continuation loop did not finish");
-                let Ok((summary, tokens_before, retained)) =
-                    session::compact(&provider, &model, &entries)
-                else {
+                let Ok((summary, tokens_before, retained)) = session::compact_with_state(
+                    &provider,
+                    &model,
+                    &entries,
+                    &state,
+                    session::ContextOptions::default(),
+                ) else {
                     continue;
                 };
                 compactions += 1;

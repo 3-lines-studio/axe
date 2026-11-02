@@ -723,8 +723,14 @@ fn compact_generates_structured_summary() {
             message: user(&format!("message {i} {}", "x".repeat(3800))),
         })
         .collect();
-    let (summary, tokens_before, retained) =
-        axe::session::compact(&p, "m1", &entries).expect("compact");
+    let (summary, tokens_before, retained) = axe::session::compact_with_state(
+        &p,
+        "m1",
+        &entries,
+        &axe::session::SessionState::default(),
+        axe::session::ContextOptions::default(),
+    )
+    .expect("compact");
     assert!(summary.starts_with("## Goal\nbuild the thing"));
     assert_eq!(tokens_before, 0);
     assert!(!retained.is_empty() && retained.len() < entries.len());
@@ -759,7 +765,14 @@ fn compact_falls_back_when_a_small_model_cannot_follow_the_schema() {
             message: user(&format!("message {i} {}", "x".repeat(1000))),
         })
         .collect();
-    let (summary, _, retained) = axe::session::compact(&p, "small", &entries).expect("compact");
+    let (summary, _, retained) = axe::session::compact_with_state(
+        &p,
+        "small",
+        &entries,
+        &axe::session::SessionState::default(),
+        axe::session::ContextOptions::default(),
+    )
+    .expect("compact");
     assert!(summary.contains("## Critical Context"));
     assert!(summary.contains("still short"));
     assert!(!retained.is_empty());
@@ -789,8 +802,14 @@ fn repeated_compaction_keeps_a_bounded_continuation_context() {
                 message: user(&format!("cycle {cycle} turn {turn} {}", "x".repeat(500))),
             });
         }
-        let (summary, tokens_before, retained) =
-            axe::session::compact(&p, "small", &entries).expect("compact");
+        let (summary, tokens_before, retained) = axe::session::compact_with_state(
+            &p,
+            "small",
+            &entries,
+            &axe::session::SessionState::default(),
+            axe::session::ContextOptions::default(),
+        )
+        .expect("compact");
         entries.push(axe::session::Entry::Compaction {
             summary,
             tokens_before,

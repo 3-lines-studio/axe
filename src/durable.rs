@@ -601,12 +601,12 @@ mod tests {
     }
 
     fn usage(input: usize) -> Entry {
-        Entry::Usage {
-            input,
-            output: 0,
-            cached_input: 0,
-            context_input: 0,
-            context_output: 0,
+        Entry::Message {
+            message: crate::Message {
+                role: "user".into(),
+                content: input.to_string(),
+                ..crate::Message::default()
+            },
         }
     }
 
@@ -615,7 +615,7 @@ mod tests {
             .entries()
             .iter()
             .filter_map(|record| match &record.entry {
-                Entry::Usage { input, .. } => Some(*input),
+                Entry::Message { message } => message.content.parse().ok(),
                 _ => None,
             })
             .collect()

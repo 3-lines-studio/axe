@@ -22,14 +22,6 @@ pub enum Entry {
         timestamp: i64,
         retained: Vec<Message>,
     },
-    Usage {
-        input: usize,
-        output: usize,
-        cached_input: usize,
-        context_input: usize,
-        #[serde(default)]
-        context_output: usize,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -231,7 +223,7 @@ pub fn context_messages_with(entries: &[Entry], options: ContextOptions) -> Vec<
                 out.extend(retained.iter().cloned());
             }
             Entry::Reset => out.clear(),
-            Entry::ToolIntent { .. } | Entry::Usage { .. } => {}
+            Entry::ToolIntent { .. } => {}
         }
     }
     out
@@ -938,63 +930,6 @@ pub fn drop_incomplete_tool_calls(msgs: &mut Vec<Message>) {
 
 const RETAIN_TOKENS: usize = 20_000;
 
-pub fn latest_context_tokens(entries: &[Entry]) -> Option<usize> {
-    for entry in after_reset(entries).iter().rev() {
-        match entry {
-            Entry::Usage {
-                context_input,
-                context_output,
-                ..
-            } if *context_input > 0 => {
-                return Some(context_input.saturating_add(*context_output));
-            }
-            Entry::Compaction { .. } => return None,
-            _ => {}
-        }
-    }
-    None
-}
-
-fn split_retained(entries: &[Entry], options: ContextOptions) -> (Vec<Message>, Vec<Message>) {
-    let entries = after_reset(entries);
-    let msgs = context_messages_with(entries, options);
-    let Some(current_tokens) = latest_context_tokens(entries) else {
-        return split_last_turn(msgs);
-    };
-    let mut message_count = msgs.len();
-    let mut retained_start = message_count;
-    let active_start = entries
-        .iter()
-        .rposition(|entry| matches!(entry, Entry::Compaction { .. }))
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    for entry in entries[active_start..].iter().rev() {
-        match entry {
-            Entry::Message { .. } => {
-                message_count = message_count.saturating_sub(1);
-            }
-            Entry::Usage {
-                context_input,
-                context_output,
-                ..
-            } if *context_input > 0 => {
-                let boundary_tokens = context_input.saturating_add(*context_output);
-                if current_tokens.saturating_sub(boundary_tokens) > RETAIN_TOKENS {
-                    break;
-                }
-                retained_start = message_count;
-            }
-            _ => {}
-        }
-    }
-    if retained_start == msgs.len() {
-        return split_last_turn(msgs);
-    }
-    let mut summarized = msgs;
-    let retained = summarized.split_off(retained_start);
-    (retained, summarized)
-}
-
 fn after_reset_start(entries: &[Entry]) -> usize {
     entries
         .iter()
@@ -1234,52 +1169,6 @@ fn request_summary(
         .map_err(|error| error.to_string())
 }
 
-pub fn compact(
-    provider: &impl Provider,
-    model: &str,
-    entries: &[Entry],
-) -> Result<(String, usize, Vec<Message>), String> {
-    compact_with(provider, model, entries, ContextOptions::default())
-}
-
-pub fn compact_with(
-    provider: &impl Provider,
-    model: &str,
-    entries: &[Entry],
-    options: ContextOptions,
-) -> Result<(String, usize, Vec<Message>), String> {
-    let tokens_before = latest_context_tokens(entries).unwrap_or(0);
-    let (mut retained, to_summarize) = split_retained(entries, options);
-    drop_incomplete_tool_calls(&mut retained);
-    if to_summarize.is_empty() {
-        return Err("nothing to summarize".into());
-    }
-    let conversation = serialize_conversation(&to_summarize);
-    let first = request_summary(provider, model, &conversation, None).unwrap_or_default();
-    let summary = if valid_summary(&first) {
-        first
-    } else {
-        let second = request_summary(
-            provider,
-            model,
-            &conversation,
-            Some(
-                "Your previous response was invalid. Return all required headings and substantive factual content.",
-            ),
-        )
-        .unwrap_or_default();
-        if valid_summary(&second) {
-            second
-        } else {
-            fallback_summary(
-                &to_summarize,
-                if second.is_empty() { &first } else { &second },
-            )
-        }
-    };
-    Ok((summary, tokens_before, retained))
-}
-
 pub fn compact_with_state(
     provider: &impl Provider,
     model: &str,
@@ -1354,16 +1243,6 @@ mod tests {
         }
     }
 
-    fn usage(context_input: usize, context_output: usize) -> Entry {
-        Entry::Usage {
-            input: context_input,
-            output: context_output,
-            cached_input: 0,
-            context_input,
-            context_output,
-        }
-    }
-
     fn call(id: &str) -> crate::ToolCall {
         crate::ToolCall {
             id: id.into(),
@@ -1391,12 +1270,10 @@ mod tests {
             Entry::Message {
                 message: message("user", "new"),
             },
-            usage(10, 1),
         ];
         let messages = context_messages(&entries);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "new");
-        assert_eq!(latest_context_tokens(&entries), Some(11));
     }
 
     #[test]
@@ -1423,7 +1300,6 @@ mod tests {
             Entry::Message {
                 message: message("user", "kept"),
             },
-            usage(10, 1),
         ];
         entries.push(Entry::Compaction {
             summary: "summary".into(),
@@ -1509,7 +1385,6 @@ mod tests {
                 Entry::Message {
                     message: message("user", "before compaction"),
                 },
-                usage(250_000, 500),
                 Entry::Compaction {
                     summary: "a summary".into(),
                     tokens_before: 250_500,
@@ -1535,7 +1410,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_context_uses_usage_and_complete_turns() {
+    fn retained_context_uses_token_points_and_complete_turns() {
         let mut tool_call = message("assistant", "");
         tool_call.tool_calls.push(crate::ToolCall {
             id: "call-1".into(),
@@ -1551,14 +1426,12 @@ mod tests {
             Entry::Message {
                 message: message("assistant", "old answer"),
             },
-            usage(100_000, 100),
             Entry::Message {
                 message: message("user", "middle"),
             },
             Entry::Message {
                 message: message("assistant", "middle answer"),
             },
-            usage(110_000, 100),
             Entry::Message {
                 message: message("user", "latest"),
             },
@@ -1569,15 +1442,35 @@ mod tests {
             Entry::Message {
                 message: message("assistant", "latest answer"),
             },
-            usage(125_000, 100),
         ];
-        let (retained, summarized) = split_retained(&entries, ContextOptions::default());
-        assert_eq!(latest_context_tokens(&entries), Some(125_100));
-        assert_eq!(retained.len(), 4);
-        assert_eq!(retained[0].content, "latest");
-        assert_eq!(retained[1].tool_calls[0].id, "call-1");
-        assert_eq!(retained[2].tool_call_id, "call-1");
-        assert_eq!(summarized.last().unwrap().content, "middle answer");
+        let state = SessionState {
+            context_input: 125_000,
+            context_output: 100,
+            points: vec![
+                ContextPoint {
+                    index: 1,
+                    tokens: 100_100,
+                },
+                ContextPoint {
+                    index: 3,
+                    tokens: 110_100,
+                },
+                ContextPoint {
+                    index: 7,
+                    tokens: 125_100,
+                },
+            ],
+            ..SessionState::default()
+        };
+        let (retained, summarized) =
+            split_retained_state(&entries, ContextOptions::default(), &state);
+        assert_eq!(state.context_tokens(), 125_100);
+        assert_eq!(retained.len(), 5);
+        assert_eq!(retained[0].content, "middle answer");
+        assert_eq!(retained[1].content, "latest");
+        assert_eq!(retained[2].tool_calls[0].id, "call-1");
+        assert_eq!(retained[3].tool_call_id, "call-1");
+        assert_eq!(summarized.last().unwrap().content, "middle");
     }
 
     struct SummaryProvider;
@@ -1627,7 +1520,6 @@ mod tests {
             Entry::Message {
                 message: message("assistant", "old answer"),
             },
-            usage(100_000, 100),
             Entry::Message {
                 message: message("user", "latest"),
             },
@@ -1636,9 +1528,16 @@ mod tests {
                 message: tool_result,
             },
         ];
-        let (_, _, retained) = compact(&SummaryProvider, "test", &entries).unwrap();
-        assert_eq!(retained.len(), 1);
+        let (_, _, retained) = compact_with_state(
+            &SummaryProvider,
+            "test",
+            &entries,
+            &SessionState::default(),
+            ContextOptions::default(),
+        )
+        .unwrap();
         assert_eq!(retained[0].content, "latest");
+        assert!(!retained.iter().any(|message| message.content == "old"));
     }
 
     #[test]
@@ -1682,20 +1581,6 @@ mod tests {
         ];
         drop_incomplete_tool_calls(&mut msgs);
         assert_eq!(msgs.len(), 2);
-    }
-
-    #[test]
-    fn compaction_resets_persisted_context_usage() {
-        let entries = vec![
-            usage(250_000, 500),
-            Entry::Compaction {
-                summary: "summary".into(),
-                tokens_before: 250_500,
-                timestamp: 1,
-                retained: Vec::new(),
-            },
-        ];
-        assert_eq!(latest_context_tokens(&entries), None);
     }
 
     #[test]

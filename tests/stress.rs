@@ -630,25 +630,17 @@ fn session_compaction_roundtrip() {
             images: Vec::new(),
         }],
     };
-    let usage = axe::session::Entry::Usage {
+    let state = axe::session::SessionState {
         input: 120,
         output: 8,
         cached_input: 80,
         context_input: 100,
         context_output: 8,
+        points: Vec::new(),
     };
-    store.save(&[entry, usage]).unwrap();
+    store.save_with_state(&[entry], state.clone()).unwrap();
     let entries = store.live();
-    assert!(matches!(
-        entries[1],
-        axe::session::Entry::Usage {
-            input: 120,
-            output: 8,
-            cached_input: 80,
-            context_input: 100,
-            context_output: 8
-        }
-    ));
+    assert_eq!(store.state(), state);
     let msgs = axe::session::context_messages(&entries);
     assert_eq!(msgs.len(), 2);
     assert!(msgs[0].content.contains("done stuff"));

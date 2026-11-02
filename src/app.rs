@@ -88,14 +88,6 @@ pub struct RewindItem {
     pub preview: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SessionUsage {
-    pub input: usize,
-    pub output: usize,
-    pub context_input: usize,
-    pub cached_input: usize,
-}
-
 pub fn parse_command(input: &str) -> Option<Command> {
     let name = input
         .trim_start_matches('/')
@@ -338,27 +330,6 @@ pub fn rewind_entries(messages: &[Message], index: usize) -> Vec<Entry> {
         .collect()
 }
 
-pub fn session_usage(entries: &[Entry]) -> SessionUsage {
-    let mut usage = SessionUsage::default();
-    for entry in crate::session::after_reset(entries) {
-        let Entry::Usage {
-            input,
-            output,
-            cached_input,
-            context_input,
-            ..
-        } = entry
-        else {
-            continue;
-        };
-        usage.input += input;
-        usage.output += output;
-        usage.context_input = *context_input;
-        usage.cached_input = *cached_input;
-    }
-    usage
-}
-
 pub fn load_session(store: &dyn Store, id: &str) -> Option<(String, Vec<Entry>)> {
     if id == "last" {
         let session_meta = store.list().into_iter().next()?;
@@ -400,31 +371,5 @@ mod tests {
     fn builds_rewind_entries() {
         let messages = vec![Message::default(), Message::default()];
         assert_eq!(rewind_entries(&messages, 1).len(), 1);
-    }
-
-    #[test]
-    fn usage_before_a_reset_is_not_counted() {
-        let entries = vec![
-            Entry::Usage {
-                input: 10,
-                output: 2,
-                cached_input: 0,
-                context_input: 10,
-                context_output: 2,
-            },
-            Entry::Reset,
-            Entry::Usage {
-                input: 7,
-                output: 3,
-                cached_input: 1,
-                context_input: 7,
-                context_output: 3,
-            },
-        ];
-        let usage = session_usage(&entries);
-        assert_eq!(usage.input, 7);
-        assert_eq!(usage.output, 3);
-        assert_eq!(usage.cached_input, 1);
-        assert_eq!(usage.context_input, 7);
     }
 }
