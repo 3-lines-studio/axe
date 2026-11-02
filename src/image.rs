@@ -164,4 +164,22 @@ mod tests {
         assert_eq!(image.url, "https://example.com/a.png");
         assert_eq!(label(&image), "https://example.com/a.png");
     }
+
+    #[test]
+    fn a_local_image_is_stored_by_path_not_as_base64() {
+        let path = std::env::temp_dir().join(format!("axe-image-{}.png", std::process::id()));
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        let source = path.display().to_string();
+        let image = attach(&source).unwrap();
+        assert!(image.url.starts_with("data:image/png;base64,"));
+
+        let json = serde_json::to_string(&image).unwrap();
+        assert!(!json.contains("data:"), "inline bytes leaked: {json}");
+        assert!(json.contains("Path"));
+
+        let loaded: crate::Image = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.path, source);
+        assert_eq!(loaded.url, image.url);
+        std::fs::remove_file(&path).ok();
+    }
 }

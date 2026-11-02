@@ -209,7 +209,7 @@ fn message_content(m: &Message, images: &[Image]) -> Option<Value> {
     if !m.content.is_empty() {
         parts.push(serde_json::json!({"type": "text", "text": m.content}));
     }
-    for image in images {
+    for image in images.iter().filter(|image| !image.url.is_empty()) {
         parts.push(serde_json::json!({
             "type": "image_url",
             "image_url": {"url": image.url},

@@ -129,12 +129,54 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Image {
-    #[serde(rename = "Path", default, skip_serializing_if = "String::is_empty")]
     pub path: String,
-    #[serde(rename = "URL", default)]
     pub url: String,
+}
+
+impl Serialize for Image {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let omit_url = !self.path.is_empty() && self.url.starts_with("data:");
+        let mut state = serializer.serialize_struct("Image", if omit_url { 1 } else { 2 })?;
+        if !self.path.is_empty() {
+            state.serialize_field("Path", &self.path)?;
+        }
+        if !omit_url {
+            state.serialize_field("URL", &self.url)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Image {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(rename = "Path", default)]
+            path: String,
+            #[serde(rename = "URL", default)]
+            url: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.url.is_empty()
+            && !wire.path.is_empty()
+            && let Some(image) = crate::image::attach_if_image(&wire.path)
+        {
+            return Ok(image);
+        }
+        Ok(Image {
+            path: wire.path,
+            url: wire.url,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
