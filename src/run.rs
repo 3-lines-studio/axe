@@ -173,7 +173,7 @@ pub fn run_stream<P: Provider>(
                 outcome: Outcome::Done,
             };
         }
-        let truncated = resp.stop_reason == "length";
+        let truncated = resp.stop_reason.is_length();
         if !run_tool_batch(opts.tools, calls, truncated, turn, cancel, sink, &mut h) {
             return RunEnd {
                 messages: h,
@@ -434,7 +434,7 @@ fn stream<P: Provider>(
             }
         }
         match handle.join() {
-            Ok(resp) if !interrupted(&resp.stop_reason) => {
+            Ok(resp) if !resp.stop_reason.is_interrupted() => {
                 trace(format!(
                     "model request_done_ms={} attempt={}",
                     started.elapsed().as_millis(),
@@ -460,10 +460,6 @@ fn stream<P: Provider>(
     }
 }
 
-fn interrupted(stop_reason: &str) -> bool {
-    matches!(stop_reason, "insufficient_system_resource" | "aborted")
-}
-
 fn exec(tools: &[Tool], call: &ToolCall, sink: &mut dyn Sink) -> (ToolOutput, Duration) {
     run_tool(tools, call, &mut |text| sink.tool_delta(call, text))
 }
@@ -476,15 +472,15 @@ fn trace(message: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::interrupted;
+    use crate::StopReason;
 
     #[test]
     fn the_provider_interruptions_are_retryable() {
-        assert!(interrupted("insufficient_system_resource"));
-        assert!(interrupted("aborted"));
-        assert!(!interrupted("stop"));
-        assert!(!interrupted("length"));
-        assert!(!interrupted("tool_calls"));
-        assert!(!interrupted("content_filter"));
+        assert!(StopReason::from("insufficient_system_resource").is_interrupted());
+        assert!(StopReason::from("aborted").is_interrupted());
+        assert!(!StopReason::from("stop").is_interrupted());
+        assert!(!StopReason::from("length").is_interrupted());
+        assert!(!StopReason::from("tool_calls").is_interrupted());
+        assert!(!StopReason::from("content_filter").is_interrupted());
     }
 }

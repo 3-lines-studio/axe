@@ -208,7 +208,7 @@ impl Provider for Flaky {
         Ok(Response {
             message: assistant("ok"),
             usage: Usage::default(),
-            stop_reason: String::new(),
+            stop_reason: Default::default(),
         })
     }
 
@@ -271,7 +271,7 @@ fn run_executes_tools_and_returns_transcript() {
                     output: 5,
                     cached_input: 0,
                 },
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
             Response {
                 message: assistant("done"),
@@ -280,7 +280,7 @@ fn run_executes_tools_and_returns_transcript() {
                     output: 2,
                     cached_input: 0,
                 },
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
         ])),
         ..Default::default()
@@ -323,12 +323,12 @@ fn loop_redacts_secrets_from_tool_output_and_user_input() {
             Response {
                 message: call_tool("c1", "leak", "{}"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
             Response {
                 message: assistant("done"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
         ])),
         ..Default::default()
@@ -367,12 +367,12 @@ fn run_continues_on_tool_error() {
             Response {
                 message: call_tool("c1", "boom", "{}"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
             Response {
                 message: assistant("recovered"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
         ])),
         ..Default::default()
@@ -390,12 +390,12 @@ fn run_unknown_tool() {
             Response {
                 message: call_tool("c1", "nope", "{}"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
             Response {
                 message: assistant("ok"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
         ])),
         ..Default::default()
@@ -411,7 +411,7 @@ fn run_max_turns() {
         .map(|_| Response {
             message: call_tool("c", "x", "{}"),
             usage: Usage::default(),
-            stop_reason: String::new(),
+            stop_reason: Default::default(),
         })
         .collect();
     let p = Fake {
@@ -565,7 +565,7 @@ fn run_length_stop_does_not_execute_tool_calls() {
             Response {
                 message: assistant("recovered"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
         ])),
         ..Default::default()
@@ -619,12 +619,12 @@ fn run_parallel_tools_ordered() {
                     images: Vec::new(),
                 },
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
             Response {
                 message: assistant("done"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
         ])),
         ..Default::default()
@@ -665,12 +665,12 @@ fn run_injects_steering_between_turns() {
             Response {
                 message: assistant("first"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
             Response {
                 message: assistant("second"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
         ])),
         ..Default::default()
@@ -710,7 +710,7 @@ fn compact_generates_structured_summary() {
                 "## Goal\nbuild the thing\n## User Requirements\n- none\n## Progress\n### Done\n- none\n### In Progress\n- build\n### Blocked\n- none\n## Key Decisions\n- none\n## Files\n- none\n## Commands and Results\n- none\n## Open Questions\n- none\n## Next Steps\n1. build\n## Critical Context\n- none",
             ),
             usage: Usage::default(),
-            stop_reason: String::new(),
+            stop_reason: Default::default(),
         }])),
         ..Default::default()
     };
@@ -740,12 +740,12 @@ fn compact_falls_back_when_a_small_model_cannot_follow_the_schema() {
             Response {
                 message: assistant("short summary"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
             Response {
                 message: assistant("still short"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
         ])),
         ..Default::default()
@@ -770,7 +770,7 @@ fn repeated_compaction_keeps_a_bounded_continuation_context() {
                 .map(|_| Response {
                     message: assistant(structured),
                     usage: Usage::default(),
-                    stop_reason: String::new(),
+                    stop_reason: Default::default(),
                 })
                 .collect::<VecDeque<_>>(),
         ),
@@ -820,12 +820,12 @@ fn run_compact_outcome_leaves_transcript() {
                     output: 2,
                     cached_input: 0,
                 },
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
             Response {
                 message: assistant("should not run"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             },
         ])),
         ..Default::default()
@@ -882,7 +882,7 @@ impl Provider for MidStreamFlaky {
             Ok(Response {
                 message: assistant("done"),
                 usage: Usage::default(),
-                stop_reason: String::new(),
+                stop_reason: Default::default(),
             })
         });
         StreamHandle::new(rx, thread)
@@ -1018,7 +1018,7 @@ fn run_cancel_mid_batch_synthesizes_results() {
                         images: Vec::new(),
                     },
                     usage: Usage::default(),
-                    stop_reason: String::new(),
+                    stop_reason: Default::default(),
                 })
             });
             StreamHandle::new(rx, thread)
@@ -1081,7 +1081,7 @@ fn run_compacts_after_complete_tool_batch() {
                 output: 200,
                 cached_input: 0,
             },
-            stop_reason: String::new(),
+            stop_reason: Default::default(),
         }])),
         ..Default::default()
     };

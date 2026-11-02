@@ -1,4 +1,6 @@
-use crate::{Error, Image, Message, Provider, Request, Response, StreamHandle, ToolCall, Usage};
+use crate::{
+    Error, Image, Message, Provider, Request, Response, StopReason, StreamHandle, ToolCall, Usage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
@@ -314,7 +316,7 @@ fn run_request(
         return Err(Error::Provider("openai: no choices in response".into()));
     }
     let choice = &parsed.choices[0];
-    let stop_reason = choice.finish_reason.clone().unwrap_or_default();
+    let stop_reason = StopReason::from(choice.finish_reason.clone().unwrap_or_default());
     let om = &choice.message;
     let mut calls = Vec::new();
     if let Some(cs) = &om.tool_calls {
@@ -601,7 +603,7 @@ impl StreamAcc {
                 output: self.usage.completion_tokens,
                 cached_input: self.usage.prompt_tokens_details.cached_tokens,
             },
-            stop_reason: self.finish_reason.clone().unwrap_or_default(),
+            stop_reason: StopReason::from(self.finish_reason.clone().unwrap_or_default()),
         }
     }
 }

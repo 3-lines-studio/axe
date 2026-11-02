@@ -403,6 +403,87 @@ pub trait Provider {
     fn stream(&self, req: &Request, cancel: &Arc<AtomicBool>) -> StreamHandle;
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum StopReason {
+    #[default]
+    End,
+    Length,
+    ToolCalls,
+    ContentFilter,
+    Interrupted,
+    Other(String),
+}
+
+impl StopReason {
+    pub fn from_wire(value: impl Into<String>) -> Self {
+        match value.into().as_str() {
+            "" | "stop" | "end" => StopReason::End,
+            "length" => StopReason::Length,
+            "tool_calls" | "function_call" => StopReason::ToolCalls,
+            "content_filter" => StopReason::ContentFilter,
+            "insufficient_system_resource" | "aborted" | "interrupted" => StopReason::Interrupted,
+            other => StopReason::Other(other.to_string()),
+        }
+    }
+
+    pub fn is_length(&self) -> bool {
+        matches!(self, StopReason::Length)
+    }
+
+    pub fn is_interrupted(&self) -> bool {
+        matches!(self, StopReason::Interrupted)
+    }
+}
+
+impl From<String> for StopReason {
+    fn from(value: String) -> Self {
+        StopReason::from_wire(value)
+    }
+}
+
+impl From<&str> for StopReason {
+    fn from(value: &str) -> Self {
+        StopReason::from_wire(value)
+    }
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StopReason::End => f.write_str("stop"),
+            StopReason::Length => f.write_str("length"),
+            StopReason::ToolCalls => f.write_str("tool_calls"),
+            StopReason::ContentFilter => f.write_str("content_filter"),
+            StopReason::Interrupted => f.write_str("interrupted"),
+            StopReason::Other(value) => f.write_str(value),
+        }
+    }
+}
+
+impl PartialEq<str> for StopReason {
+    fn eq(&self, other: &str) -> bool {
+        match self {
+            StopReason::End => other.is_empty() || other == "stop" || other == "end",
+            StopReason::Length => other == "length",
+            StopReason::ToolCalls => other == "tool_calls" || other == "function_call",
+            StopReason::ContentFilter => other == "content_filter",
+            StopReason::Interrupted => {
+                matches!(
+                    other,
+                    "insufficient_system_resource" | "aborted" | "interrupted"
+                )
+            }
+            StopReason::Other(value) => value == other,
+        }
+    }
+}
+
+impl PartialEq<&str> for StopReason {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+
 pub struct Request<'a> {
     pub model: &'a str,
     pub system: &'a str,
@@ -414,7 +495,7 @@ pub struct Request<'a> {
 pub struct Response {
     pub message: Message,
     pub usage: Usage,
-    pub stop_reason: String,
+    pub stop_reason: StopReason,
 }
 
 #[cfg(test)]
