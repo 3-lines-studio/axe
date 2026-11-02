@@ -510,7 +510,7 @@ mod tests {
             r#"{{"path":"{}","offset":2.0,"limit":1.0}}"#,
             path.display()
         );
-        let out = (read.run)(&args, &mut |_| {}).text;
+        let out = read.run_plain(&args, &mut |_| {}).text;
         assert!(out.starts_with("b"), "got: {out}");
         assert!(!out.contains("invalid arguments"), "got: {out}");
         std::fs::remove_dir_all(&dir).ok();
@@ -528,20 +528,20 @@ mod tests {
             [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
         )
         .unwrap();
-        let out = (read.run)(&format!(r#"{{"path":"{}"}}"#, png.display()), &mut |_| {});
+        let out = read.run_plain(&format!(r#"{{"path":"{}"}}"#, png.display()), &mut |_| {});
         assert_eq!(out.images.len(), 1, "text: {}", out.text);
         assert!(out.images[0].url.starts_with("data:image/png;base64,"));
         assert!(out.text.contains("shot.png"), "got: {}", out.text);
 
         let bin = dir.join("thing.bin");
         std::fs::write(&bin, [0u8, 1, 2, 3, 0, 4]).unwrap();
-        let out = (read.run)(&format!(r#"{{"path":"{}"}}"#, bin.display()), &mut |_| {});
+        let out = read.run_plain(&format!(r#"{{"path":"{}"}}"#, bin.display()), &mut |_| {});
         assert!(out.images.is_empty());
         assert!(out.text.contains("binary file"), "got: {}", out.text);
 
         let txt = dir.join("t.txt");
         std::fs::write(&txt, "hello\n").unwrap();
-        let out = (read.run)(&format!(r#"{{"path":"{}"}}"#, txt.display()), &mut |_| {});
+        let out = read.run_plain(&format!(r#"{{"path":"{}"}}"#, txt.display()), &mut |_| {});
         assert!(out.images.is_empty());
         assert_eq!(out.text, "hello");
         std::fs::remove_dir_all(&dir).ok();
@@ -586,7 +586,7 @@ mod tests {
         let _lock = BASH_TEST.lock().unwrap();
         let bash = crate::tools::bash(local());
         let args = serde_json::json!({"command": "yes | head -c 20000"}).to_string();
-        let out = (bash.run)(&args, &mut |_| {}).text;
+        let out = bash.run_plain(&args, &mut |_| {}).text;
         assert!(
             out.contains("Output truncated to the last 16KB"),
             "got tail: {}",
@@ -662,20 +662,23 @@ mod tests {
         let machine: std::sync::Arc<dyn crate::machine::Machine> = fake.clone();
 
         let write = crate::tools::write(machine.clone());
-        let out = (write.run)(
-            r#"{"path":"/memoria/nota.txt","content":"hola\n"}"#,
-            &mut |_| {},
-        )
-        .text;
+        let out = write
+            .run_plain(
+                r#"{"path":"/memoria/nota.txt","content":"hola\n"}"#,
+                &mut |_| {},
+            )
+            .text;
         assert!(out.starts_with("wrote /memoria/nota.txt"), "got: {out}");
 
         let read = crate::tools::read(machine.clone());
-        let out = (read.run)(r#"{"path":"/memoria/nota.txt"}"#, &mut |_| {}).text;
+        let out = read
+            .run_plain(r#"{"path":"/memoria/nota.txt"}"#, &mut |_| {})
+            .text;
         assert_eq!(out.trim(), "hola", "got: {out}");
 
         let edit = crate::tools::edit(machine.clone());
         let args = r#"{"path":"/memoria/nota.txt","edits":[{"oldText":"hola","newText":"chau"}]}"#;
-        let out = (edit.run)(args, &mut |_| {}).text;
+        let out = edit.run_plain(args, &mut |_| {}).text;
         assert!(
             out.contains("Successfully replaced 1 block(s)"),
             "got: {out}"
@@ -690,7 +693,9 @@ mod tests {
         assert_eq!(guardado, b"chau\n");
 
         let bash = crate::tools::bash(machine);
-        let out = (bash.run)(r#"{"command":"ls /memoria"}"#, &mut |_| {}).text;
+        let out = bash
+            .run_plain(r#"{"command":"ls /memoria"}"#, &mut |_| {})
+            .text;
         assert_eq!(out, "ran: ls /memoria");
         assert_eq!(fake.runs.lock().unwrap().as_slice(), ["ls /memoria"]);
     }
@@ -849,6 +854,7 @@ pub fn read(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
                 return ToolOutput {
                     text: format!("Attached {} for viewing.", a.path),
                     images: vec![image],
+                    error: false,
                 };
             }
             if looks_binary(&data) {

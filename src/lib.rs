@@ -265,10 +265,47 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+#[derive(Clone, Debug, Default)]
+pub struct ToolContext {
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl ToolContext {
+    pub fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolError {
+    InvalidArguments(String),
+    Cancelled,
+    Failed(String),
+}
+
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolError::InvalidArguments(message) => {
+                write!(f, "invalid arguments: {message}")
+            }
+            ToolError::Cancelled => f.write_str("cancelled"),
+            ToolError::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ToolError {}
+
+pub type ToolResult = Result<ToolOutput, ToolError>;
+
 #[derive(Debug, Default)]
 pub struct ToolOutput {
     pub text: String,
     pub images: Vec<Image>,
+    pub error: bool,
 }
 
 impl ToolOutput {
@@ -276,13 +313,32 @@ impl ToolOutput {
         ToolOutput {
             text: text.into(),
             images: Vec::new(),
+            error: false,
+        }
+    }
+
+    pub fn error(text: impl Into<String>) -> Self {
+        ToolOutput {
+            text: text.into(),
+            images: Vec::new(),
+            error: true,
         }
     }
 }
 
 impl From<String> for ToolOutput {
     fn from(text: String) -> Self {
-        ToolOutput::text(text)
+        if text.starts_with("error:") {
+            ToolOutput::error(text)
+        } else {
+            ToolOutput::text(text)
+        }
+    }
+}
+
+impl From<ToolError> for ToolOutput {
+    fn from(error: ToolError) -> Self {
+        ToolOutput::error(format!("error: {error}"))
     }
 }
 
@@ -293,7 +349,7 @@ pub struct Tool {
     pub snippet: String,
     pub sequential: bool,
     #[allow(clippy::type_complexity)]
-    pub run: Box<dyn Fn(&str, &mut dyn FnMut(&str)) -> ToolOutput + Send + Sync>,
+    pub run: Box<dyn Fn(&str, &ToolContext, &mut dyn FnMut(&str)) -> ToolResult + Send + Sync>,
 }
 
 pub fn new_tool<T, R>(
@@ -328,7 +384,7 @@ where
         parameters,
         snippet: String::new(),
         sequential: false,
-        run: Box::new(move |raw, progress| {
+        run: Box::new(move |raw, _context, progress| {
             let raw = if raw.trim().is_empty() { "{}" } else { raw };
             let mut args: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
             if !args.is_null() {
@@ -336,12 +392,21 @@ where
             }
             let coerced = serde_json::to_string(&args).unwrap_or_else(|_| raw.to_string());
             match serde_json::from_str::<T>(&coerced) {
-                Ok(args) => run(args, progress).into(),
-                Err(e) => ToolOutput::text(format!(
-                    "error: invalid arguments for {name}: {e}\nReceived: {raw}"
-                )),
+                Ok(args) => Ok(run(args, progress).into()),
+                Err(e) => Err(ToolError::InvalidArguments(format!(
+                    "{name}: {e}\nReceived: {raw}"
+                ))),
             }
         }),
+    }
+}
+
+impl Tool {
+    pub fn run_plain(&self, raw: &str, progress: &mut dyn FnMut(&str)) -> ToolOutput {
+        match (self.run)(raw, &ToolContext::default(), progress) {
+            Ok(output) => output,
+            Err(error) => ToolOutput::from(error),
+        }
     }
 }
 

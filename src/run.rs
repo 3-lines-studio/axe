@@ -228,7 +228,10 @@ fn run_inner<P: Provider>(
     let started = Instant::now();
     let mut h: Vec<Message> = msgs.iter().map(sentinel::redact_message).collect();
     let mut usage = Usage::default();
-    let mut context = Usage::default();
+    let mut context_usage = Usage::default();
+    let tool_context = crate::ToolContext {
+        cancel: Some(cancel.clone()),
+    };
     trace(format!(
         "run start messages={} system_bytes={} tools={}",
         msgs.len(),
@@ -241,7 +244,7 @@ fn run_inner<P: Provider>(
             return RunEnd {
                 messages: h,
                 usage,
-                context,
+                context: context_usage,
                 outcome: Outcome::Cancelled,
             };
         }
@@ -255,14 +258,14 @@ fn run_inner<P: Provider>(
                     return RunEnd {
                         messages: h,
                         usage,
-                        context,
+                        context: context_usage,
                         outcome: Outcome::Cancelled,
                     };
                 }
                 return RunEnd {
                     messages: h,
                     usage,
-                    context,
+                    context: context_usage,
                     outcome: Outcome::Failed(e),
                 };
             }
@@ -281,7 +284,7 @@ fn run_inner<P: Provider>(
             output: usage.output + resp.usage.output,
             cached_input: usage.cached_input + resp.usage.cached_input,
         };
-        context = resp.usage;
+        context_usage = resp.usage;
         h.push(resp.message);
         hooks.event(AgentEvent::Assistant {
             turn,
@@ -305,16 +308,25 @@ fn run_inner<P: Provider>(
             return RunEnd {
                 messages: h,
                 usage,
-                context,
+                context: context_usage,
                 outcome: Outcome::Done,
             };
         }
         let truncated = resp.stop_reason.is_length();
-        if !run_tool_batch(opts.tools, calls, truncated, turn, cancel, hooks, &mut h) {
+        if !run_tool_batch(
+            opts.tools,
+            calls,
+            truncated,
+            turn,
+            cancel,
+            &tool_context,
+            hooks,
+            &mut h,
+        ) {
             return RunEnd {
                 messages: h,
                 usage,
-                context,
+                context: context_usage,
                 outcome: Outcome::Cancelled,
             };
         }
@@ -325,7 +337,7 @@ fn run_inner<P: Provider>(
             return RunEnd {
                 messages: h,
                 usage,
-                context,
+                context: context_usage,
                 outcome: Outcome::Compact,
             };
         }
@@ -333,7 +345,7 @@ fn run_inner<P: Provider>(
     RunEnd {
         messages: h,
         usage,
-        context,
+        context: context_usage,
         outcome: Outcome::MaxTurns,
     }
 }
@@ -349,12 +361,14 @@ fn user_message(text: String) -> Message {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tool_batch(
     tools: &[Tool],
     calls: Vec<ToolCall>,
     truncated: bool,
     turn: usize,
     cancel: &Arc<AtomicBool>,
+    context: &crate::ToolContext,
     hooks: &mut dyn RuntimeHooks,
     h: &mut Vec<Message>,
 ) -> bool {
@@ -383,7 +397,7 @@ fn run_tool_batch(
                     Duration::ZERO,
                 )
             } else {
-                exec(tools, &call, hooks)
+                exec(tools, &call, context, hooks)
             };
             hooks.event(AgentEvent::ToolResult {
                 call: &call,
@@ -398,7 +412,7 @@ fn run_tool_batch(
         }
         !cancelled(cancel)
     } else {
-        run_parallel(tools, calls, turn, cancel, hooks, h)
+        run_parallel(tools, calls, turn, cancel, context, hooks, h)
     }
 }
 
@@ -425,11 +439,13 @@ enum ParallelMsg {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_parallel(
     tools: &[Tool],
     calls: Vec<ToolCall>,
     turn: usize,
     cancel: &Arc<AtomicBool>,
+    context: &crate::ToolContext,
     hooks: &mut dyn RuntimeHooks,
     h: &mut Vec<Message>,
 ) -> bool {
@@ -442,6 +458,7 @@ fn run_parallel(
         for (idx, call) in calls.iter().enumerate() {
             let ptx = ptx.clone();
             let cancel = cancel.clone();
+            let context = context.clone();
             scope.spawn(move || {
                 let (output, elapsed) = if cancelled(&cancel) {
                     (
@@ -449,7 +466,7 @@ fn run_parallel(
                         Duration::ZERO,
                     )
                 } else {
-                    run_tool(tools, call, &mut |text| {
+                    run_tool(tools, call, &context, &mut |text| {
                         let _ = ptx.send(ParallelMsg::Delta {
                             idx,
                             text: text.to_string(),
@@ -500,20 +517,25 @@ fn run_parallel(
 fn run_tool(
     tools: &[Tool],
     call: &ToolCall,
+    context: &crate::ToolContext,
     progress: &mut dyn FnMut(&str),
 ) -> (ToolOutput, Duration) {
     let started = Instant::now();
     for t in tools {
         if t.name == call.name {
-            let output = (t.run)(&call.arguments, progress);
+            let output = match (t.run)(&call.arguments, context, progress) {
+                Ok(output) => output,
+                Err(error) => output_from_error(error),
+            };
             let elapsed = started.elapsed();
             trace(format!(
                 "tool name={} elapsed_ms={} argument_bytes={} output_bytes={}",
                 call.name,
                 elapsed.as_millis(),
                 call.arguments.len(),
-                output.text.len()
+                output.text.len(),
             ));
+            trace(format!("tool error={}", output.error));
             return (output, elapsed);
         }
     }
@@ -614,10 +636,19 @@ fn stream<P: Provider>(
     }
 }
 
-fn exec(tools: &[Tool], call: &ToolCall, hooks: &mut dyn RuntimeHooks) -> (ToolOutput, Duration) {
-    run_tool(tools, call, &mut |text| {
+fn exec(
+    tools: &[Tool],
+    call: &ToolCall,
+    context: &crate::ToolContext,
+    hooks: &mut dyn RuntimeHooks,
+) -> (ToolOutput, Duration) {
+    run_tool(tools, call, context, &mut |text| {
         hooks.event(AgentEvent::ToolDelta { call, text })
     })
+}
+
+fn output_from_error(error: crate::ToolError) -> ToolOutput {
+    ToolOutput::from(error)
 }
 
 fn trace(message: String) {

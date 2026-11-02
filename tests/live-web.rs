@@ -8,7 +8,7 @@ fn run(name: &str, args: &str) -> String {
         Some(web),
     );
     let tool = tools.iter().find(|tool| tool.name == name).unwrap();
-    let output = (tool.run)(args, &mut |_| {});
+    let output = tool.run_plain(args, &mut |_| {});
     output.text.clone()
 }
 

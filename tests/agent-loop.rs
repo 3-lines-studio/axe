@@ -506,10 +506,10 @@ fn new_tool_bad_arguments() {
     let tool = new_tool("bad", "needs int", "{}", |args: NeedsInt| {
         args.n.to_string()
     });
-    let got = (tool.run)(r#"{"n":"x"}"#, &mut |_| {}).text;
+    let got = tool.run_plain(r#"{"n":"x"}"#, &mut |_| {}).text;
     assert!(got.contains("invalid arguments"), "got: {got}");
     assert!(got.contains("Received:"), "got: {got}");
-    assert_eq!((tool.run)(r#"{"n":42}"#, &mut |_| {}).text, "42");
+    assert_eq!(tool.run_plain(r#"{"n":42}"#, &mut |_| {}).text, "42");
 }
 
 #[derive(Deserialize)]
@@ -530,19 +530,23 @@ fn new_tool_coerces_argument_types() {
         |args: NeedsFields| format!("{} {} {} {:?}", args.n, args.b, args.s, args.o),
     );
     assert_eq!(
-        (tool.run)(r#"{"n":"7","b":1,"s":42}"#, &mut |_| {}).text,
+        tool.run_plain(r#"{"n":"7","b":1,"s":42}"#, &mut |_| {})
+            .text,
         "7 true 42 None"
     );
     assert_eq!(
-        (tool.run)(r#"{"n":true,"b":"false","s":null}"#, &mut |_| {}).text,
+        tool.run_plain(r#"{"n":true,"b":"false","s":null}"#, &mut |_| {})
+            .text,
         "1 false  None"
     );
     assert_eq!(
-        (tool.run)(r#"{"n":null,"b":0,"s":"x","o":null}"#, &mut |_| {}).text,
+        tool.run_plain(r#"{"n":null,"b":0,"s":"x","o":null}"#, &mut |_| {})
+            .text,
         "0 false x None"
     );
     assert_eq!(
-        (tool.run)(r#"{"n":7.9,"b":1,"s":"x"}"#, &mut |_| {}).text,
+        tool.run_plain(r#"{"n":7.9,"b":1,"s":"x"}"#, &mut |_| {})
+            .text,
         "7 true x None"
     );
 }

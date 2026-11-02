@@ -478,7 +478,7 @@ mod tests {
     }
 
     fn run(tool: &Tool, args: &str) -> String {
-        (tool.run)(args, &mut |_| {}).text
+        tool.run_plain(args, &mut |_| {}).text
     }
 
     fn body_of(request: &str) -> &str {
