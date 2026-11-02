@@ -323,6 +323,7 @@ fn run_request(
             input: parsed.usage.prompt_tokens,
             output: parsed.usage.completion_tokens,
             cached_input: parsed.usage.prompt_tokens_details.cached_tokens,
+            reasoning: parsed.usage.completion_tokens_details.reasoning_tokens,
         },
         stop_reason,
     })
@@ -584,6 +585,7 @@ impl StreamAcc {
                 input: self.usage.prompt_tokens,
                 output: self.usage.completion_tokens,
                 cached_input: self.usage.prompt_tokens_details.cached_tokens,
+                reasoning: self.usage.completion_tokens_details.reasoning_tokens,
             },
             stop_reason: StopReason::from(self.finish_reason.clone().unwrap_or_default()),
         }
@@ -713,12 +715,20 @@ struct OaUsage {
     completion_tokens: usize,
     #[serde(default)]
     prompt_tokens_details: OaPromptTokensDetails,
+    #[serde(default)]
+    completion_tokens_details: OaCompletionTokensDetails,
 }
 
 #[derive(Clone, Deserialize, Default)]
 struct OaPromptTokensDetails {
     #[serde(default)]
     cached_tokens: usize,
+}
+
+#[derive(Clone, Deserialize, Default)]
+struct OaCompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: usize,
 }
 
 #[derive(Deserialize)]

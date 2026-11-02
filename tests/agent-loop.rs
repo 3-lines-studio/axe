@@ -270,6 +270,8 @@ fn run_executes_tools_and_returns_transcript() {
                     input: 10,
                     output: 5,
                     cached_input: 0,
+
+                    reasoning: 0,
                 },
                 stop_reason: Default::default(),
             },
@@ -279,6 +281,8 @@ fn run_executes_tools_and_returns_transcript() {
                     input: 20,
                     output: 2,
                     cached_input: 0,
+
+                    reasoning: 0,
                 },
                 stop_reason: Default::default(),
             },
@@ -441,6 +445,8 @@ fn run_end_separates_last_context_usage_from_totals() {
                 input: 10,
                 output: 5,
                 cached_input: 3,
+
+                reasoning: 0,
             },
             stop_reason: "tool_calls".into(),
         },
@@ -450,6 +456,8 @@ fn run_end_separates_last_context_usage_from_totals() {
                 input: 20,
                 output: 8,
                 cached_input: 7,
+
+                reasoning: 0,
             },
             stop_reason: "stop".into(),
         },
@@ -482,6 +490,8 @@ fn run_end_separates_last_context_usage_from_totals() {
             input: 30,
             output: 13,
             cached_input: 10,
+
+            reasoning: 0,
         },
         "run totals accumulate across turns"
     );
@@ -491,6 +501,8 @@ fn run_end_separates_last_context_usage_from_totals() {
             input: 20,
             output: 8,
             cached_input: 7,
+
+            reasoning: 0,
         },
         "context is the last request, not the sum"
     );
@@ -842,6 +854,8 @@ fn run_compact_outcome_leaves_transcript() {
                     input: 20,
                     output: 2,
                     cached_input: 0,
+
+                    reasoning: 0,
                 },
                 stop_reason: Default::default(),
             },
@@ -1103,6 +1117,8 @@ fn run_compacts_after_complete_tool_batch() {
                 input: 249_900,
                 output: 200,
                 cached_input: 0,
+
+                reasoning: 0,
             },
             stop_reason: Default::default(),
         }])),
@@ -1166,6 +1182,8 @@ fn the_observer_sees_streamed_and_completed_events() {
                 input: 3,
                 output: 2,
                 cached_input: 0,
+
+                reasoning: 0,
             },
             stop_reason: Default::default(),
         }])),

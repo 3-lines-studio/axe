@@ -634,6 +634,7 @@ fn session_compaction_roundtrip() {
         input: 120,
         output: 8,
         cached_input: 80,
+        reasoning: 3,
         context_input: 100,
         context_output: 8,
         points: Vec::new(),

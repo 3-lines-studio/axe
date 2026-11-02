@@ -30,12 +30,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct TuiConfig {
     pub base: String,
     pub model: String,
+    pub spec: crate::ModelSpec,
     pub system: String,
     pub dir: String,
     pub store: Arc<dyn Store>,
     pub api_key: String,
     pub resume: Option<String>,
-    pub context_window: Option<usize>,
 }
 
 enum Entry {
@@ -389,7 +389,7 @@ impl App {
             "press ctrl+c again to exit".to_string()
         } else {
             let mut parts = vec![self.cfg.model.clone()];
-            if let Some(window) = self.cfg.context_window
+            if let Some(window) = self.cfg.spec.context_window
                 && window > 0
             {
                 let percent = self.input_tokens.saturating_mul(100) / window;
@@ -1467,6 +1467,7 @@ impl App {
         let tools = self.tools();
         let threshold = self
             .cfg
+            .spec
             .context_window
             .map(|window| window.saturating_sub(16384));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -2112,6 +2113,7 @@ impl Observer for RatatuiObserver<'_> {
                     input,
                     output,
                     cached_input,
+                    reasoning: 0,
                 }));
             }
             AgentEvent::AssistantDone | AgentEvent::Assistant { .. } | AgentEvent::Tool { .. } => {}

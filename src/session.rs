@@ -43,6 +43,7 @@ pub struct SessionState {
     pub input: usize,
     pub output: usize,
     pub cached_input: usize,
+    pub reasoning: usize,
     pub context_input: usize,
     pub context_output: usize,
     #[serde(default)]
@@ -54,6 +55,7 @@ impl SessionState {
         self.input = self.input.saturating_add(usage.input);
         self.output = self.output.saturating_add(usage.output);
         self.cached_input = self.cached_input.saturating_add(usage.cached_input);
+        self.reasoning = self.reasoning.saturating_add(usage.reasoning);
         self.context_input = context.input;
         self.context_output = context.output;
     }

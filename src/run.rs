@@ -283,6 +283,7 @@ fn run_inner<P: Provider>(
             input: usage.input + resp.usage.input,
             output: usage.output + resp.usage.output,
             cached_input: usage.cached_input + resp.usage.cached_input,
+            reasoning: usage.reasoning + resp.usage.reasoning,
         };
         context_usage = resp.usage;
         h.push(resp.message);

@@ -204,11 +204,59 @@ pub struct Message {
     pub images: Vec<Image>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelSpec {
+    pub id: String,
+    pub context_window: Option<usize>,
+    pub max_output: Option<usize>,
+    pub tools: bool,
+    pub images: bool,
+    pub reasoning: bool,
+    pub input_micros_per_million: Option<u64>,
+    pub output_micros_per_million: Option<u64>,
+}
+
+impl ModelSpec {
+    pub fn for_model(model: &str) -> Self {
+        match model {
+            "deepseek-flash" | "deepseek-v4-pro" => Self {
+                id: model.to_string(),
+                context_window: Some(1_000_000),
+                max_output: Some(384_000),
+                tools: true,
+                images: model == "deepseek-flash",
+                reasoning: true,
+                input_micros_per_million: None,
+                output_micros_per_million: None,
+            },
+            _ => Self {
+                id: model.to_string(),
+                context_window: None,
+                max_output: None,
+                tools: true,
+                images: false,
+                reasoning: false,
+                input_micros_per_million: None,
+                output_micros_per_million: None,
+            },
+        }
+    }
+
+    pub fn cost_micros(&self, usage: &Usage) -> Option<u64> {
+        let input = self.input_micros_per_million?;
+        let output = self.output_micros_per_million?;
+        let input_cost = (usage.input as u128 * input as u128) / 1_000_000;
+        let output_cost = ((usage.output + usage.reasoning) as u128 * output as u128) / 1_000_000;
+        Some((input_cost + output_cost) as u64)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input: usize,
     pub output: usize,
     pub cached_input: usize,
+    pub reasoning: usize,
 }
 
 #[derive(Debug)]
@@ -726,6 +774,26 @@ mod tests {
                 .any(|entry| entry.file_name().to_string_lossy().starts_with(".axe-tmp-"))
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn model_specs_describe_deepseek_and_price_a_usage() {
+        let flash = ModelSpec::for_model("deepseek-flash");
+        assert_eq!(flash.context_window, Some(1_000_000));
+        assert!(flash.images && flash.reasoning);
+
+        let spec = ModelSpec {
+            input_micros_per_million: Some(2),
+            output_micros_per_million: Some(4),
+            ..ModelSpec::for_model("deepseek-flash")
+        };
+        let usage = Usage {
+            input: 1_000_000,
+            output: 500_000,
+            cached_input: 0,
+            reasoning: 250_000,
+        };
+        assert_eq!(spec.cost_micros(&usage), Some(5));
     }
 
     #[test]

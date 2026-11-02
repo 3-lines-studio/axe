@@ -4,7 +4,7 @@
 
 use axe::run::{self, AgentEvent, Control, Observer, Outcome, RunOptions};
 use axe::session::{SessionState, Store};
-use axe::{Image, Message, OpenAI, Tool, ToolCall};
+use axe::{Image, Message, ModelSpec, OpenAI, Tool, ToolCall};
 use std::io::{IsTerminal, Read};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -13,6 +13,7 @@ use std::time::Instant;
 struct Config {
     base: String,
     model: String,
+    spec: ModelSpec,
     system: String,
     dir: String,
     resume: Option<String>,
@@ -24,6 +25,7 @@ struct FileConfig {
     model: String,
     base: String,
     context_window: Option<usize>,
+    spec: ModelSpec,
 }
 
 fn main() {
@@ -65,12 +67,12 @@ fn main() {
             let tui_cfg = axe::tui::TuiConfig {
                 base: cfg.base.clone(),
                 model: cfg.model.clone(),
+                spec: cfg.spec.clone(),
                 system: resolve_system(&cfg, &tools),
                 dir: cfg.dir.clone(),
                 store,
                 api_key: key,
                 resume: cfg.resume.clone(),
-                context_window: fc.context_window,
             };
             if let Err(e) = axe::tui::run(tui_cfg) {
                 eprintln!("error: {e}");
@@ -111,6 +113,7 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
         } else {
             fc.model.clone()
         },
+        spec: ModelSpec::for_model("deepseek-flash"),
         system: String::new(),
         dir: String::new(),
         resume: None,
@@ -183,6 +186,10 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
             _ => return Err(format!("flag provided but not defined: {a}")),
         }
         i += 1;
+    }
+    cfg.spec = ModelSpec::for_model(&cfg.model);
+    if let Some(window) = fc.context_window {
+        cfg.spec.context_window = Some(window);
     }
     Ok((cfg, rest))
 }
@@ -332,7 +339,10 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
         output: 0,
     };
     let mut control = CliControl {
-        threshold: fc.context_window.map(|window| window.saturating_sub(16384)),
+        threshold: cfg
+            .spec
+            .context_window
+            .map(|window| window.saturating_sub(16384)),
     };
     let opts = RunOptions {
         model: &cfg.model,
@@ -536,6 +546,7 @@ fn load_config() -> FileConfig {
         model: String::new(),
         base: String::new(),
         context_window: None,
+        spec: ModelSpec::for_model("deepseek-flash"),
     };
     let Some(dir) = axe::config_dir() else {
         return c;
@@ -562,6 +573,14 @@ fn load_config() -> FileConfig {
             "context_window" => c.context_window = val.parse().ok(),
             _ => {}
         }
+    }
+    c.spec = ModelSpec::for_model(if c.model.is_empty() {
+        "deepseek-flash"
+    } else {
+        &c.model
+    });
+    if let Some(window) = c.context_window {
+        c.spec.context_window = Some(window);
     }
     c
 }
@@ -655,6 +674,7 @@ mod tests {
             model: String::new(),
             base: String::new(),
             context_window: None,
+            spec: ModelSpec::for_model("deepseek-flash"),
         }
     }
 
@@ -776,6 +796,7 @@ mod tests {
             model: String::new(),
             base: String::new(),
             context_window: None,
+            spec: ModelSpec::for_model("deepseek-flash"),
         };
         let tokens = [
             "-base",
@@ -846,6 +867,7 @@ mod tests {
         let cfg = Config {
             base: String::new(),
             model: String::new(),
+            spec: ModelSpec::for_model("deepseek-flash"),
             system: String::new(),
             dir: "/tmp/work".into(),
             resume: None,
