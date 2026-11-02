@@ -71,14 +71,16 @@ pub fn run(cfg: TuiConfig) -> Result<(), String> {
     let mut stdout = io::stdout();
     execute!(
         stdout,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    )
-    .map_err(|error| error.to_string())?;
-    execute!(
-        stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste
+    )
+    .map_err(|error| error.to_string())?;
+    // Some terminals (Herdr) reset the Kitty keyboard flags when switching to
+    // the alternate screen, so request them only after entering it.
+    execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )
     .map_err(|error| error.to_string())?;
     let backend = CrosstermBackend::new(stdout);

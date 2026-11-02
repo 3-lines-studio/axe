@@ -916,6 +916,28 @@ def oneshot_reads_image(h, axe):
 
 
 @case
+def tui_shift_enter_inserts_newline(h, axe):
+    """Shift+Enter is a newline, not a submit. Terminals that support the Kitty
+    keyboard protocol send it as a distinct key event; Herdr needs the flag
+    requested after switching to the alternate screen."""
+    with h.mock(ANSWER_SCENARIO) as srv:
+        t = h.tui(axe, base=srv.base_url)
+        try:
+            t.expect("Run /help")
+            t.type("first")
+            t.key("shift_enter")
+            t.type("second")
+            t.send("\r")
+            t.expect("Done")
+            t.type("/quit\r")
+            check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
+        finally:
+            t.close()
+    content = body_msg(srv, 0, "user")[-1]["content"]
+    check(content == "first\nsecond", "shift+enter did not insert a newline: %r" % content)
+
+
+@case
 def tui_image_attach(h, axe):
     """A local image attaches through /image and reaches the provider as a
     content block array rather than a plain string."""
