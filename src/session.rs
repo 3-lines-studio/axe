@@ -1,5 +1,5 @@
 use crate::ids::{EntryId, SessionId};
-use crate::{Message, Provider, Request};
+use crate::{Message, Provider, Request, Usage};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -40,6 +40,41 @@ pub struct Record {
     pub entry: Entry,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPoint {
+    pub index: usize,
+    pub tokens: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionState {
+    pub input: usize,
+    pub output: usize,
+    pub cached_input: usize,
+    pub context_input: usize,
+    pub context_output: usize,
+    #[serde(default)]
+    pub points: Vec<ContextPoint>,
+}
+
+impl SessionState {
+    pub fn record(&mut self, usage: &Usage, context: &Usage) {
+        self.input = self.input.saturating_add(usage.input);
+        self.output = self.output.saturating_add(usage.output);
+        self.cached_input = self.cached_input.saturating_add(usage.cached_input);
+        self.context_input = context.input;
+        self.context_output = context.output;
+    }
+
+    pub fn context_tokens(&self) -> usize {
+        self.context_input.saturating_add(self.context_output)
+    }
+
+    pub fn point(&mut self, index: usize, tokens: usize) {
+        self.points.push(ContextPoint { index, tokens });
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionMeta {
     pub id: String,
@@ -70,6 +105,27 @@ pub trait Store: Send + Sync {
     fn resume_id(&self) -> Option<String>;
     fn set_resume_id(&self, id: &str);
     fn clear_resume_id(&self);
+
+    fn state(&self) -> SessionState {
+        SessionState::default()
+    }
+
+    fn append_with_state(&self, entries: &[Entry], _state: SessionState) -> std::io::Result<()> {
+        self.append(entries)
+    }
+
+    fn save_with_state(&self, entries: &[Entry], _state: SessionState) -> std::io::Result<()> {
+        self.save(entries)
+    }
+
+    fn continue_archived_with_state(
+        &self,
+        id: &str,
+        entries: &[Entry],
+        _state: SessionState,
+    ) -> std::io::Result<bool> {
+        self.continue_archived(id, entries)
+    }
 }
 
 fn store_dir(dir: &str) -> PathBuf {
@@ -939,6 +995,61 @@ fn split_retained(entries: &[Entry], options: ContextOptions) -> (Vec<Message>, 
     (retained, summarized)
 }
 
+fn after_reset_start(entries: &[Entry]) -> usize {
+    entries
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::Reset))
+        .map(|at| at + 1)
+        .unwrap_or(0)
+}
+
+fn split_retained_state(
+    entries: &[Entry],
+    options: ContextOptions,
+    state: &SessionState,
+) -> (Vec<Message>, Vec<Message>) {
+    let start = after_reset_start(entries);
+    let entries = &entries[start..];
+    let msgs = context_messages_with(entries, options);
+    let current_tokens = state.context_tokens();
+    if current_tokens == 0 {
+        return split_last_turn(msgs);
+    }
+    let mut points = BTreeMap::new();
+    for point in &state.points {
+        if point.index >= start {
+            points.insert(point.index - start, point.tokens);
+        }
+    }
+    let mut message_count = msgs.len();
+    let mut retained_start = message_count;
+    let active_start = entries
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::Compaction { .. }))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    for (index, entry) in entries.iter().enumerate().rev() {
+        if index < active_start {
+            break;
+        }
+        if let Entry::Message { .. } = entry {
+            message_count = message_count.saturating_sub(1);
+        }
+        if let Some(tokens) = points.get(&index) {
+            if current_tokens.saturating_sub(*tokens) > RETAIN_TOKENS {
+                break;
+            }
+            retained_start = message_count;
+        }
+    }
+    if retained_start == msgs.len() {
+        return split_last_turn(msgs);
+    }
+    let mut summarized = msgs;
+    let retained = summarized.split_off(retained_start);
+    (retained, summarized)
+}
+
 fn split_last_turn(mut msgs: Vec<Message>) -> (Vec<Message>, Vec<Message>) {
     let start = msgs
         .iter()
@@ -1139,6 +1250,45 @@ pub fn compact_with(
 ) -> Result<(String, usize, Vec<Message>), String> {
     let tokens_before = latest_context_tokens(entries).unwrap_or(0);
     let (mut retained, to_summarize) = split_retained(entries, options);
+    drop_incomplete_tool_calls(&mut retained);
+    if to_summarize.is_empty() {
+        return Err("nothing to summarize".into());
+    }
+    let conversation = serialize_conversation(&to_summarize);
+    let first = request_summary(provider, model, &conversation, None).unwrap_or_default();
+    let summary = if valid_summary(&first) {
+        first
+    } else {
+        let second = request_summary(
+            provider,
+            model,
+            &conversation,
+            Some(
+                "Your previous response was invalid. Return all required headings and substantive factual content.",
+            ),
+        )
+        .unwrap_or_default();
+        if valid_summary(&second) {
+            second
+        } else {
+            fallback_summary(
+                &to_summarize,
+                if second.is_empty() { &first } else { &second },
+            )
+        }
+    };
+    Ok((summary, tokens_before, retained))
+}
+
+pub fn compact_with_state(
+    provider: &impl Provider,
+    model: &str,
+    entries: &[Entry],
+    state: &SessionState,
+    options: ContextOptions,
+) -> Result<(String, usize, Vec<Message>), String> {
+    let tokens_before = state.context_tokens();
+    let (mut retained, to_summarize) = split_retained_state(entries, options, state);
     drop_incomplete_tool_calls(&mut retained);
     if to_summarize.is_empty() {
         return Err("nothing to summarize".into());

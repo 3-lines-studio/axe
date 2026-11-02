@@ -1,6 +1,6 @@
 use crate::durable::Journal;
 use crate::ids::SessionId;
-use crate::session::{self, Entry, SessionMeta, Store};
+use crate::session::{self, Entry, SessionMeta, SessionState, Store};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -103,8 +103,7 @@ impl Store for JournalStore {
     }
 
     fn save(&self, entries: &[Entry]) -> std::io::Result<()> {
-        let id = self.current_id();
-        self.with_journal(|journal| journal.replace_session(&id, entries.to_vec()))
+        self.save_with_state(entries, SessionState::default())
     }
 
     fn append(&self, entries: &[Entry]) -> std::io::Result<()> {
@@ -116,6 +115,37 @@ impl Store for JournalStore {
         })
     }
 
+    fn state(&self) -> SessionState {
+        let id = self.current_id();
+        if let Some(journal) = self
+            .journal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            return journal.state(&id);
+        }
+        Journal::load_state(&self.dir, &id).unwrap_or_default()
+    }
+
+    fn append_with_state(&self, entries: &[Entry], mut state: SessionState) -> std::io::Result<()> {
+        let id = self.current_id();
+        if !entries.is_empty() {
+            let index = self.live().len() + entries.len() - 1;
+            state.point(index, state.context_tokens());
+        }
+        self.with_journal(|journal| {
+            journal
+                .commit_session_with_state(&id, entries.to_vec(), Vec::new(), Some(state))
+                .map(|_| ())
+        })
+    }
+
+    fn save_with_state(&self, entries: &[Entry], state: SessionState) -> std::io::Result<()> {
+        let id = self.current_id();
+        self.with_journal(|journal| journal.replace_session(&id, entries.to_vec(), state))
+    }
+
     fn archive(&self) -> Option<String> {
         let old = self.current_id();
         self.write_current();
@@ -123,10 +153,19 @@ impl Store for JournalStore {
     }
 
     fn continue_archived(&self, id: &str, entries: &[Entry]) -> std::io::Result<bool> {
+        self.continue_archived_with_state(id, entries, SessionState::default())
+    }
+
+    fn continue_archived_with_state(
+        &self,
+        id: &str,
+        entries: &[Entry],
+        state: SessionState,
+    ) -> std::io::Result<bool> {
         let Some(id) = SessionId::new(id) else {
             return Ok(false);
         };
-        self.with_journal(|journal| journal.replace_session(&id, entries.to_vec()))?;
+        self.with_journal(|journal| journal.replace_session(&id, entries.to_vec(), state))?;
         Ok(true)
     }
 
@@ -140,7 +179,9 @@ impl Store for JournalStore {
 
     fn discard(&self) {
         let id = self.current_id();
-        let _ = self.with_journal(|journal| journal.replace_session(&id, Vec::new()));
+        let _ = self.with_journal(|journal| {
+            journal.replace_session(&id, Vec::new(), SessionState::default())
+        });
         self.write_current();
     }
 

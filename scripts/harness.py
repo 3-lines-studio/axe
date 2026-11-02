@@ -363,6 +363,23 @@ class Harness:
             entries = [entry for entry in entries if entry.get("session") == sid]
         return entries
 
+    def session_state(self, sid=None):
+        root = self.session_root()
+        states = {}
+        path = root / "state.json"
+        if path.exists():
+            for item in json.loads(path.read_text()).get("states", []):
+                states[item["session"]] = item.get("state", {})
+        journal = root / "journal.jsonl"
+        if journal.exists():
+            for line in journal.read_text().splitlines():
+                if line.strip():
+                    for item in json.loads(line).get("states", []):
+                        states[item["session"]] = item.get("state", {})
+        if sid is not None:
+            return states.get(sid, {})
+        return states
+
     def seed_session_msgs(self, sid, title, msgs):
         root = self.session_root()
         root.mkdir(parents=True, exist_ok=True)
@@ -961,22 +978,22 @@ def usage_persisted(h, axe):
             check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
         finally:
             t.close()
-    usage = [e["entry"] for e in h.state_entries() if e["entry"].get("type") == "usage"]
-    check(len(usage) == 1, "tui: expected 1 usage entry, got %d" % len(usage))
-    check(usage[0]["input"] == 30, "tui: billed input: %s" % usage[0])
-    check(usage[0]["output"] == 13, "tui: billed output: %s" % usage[0])
-    check(usage[0]["context_input"] == 20, "tui: context_input: %s" % usage[0])
-    check(usage[0]["context_output"] == 8, "tui: context_output: %s" % usage[0])
+    states = [state for state in h.session_state().values() if state.get("input")]
+    check(len(states) == 1, "tui: expected 1 usage state, got %d" % len(states))
+    usage = states[0]
+    check(usage["input"] == 30, "tui: billed input: %s" % usage)
+    check(usage["output"] == 13, "tui: billed output: %s" % usage)
+    check(usage["context_input"] == 20, "tui: context_input: %s" % usage)
+    check(usage["context_output"] == 8, "tui: context_output: %s" % usage)
 
     h.seed_session("111", "old", "prior work")
     with h.mock(ANSWER_SCENARIO) as srv:
         p = h.oneshot(axe, ["--resume", "111", "continue"], base=srv.base_url)
         check(p.returncode == 0, "exit %s: %s" % (p.returncode, p.stderr[-500:]))
-    usage = [e["entry"] for e in h.state_entries("111") if e["entry"].get("type") == "usage"]
-    check(len(usage) == 1, "oneshot: expected 1 usage entry, got %d" % len(usage))
-    check(usage[0]["input"] == 20, "oneshot: billed input: %s" % usage[0])
-    check(usage[0]["context_input"] == 20, "oneshot: context_input: %s" % usage[0])
-    check(usage[0]["context_output"] == 8, "oneshot: context_output: %s" % usage[0])
+    usage = h.session_state("111")
+    check(usage.get("input") == 20, "oneshot: billed input: %s" % usage)
+    check(usage.get("context_input") == 20, "oneshot: context_input: %s" % usage)
+    check(usage.get("context_output") == 8, "oneshot: context_output: %s" % usage)
 
 
 @case

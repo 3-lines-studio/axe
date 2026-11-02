@@ -1,5 +1,5 @@
 use crate::ids::{EntryId, Seq, SessionId, TaskId};
-use crate::session::{self, Entry, Record};
+use crate::session::{self, Entry, Record, SessionState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -38,6 +38,13 @@ pub struct TaskRecord {
     pub updated: i64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StateRecord {
+    session: SessionId,
+    #[serde(default)]
+    state: SessionState,
+}
+
 #[derive(Deserialize)]
 struct Snapshot {
     version: u32,
@@ -48,6 +55,8 @@ struct Snapshot {
     entries: Vec<Record>,
     #[serde(default)]
     tasks: Vec<TaskRecord>,
+    #[serde(default)]
+    states: Vec<StateRecord>,
 }
 
 #[derive(Serialize)]
@@ -58,6 +67,7 @@ struct SnapshotOut<'a> {
     next_task: TaskId,
     entries: &'a [Record],
     tasks: &'a [TaskRecord],
+    states: Vec<StateRecord>,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +76,8 @@ struct Commit {
     entries: Vec<Record>,
     #[serde(default)]
     tasks: Vec<TaskRecord>,
+    #[serde(default)]
+    states: Vec<StateRecord>,
 }
 
 #[derive(Serialize)]
@@ -74,6 +86,7 @@ struct Line<'a> {
     at: i64,
     entries: &'a [Record],
     tasks: &'a [TaskRecord],
+    states: Vec<StateRecord>,
 }
 
 pub struct Journal {
@@ -86,6 +99,7 @@ pub struct Journal {
     bytes: u64,
     entries: Vec<Record>,
     tasks: BTreeMap<TaskId, TaskRecord>,
+    states: BTreeMap<SessionId, SessionState>,
 }
 
 impl Journal {
@@ -98,6 +112,7 @@ impl Journal {
         let mut next_task = TaskId(0);
         let mut entries = Vec::new();
         let mut tasks = BTreeMap::new();
+        let mut states = BTreeMap::new();
         if let Some(snapshot) = read_snapshot(dir)? {
             if snapshot.version != VERSION {
                 return Err(invalid(format!(
@@ -112,6 +127,9 @@ impl Journal {
             for task in snapshot.tasks {
                 next_task = next_task.max(task.id.next());
                 tasks.insert(task.id, task);
+            }
+            for state in snapshot.states {
+                states.insert(state.session, state.state);
             }
         }
 
@@ -149,6 +167,9 @@ impl Journal {
                 next_task = next_task.max(task.id.next());
                 tasks.insert(task.id, task);
             }
+            for state in commit.states {
+                states.insert(state.session, state.state);
+            }
         }
 
         Ok(Self {
@@ -161,6 +182,7 @@ impl Journal {
             bytes,
             entries,
             tasks,
+            states,
         })
     }
 
@@ -194,6 +216,7 @@ impl Journal {
             next_task: TaskId(0),
             entries: &records,
             tasks: &[],
+            states: Vec::new(),
         };
         let bytes = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
         crate::atomic_write(&dir.join(STATE), &bytes)
@@ -205,6 +228,10 @@ impl Journal {
 
     pub fn load_tasks(dir: &Path) -> std::io::Result<Vec<TaskRecord>> {
         Ok(read(dir)?.1)
+    }
+
+    pub fn load_state(dir: &Path, session: &SessionId) -> std::io::Result<SessionState> {
+        Ok(read(dir)?.2.get(session).cloned().unwrap_or_default())
     }
 
     pub fn dir(&self) -> &Path {
@@ -237,7 +264,17 @@ impl Journal {
         entries: Vec<Entry>,
         tasks: Vec<TaskRecord>,
     ) -> std::io::Result<Seq> {
-        if entries.is_empty() && tasks.is_empty() {
+        self.commit_session_with_state(session, entries, tasks, None)
+    }
+
+    pub fn commit_session_with_state(
+        &mut self,
+        session: &SessionId,
+        entries: Vec<Entry>,
+        tasks: Vec<TaskRecord>,
+        state: Option<SessionState>,
+    ) -> std::io::Result<Seq> {
+        if entries.is_empty() && tasks.is_empty() && state.is_none() {
             return Ok(self.seq);
         }
         let at = session::now_ms();
@@ -257,11 +294,21 @@ impl Journal {
             id = id.next();
         }
         let seq = self.seq.next();
+        let states = state
+            .as_ref()
+            .map(|state| {
+                vec![StateRecord {
+                    session: session.clone(),
+                    state: state.clone(),
+                }]
+            })
+            .unwrap_or_default();
         let mut line = serde_json::to_vec(&Line {
             seq,
             at,
             entries: &records,
             tasks: &tasks,
+            states: states.clone(),
         })
         .map_err(std::io::Error::other)?;
         line.push(b'\n');
@@ -284,6 +331,9 @@ impl Journal {
             self.next_task = self.next_task.max(task.id.next());
             self.tasks.insert(task.id, task);
         }
+        if let Some(state) = state {
+            self.states.insert(session.clone(), state);
+        }
         Ok(seq)
     }
 
@@ -291,6 +341,7 @@ impl Journal {
         &mut self,
         session: &SessionId,
         entries: Vec<Entry>,
+        state: SessionState,
     ) -> std::io::Result<()> {
         let mut kept: Vec<Record> = self
             .entries
@@ -310,11 +361,23 @@ impl Journal {
             id = id.next();
         }
         let seq = self.seq.next();
-        self.write_state_at(&kept, seq, id)?;
+        let previous = self.states.insert(session.clone(), state);
+        if let Err(error) = self.write_state_at(&kept, seq, id) {
+            if let Some(previous) = previous {
+                self.states.insert(session.clone(), previous);
+            } else {
+                self.states.remove(session);
+            }
+            return Err(error);
+        }
         self.entries = kept;
         self.seq = seq;
         self.next_id = id;
         self.truncate_journal()
+    }
+
+    pub fn state(&self, session: &SessionId) -> SessionState {
+        self.states.get(session).cloned().unwrap_or_default()
     }
 
     pub fn records_for<'a>(
@@ -397,6 +460,14 @@ impl Journal {
         next_id: EntryId,
     ) -> std::io::Result<()> {
         let tasks: Vec<TaskRecord> = self.tasks.values().cloned().collect();
+        let states: Vec<StateRecord> = self
+            .states
+            .iter()
+            .map(|(session, state)| StateRecord {
+                session: session.clone(),
+                state: state.clone(),
+            })
+            .collect();
         let snapshot = SnapshotOut {
             version: VERSION,
             seq,
@@ -404,6 +475,7 @@ impl Journal {
             next_task: self.next_task,
             entries,
             tasks: &tasks,
+            states,
         };
         let bytes = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
         crate::atomic_write(&self.dir.join(STATE), &bytes)
@@ -440,10 +512,17 @@ fn lock_dir(dir: &Path) -> std::io::Result<File> {
     Ok(lease)
 }
 
-fn read(dir: &Path) -> std::io::Result<(Vec<Record>, Vec<TaskRecord>)> {
+type Loaded = (
+    Vec<Record>,
+    Vec<TaskRecord>,
+    BTreeMap<SessionId, SessionState>,
+);
+
+fn read(dir: &Path) -> std::io::Result<Loaded> {
     let mut seq = Seq(0);
     let mut records = Vec::new();
     let mut tasks = BTreeMap::new();
+    let mut states = BTreeMap::new();
     if let Some(snapshot) = read_snapshot(dir)? {
         if snapshot.version != VERSION {
             return Err(invalid(format!(
@@ -456,11 +535,14 @@ fn read(dir: &Path) -> std::io::Result<(Vec<Record>, Vec<TaskRecord>)> {
         for task in snapshot.tasks {
             tasks.insert(task.id, task);
         }
+        for state in snapshot.states {
+            states.insert(state.session, state.state);
+        }
     }
     let raw = match std::fs::read(dir.join(JOURNAL)) {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((records, tasks.into_values().collect()));
+            return Ok((records, tasks.into_values().collect(), states));
         }
         Err(error) => return Err(error),
     };
@@ -481,8 +563,11 @@ fn read(dir: &Path) -> std::io::Result<(Vec<Record>, Vec<TaskRecord>)> {
         for task in commit.tasks {
             tasks.insert(task.id, task);
         }
+        for state in commit.states {
+            states.insert(state.session, state.state);
+        }
     }
-    Ok((records, tasks.into_values().collect()))
+    Ok((records, tasks.into_values().collect(), states))
 }
 
 fn read_snapshot(dir: &Path) -> std::io::Result<Option<Snapshot>> {

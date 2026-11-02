@@ -1,7 +1,7 @@
 use crate::app;
 use crate::openai::OpenAI;
 use crate::run::{self, AgentEvent, Control, Observer, Outcome, RunOptions};
-use crate::session::{self, Store};
+use crate::session::{self, SessionState, Store};
 use crate::{Image, Message, Usage};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -104,6 +104,7 @@ struct App {
     output_tokens: usize,
     session_input: usize,
     session_output: usize,
+    session_state: SessionState,
     turn_started: Instant,
     tool_running: Option<String>,
     tool_live: Option<String>,
@@ -197,6 +198,7 @@ fn run_app(
         output_tokens: 0,
         session_input: 0,
         session_output: 0,
+        session_state: SessionState::default(),
         turn_started: Instant::now(),
         tool_running: None,
         tool_live: None,
@@ -612,13 +614,17 @@ impl App {
             .collect::<Vec<_>>();
         self.messages = session::context_messages(&entries);
         session::drop_incomplete_tool_calls(&mut self.messages);
-        let usage = app::session_usage(&entries);
-        self.input_tokens = usage.context_input;
-        self.output_tokens = 0;
-        self.session_input = usage.input;
-        self.session_output = usage.output;
+        self.session_state = self.cfg.store.state();
+        self.input_tokens = self.session_state.context_input;
+        self.output_tokens = self.session_state.context_output;
+        self.session_input = self.session_state.input;
+        self.session_output = self.session_state.output;
         self.rebuild_transcript_from(&transcript);
-        if let Err(error) = self.cfg.store.save(&entries) {
+        if let Err(error) = self
+            .cfg
+            .store
+            .save_with_state(&entries, self.session_state.clone())
+        {
             self.entries
                 .push(Entry::Notice(format!("error: save session: {error}")));
         }
@@ -1378,6 +1384,7 @@ impl App {
         self.output_tokens = 0;
         self.session_input = 0;
         self.session_output = 0;
+        self.session_state = SessionState::default();
         self.history.clear();
         self.history_index = None;
         self.follow = true;
@@ -1385,7 +1392,11 @@ impl App {
 
     fn rewind_to(&mut self, index: usize) {
         let entries = app::rewind_entries(&self.messages, index);
-        if let Err(error) = self.cfg.store.save(&entries) {
+        if let Err(error) = self
+            .cfg
+            .store
+            .save_with_state(&entries, SessionState::default())
+        {
             self.entries
                 .push(Entry::Notice(format!("error: save session: {error}")));
             return;
@@ -1395,6 +1406,7 @@ impl App {
         self.output_tokens = 0;
         self.session_input = 0;
         self.session_output = 0;
+        self.session_state = SessionState::default();
         self.rebuild_transcript();
         self.entries.push(Entry::Notice(format!(
             "rewound · {} messages remaining",
@@ -1429,14 +1441,20 @@ impl App {
         let provider = self.provider();
         let model = self.cfg.model.clone();
         let entries = self.cfg.store.live();
+        let state = self.cfg.store.state();
         let (sender, receiver) = mpsc::channel();
         self.events = Some(receiver);
         self.compacting = true;
         self.turn_started = Instant::now();
         std::thread::spawn(move || {
-            let result = session::compact(&provider, &model, &entries).map(
-                |(summary, tokens_before, retained)| (summary, tokens_before, retained, entries),
-            );
+            let result = session::compact_with_state(
+                &provider,
+                &model,
+                &entries,
+                &state,
+                session::ContextOptions::default(),
+            )
+            .map(|(summary, tokens_before, retained)| (summary, tokens_before, retained, entries));
             let _ = sender.send(TurnEvent::Compacted(result));
         });
     }
@@ -1574,27 +1592,23 @@ impl App {
                     error,
                     compact,
                 } => {
-                    let mut entries: Vec<_> = messages[self.messages.len()..]
+                    let entries: Vec<_> = messages[self.messages.len()..]
                         .iter()
                         .cloned()
                         .map(|message| session::Entry::Message { message })
                         .collect();
-                    if usage.input > 0 || usage.output > 0 {
-                        entries.push(session::Entry::Usage {
-                            input: usage.input,
-                            output: usage.output,
-                            cached_input: context.cached_input,
-                            context_input: context.input,
-                            context_output: context.output,
-                        });
-                    }
-                    if let Err(error) = self.cfg.store.append(&entries) {
+                    let mut state = self.session_state.clone();
+                    state.record(&usage, &context);
+                    if let Err(error) = self.cfg.store.append_with_state(&entries, state.clone()) {
                         self.entries
                             .push(Entry::Notice(format!("error: save session: {error}")));
                     }
                     self.messages = messages;
-                    self.session_input += usage.input;
-                    self.session_output += usage.output;
+                    self.session_state = state;
+                    self.session_input = self.session_state.input;
+                    self.session_output = self.session_state.output;
+                    self.input_tokens = self.session_state.context_input;
+                    self.output_tokens = self.session_state.context_output;
                     self.running = false;
                     self.steer = None;
                     compact_after = compact

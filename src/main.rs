@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use axe::run::{self, AgentEvent, Control, Observer, Outcome, RunOptions};
-use axe::session::Store;
+use axe::session::{SessionState, Store};
 use axe::{Image, Message, OpenAI, Tool, ToolCall};
 use std::io::{IsTerminal, Read};
 use std::sync::Arc;
@@ -254,21 +254,25 @@ fn persist_oneshot(
     store: &dyn axe::session::Store,
     resume_id: Option<&str>,
     entries: &[axe::session::Entry],
+    state: &SessionState,
 ) -> std::io::Result<()> {
     let Some(id) = resume_id else {
         return Ok(());
     };
-    store.continue_archived(id, entries).map(|_| ())
+    store
+        .continue_archived_with_state(id, entries, state.clone())
+        .map(|_| ())
 }
 
 fn fail_oneshot(
     store: &dyn axe::session::Store,
     resume_id: Option<&str>,
     entries: &[axe::session::Entry],
+    state: &SessionState,
     msg: String,
 ) -> ! {
     eprintln!("{msg}");
-    if let Err(e) = persist_oneshot(store, resume_id, entries) {
+    if let Err(e) = persist_oneshot(store, resume_id, entries, state) {
         eprintln!("error: save session: {e}");
     }
     std::process::exit(1);
@@ -283,6 +287,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     let mut resume_id = None;
     let mut history = Vec::new();
     let mut session_entries = Vec::new();
+    let mut session_state = SessionState::default();
     if let Some(id) = &cfg.resume {
         store.archive();
         let loaded = if id == "last" {
@@ -297,6 +302,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
         match loaded {
             Some((id, entries)) => {
                 resume_id = Some(id);
+                session_state = store.state();
                 history = axe::session::context_messages(&entries);
                 axe::session::drop_incomplete_tool_calls(&mut history);
                 session_entries = entries;
@@ -352,15 +358,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
                 .cloned()
                 .map(|message| axe::session::Entry::Message { message }),
         );
-        if end.usage.input > 0 || end.usage.output > 0 {
-            session_entries.push(axe::session::Entry::Usage {
-                input: end.usage.input,
-                output: end.usage.output,
-                cached_input: end.context.cached_input,
-                context_input: end.context.input,
-                context_output: end.context.output,
-            });
-        }
+        session_state.record(&end.usage, &end.context);
         match end.outcome {
             Outcome::Failed(error) => {
                 if !overflow_retried && axe::session::is_overflow_error(&error) {
@@ -372,6 +370,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
                         &store,
                         resume_id.as_deref(),
                         &mut session_entries,
+                        &session_state,
                     );
                     continue;
                 }
@@ -379,6 +378,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
                     &store,
                     resume_id.as_deref(),
                     &session_entries,
+                    &session_state,
                     format!("error: {error}"),
                 );
             }
@@ -389,6 +389,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
                     &store,
                     resume_id.as_deref(),
                     &mut session_entries,
+                    &session_state,
                 );
                 continue;
             }
@@ -397,6 +398,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
                     &store,
                     resume_id.as_deref(),
                     &session_entries,
+                    &session_state,
                     "error: interrupted".into(),
                 );
             }
@@ -405,6 +407,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
                     &store,
                     resume_id.as_deref(),
                     &session_entries,
+                    &session_state,
                     "error: stopped: max turns reached".into(),
                 );
             }
@@ -414,7 +417,12 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
             }
         }
     }
-    if let Err(e) = persist_oneshot(&store, resume_id.as_deref(), &session_entries) {
+    if let Err(e) = persist_oneshot(
+        &store,
+        resume_id.as_deref(),
+        &session_entries,
+        &session_state,
+    ) {
         eprintln!("error: save session: {e}");
         std::process::exit(1);
     }
@@ -439,8 +447,15 @@ fn compact_or_fail(
     store: &dyn axe::session::Store,
     resume_id: Option<&str>,
     entries: &mut Vec<axe::session::Entry>,
+    state: &SessionState,
 ) -> Vec<Message> {
-    match axe::session::compact(provider, model, entries) {
+    match axe::session::compact_with_state(
+        provider,
+        model,
+        entries,
+        state,
+        axe::session::ContextOptions::default(),
+    ) {
         Ok((summary, tokens_before, retained)) => {
             entries.push(axe::session::Entry::Compaction {
                 summary,
@@ -456,6 +471,7 @@ fn compact_or_fail(
             store,
             resume_id,
             entries,
+            state,
             format!("error: compaction failed: {e}"),
         ),
     }
