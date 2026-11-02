@@ -1,7 +1,19 @@
 use super::Entry;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
+use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
+
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
+
+pub(super) fn spinner_frame(elapsed: Duration) -> usize {
+    (elapsed.as_millis() / SPINNER_INTERVAL.as_millis()) as usize % SPINNER_FRAMES.len()
+}
+
+pub(super) fn spinner_glyph(frame: usize) -> &'static str {
+    SPINNER_FRAMES[frame]
+}
 
 pub(super) fn assistant_entry(source: String, width: usize) -> Entry {
     let rendered = render_markdown(&source, width);
@@ -29,7 +41,8 @@ pub(super) fn render_markdown_with(
     force: bool,
 ) -> Vec<Line<'static>> {
     let markdown = mobile_tables(markdown, width, force);
-    tui_markdown::from_str(&markdown)
+    let palette = super::theme::palette();
+    super::theme::markdown(&markdown)
         .lines
         .into_iter()
         .map(|line| {
@@ -40,9 +53,9 @@ pub(super) fn render_markdown_with(
                     let style = if span.style.fg.is_some() {
                         span.style
                     } else if span.style.add_modifier.contains(Modifier::BOLD) {
-                        span.style.fg(Color::Cyan)
+                        span.style.fg(palette.strong)
                     } else if span.style.add_modifier.contains(Modifier::ITALIC) {
-                        span.style.fg(Color::Magenta)
+                        span.style.fg(palette.secondary)
                     } else {
                         span.style
                     };

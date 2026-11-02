@@ -1,6 +1,7 @@
 use super::App;
 use super::render::{assistant_entry, byte_at_column, dropped_image_path};
 use super::runtime::TurnEvent;
+use super::status::{self, State};
 use crate::app;
 use crate::session;
 
@@ -209,7 +210,29 @@ impl App {
         }
         match key.code {
             KeyCode::Enter => self.submit(),
+            // Herdr turns ctrl+left and ctrl+right into readline's alt+b and
+            // alt+f before the app sees them.
+            KeyCode::Char('b' | 'B') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.move_word_left()
+            }
+            KeyCode::Char('f' | 'F') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.move_word_right()
+            }
             KeyCode::Char(character) => self.insert(character),
+            KeyCode::Backspace
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.delete_word_left()
+            }
+            KeyCode::Delete
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.delete_word_right()
+            }
             KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => self.delete(),
             KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => self.move_word_left(),
@@ -469,6 +492,14 @@ impl App {
         self.input.drain(self.cursor..end);
     }
 
+    pub(super) fn delete_word_right(&mut self) {
+        let start = self.cursor;
+        self.move_word_right();
+        let end = self.cursor;
+        self.input.drain(start..end);
+        self.cursor = start;
+    }
+
     pub(super) fn move_line_up(&mut self) {
         let start = self.line_start();
         if start == 0 {
@@ -521,6 +552,7 @@ impl App {
         let mut changed = false;
         let mut compact_after = false;
         let mut turn_after = false;
+        let mut failed = false;
         while let Ok(event) = receiver.try_recv() {
             changed = true;
             match event {
@@ -624,6 +656,7 @@ impl App {
                         self.retry_after_compact = true;
                         self.overflow_retried = true;
                     } else if let Some(error) = error {
+                        failed = true;
                         self.entries.push(Entry::Notice(format!("error: {error}")));
                     }
                     if rewinding {
@@ -639,6 +672,10 @@ impl App {
             self.start_turn();
         } else if self.running || self.compacting {
             self.events = Some(receiver);
+        } else if failed {
+            status::report(State::Error);
+        } else {
+            status::report(State::Idle);
         }
         changed
     }

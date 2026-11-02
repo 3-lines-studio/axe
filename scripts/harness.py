@@ -472,6 +472,9 @@ KEYS = {
     "down": b"\x1b[B",
     "ctrl_c": b"\x03",
     "shift_enter": b"\x1b[13;2u",
+    "alt_b": b"\x1bb",
+    "alt_f": b"\x1bf",
+    "ctrl_delete": b"\x1b[3;5~",
     "eof": b"\x04",
 }
 
@@ -482,8 +485,16 @@ class Tui:
         self.rows = rows
         self.master, slave = pty.openpty()
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        # crossterm asks /dev/tty for the size when it can open it, so the
+        # child must not inherit the harness terminal as its controlling tty.
         self.proc = subprocess.Popen(
-            [axe] + args, stdin=slave, stdout=slave, stderr=slave, env=env, cwd=cwd
+            [axe] + args,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            env=env,
+            cwd=cwd,
+            start_new_session=True,
         )
         os.close(slave)
         self.buf = b""
@@ -525,6 +536,23 @@ class Tui:
     def output(self):
         with self._lock:
             return screen_text(self.buf, self.cols, self.rows)
+
+    def answer_theme(self, background, foreground):
+        """Answer the OSC 10/11 query axe sends before it draws."""
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with self._lock:
+                asked = b"\x1b]11;?" in self.buf
+            if asked:
+                break
+            time.sleep(0.005)
+        self.send("\x1b]10;rgb:%s\x07\x1b]11;rgb:%s\x07" % (foreground, background))
+
+    def status_reports(self):
+        with self._lock:
+            data = self.buf
+        pattern = rb"\x1b\]7501;state=([a-z]+):app=axe\x1b\\"
+        return [state.decode() for state in re.findall(pattern, data)]
 
     def expect(self, text, timeout=20):
         deadline = time.time() + timeout
@@ -935,6 +963,72 @@ def tui_shift_enter_inserts_newline(h, axe):
             t.close()
     content = body_msg(srv, 0, "user")[-1]["content"]
     check(content == "first\nsecond", "shift+enter did not insert a newline: %r" % content)
+
+
+@case
+def tui_light_theme(h, axe):
+    """A white background switches the palette and the markdown styles, so
+    bold, headings and code stay readable instead of turning cyan or white
+    on black."""
+    with h.mock(TOOL_SCENARIO) as srv:
+        t = h.tui(axe, base=srv.base_url)
+        try:
+            t.answer_theme("ffff/ffff/ffff", "0000/0000/0000")
+            t.expect("Run /help")
+            t.type("check the tool\r")
+            t.expect("Done")
+            t.type("/quit\r")
+            check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
+        finally:
+            t.close()
+    raw = t.buf
+    check(b"\x1b[38;5;4;" in raw, "light theme did not use the blue accent")
+    check(b"\x1b[38;5;6;" not in raw, "light theme still used cyan")
+    check(b"48;5;6" not in raw, "heading kept the cyan background")
+
+
+@case
+def tui_program_status(h, axe):
+    """Axe says what it is doing through OSC 7501, the Program Status
+    Protocol, so Herdr and other terminals show it without reading the
+    screen."""
+    with h.mock(ANSWER_SCENARIO) as srv:
+        t = h.tui(axe, base=srv.base_url)
+        try:
+            t.expect("Run /help")
+            t.type("status please\r")
+            t.expect("Done")
+            t.type("/quit\r")
+            check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
+        finally:
+            t.close()
+    states = t.status_reports()
+    check(states == ["idle", "working", "idle", "clear"], states)
+
+
+@case
+def tui_word_movement(h, axe):
+    """Herdr rewrites ctrl+left and ctrl+right to readline's alt+b and alt+f
+    before the app sees them, so the composer must move by word on those
+    chords instead of typing a literal b or f."""
+    with h.mock(ANSWER_SCENARIO) as srv:
+        t = h.tui(axe, base=srv.base_url)
+        try:
+            t.expect("Run /help")
+            t.type("alpha beta gamma")
+            t.key("alt_b")
+            t.key("alt_b")
+            t.key("alt_f")
+            t.type("X")
+            t.key("ctrl_delete")
+            t.send("\r")
+            t.expect("Done")
+            t.type("/quit\r")
+            check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
+        finally:
+            t.close()
+    content = body_msg(srv, 0, "user")[-1]["content"]
+    check(content == "alpha betaX", "word movement failed: %r" % content)
 
 
 @case

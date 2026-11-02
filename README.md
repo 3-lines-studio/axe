@@ -69,7 +69,7 @@ The agent can pull an image into its own context: reading a JPEG, PNG, GIF, or W
 
 Flags also accept a single dash. Run `axe --help` for the full list. If standard input is not a terminal and no prompt is given, Axe reads the prompt from standard input.
 
-The TUI supports streamed Markdown, tool status, file completion, session resume, rewind, and compaction. Run `/help` in the TUI for its commands. Use `axe --resume` or `axe -r` to open the session picker. One-shot mode requires `--resume last` or `--resume ID`.
+The TUI supports streamed Markdown, tool status, file completion, session resume, rewind, and compaction. It reads the terminal's background once at startup and picks a light or dark palette to match. Run `/help` in the TUI for its commands. Use `axe --resume` or `axe -r` to open the session picker. One-shot mode requires `--resume last` or `--resume ID`.
 
 ## Config
 

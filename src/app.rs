@@ -249,11 +249,6 @@ pub fn tool_label(call: &ToolCall, running: bool) -> String {
     match call.name.as_str() {
         "bash" => {
             let command = command.split_whitespace().collect::<Vec<_>>().join(" ");
-            let truncated = command.chars().count() > 120;
-            let mut command: String = command.chars().take(120).collect();
-            if truncated {
-                command.push('…');
-            }
             if running {
                 format!("Running {command}")
             } else {

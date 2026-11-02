@@ -1,6 +1,7 @@
 use super::App;
 use super::runtime::{RatatuiObserver, TuiControl, TurnEvent};
 use super::state::Entry;
+use super::status::{self, State};
 use crate::Message;
 use crate::app;
 use crate::openai::OpenAI;
@@ -295,6 +296,7 @@ impl App {
         self.events = Some(receiver);
         self.compacting = true;
         self.turn_started = Instant::now();
+        status::report(State::Working);
         std::thread::spawn(move || {
             let result = session::compact_with_state(
                 &provider,
@@ -328,6 +330,7 @@ impl App {
         self.steer = Some(steer);
         self.running = true;
         self.turn_started = Instant::now();
+        status::report(State::Working);
         std::thread::spawn(move || {
             let end = {
                 let mut observer = RatatuiObserver { sender: &sender };

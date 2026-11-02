@@ -26,6 +26,8 @@ mod controller;
 mod render;
 mod runtime;
 mod state;
+mod status;
+mod theme;
 
 use render::*;
 use runtime::TurnEvent;
@@ -50,6 +52,7 @@ struct TerminalRestore {
 
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
+        status::clear();
         let _ = disable_raw_mode();
         if self.enhanced_keyboard {
             let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
@@ -64,6 +67,7 @@ impl Drop for TerminalRestore {
 }
 
 pub fn run(cfg: TuiConfig) -> Result<(), String> {
+    theme::init();
     enable_raw_mode().map_err(|error| error.to_string())?;
     let restore = TerminalRestore {
         enhanced_keyboard: true,
@@ -85,6 +89,7 @@ pub fn run(cfg: TuiConfig) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|error| error.to_string())?;
+    status::report(status::State::Idle);
     let result = run_app(&mut terminal, cfg);
     drop(restore);
     result
@@ -119,6 +124,7 @@ fn run_app(
         session_output: 0,
         session_state: SessionState::default(),
         turn_started: Instant::now(),
+        spinner_frame: 0,
         tool_running: None,
         tool_live: None,
         width: 80,
@@ -154,7 +160,6 @@ fn run_app(
         }
     }
     let mut dirty = true;
-    let mut last_tick = Instant::now();
     loop {
         if app.drain_events() {
             dirty = true;
@@ -163,9 +168,12 @@ fn run_app(
             app.on_exit();
             return Ok(());
         }
-        if (app.running || app.compacting) && last_tick.elapsed() >= Duration::from_secs(1) {
-            dirty = true;
-            last_tick = Instant::now();
+        if app.running || app.compacting {
+            let frame = spinner_frame(app.turn_started.elapsed());
+            if frame != app.spinner_frame {
+                app.spinner_frame = frame;
+                dirty = true;
+            }
         }
         if dirty {
             terminal
@@ -224,6 +232,7 @@ struct App {
     session_output: usize,
     session_state: SessionState,
     turn_started: Instant,
+    spinner_frame: usize,
     tool_running: Option<String>,
     tool_live: Option<String>,
     width: usize,
@@ -266,7 +275,10 @@ fn push_transcript_header(lines: &mut Vec<Line<'static>>) {
     lines.push(Line::default());
 }
 
+const TEXT_PADDING: usize = 2;
+
 fn push_transcript_entry(lines: &mut Vec<Line<'static>>, entry: &Entry, width: usize) {
+    let text_width = width.saturating_sub(TEXT_PADDING);
     match entry {
         Entry::User { text, images } => {
             for label in images {
@@ -274,7 +286,7 @@ fn push_transcript_entry(lines: &mut Vec<Line<'static>>, entry: &Entry, width: u
                     Span::styled("┃ ", Style::default()),
                     Span::styled(
                         format!("[image {label}]"),
-                        Style::default().add_modifier(Modifier::DIM),
+                        Style::default().fg(theme::palette().muted),
                     ),
                 ]));
             }
@@ -293,11 +305,11 @@ fn push_transcript_entry(lines: &mut Vec<Line<'static>>, entry: &Entry, width: u
             }
         }
         Entry::Tool(calls) => {
-            let style = Style::default().add_modifier(Modifier::DIM);
+            let style = Style::default().fg(theme::palette().muted);
             if calls.len() == 1 {
                 lines.push(Line::from(vec![
                     Span::styled("● ", style),
-                    Span::styled(truncate(&calls[0], width.saturating_sub(2)), style),
+                    Span::styled(truncate(&calls[0], text_width.saturating_sub(2)), style),
                 ]));
             } else {
                 lines.push(Line::from(vec![
@@ -311,7 +323,7 @@ fn push_transcript_entry(lines: &mut Vec<Line<'static>>, entry: &Entry, width: u
                         "├"
                     };
                     lines.push(Line::from(Span::styled(
-                        format!("{branch} {}", truncate(call, width.saturating_sub(2))),
+                        format!("{branch} {}", truncate(call, text_width.saturating_sub(2))),
                         style,
                     )));
                 }
@@ -382,19 +394,34 @@ impl App {
         let transcript = transcript.scroll((self.scroll, 0));
         frame.render_widget(transcript, areas[0]);
         if self.running || self.compacting {
-            let elapsed = self.turn_started.elapsed().as_secs();
-            let activity = if self.compacting {
-                "• Compacting".to_string()
+            let palette = theme::palette();
+            let elapsed = self.turn_started.elapsed();
+            let (label, color) = if self.compacting {
+                ("Compacting".to_string(), palette.secondary)
             } else if let Some(tool) = &self.tool_running {
-                format!("● {tool}")
+                (tool.clone(), palette.tool)
             } else {
-                format!(
-                    "• Thinking ({elapsed}s) (↑{} ↓{})",
-                    format_tokens(self.input_tokens),
-                    format_tokens(self.output_tokens)
+                (
+                    format!(
+                        "Thinking ({}s) (↑{} ↓{})",
+                        elapsed.as_secs(),
+                        format_tokens(self.input_tokens),
+                        format_tokens(self.output_tokens)
+                    ),
+                    palette.strong,
                 )
             };
-            let mut lines = vec![Line::from(activity)];
+            let mut lines = vec![Line::from(vec![
+                Span::styled(
+                    spinner_glyph(spinner_frame(elapsed)),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    truncate(&label, usize::from(width).saturating_sub(2 + TEXT_PADDING)),
+                    Style::default(),
+                ),
+            ])];
             if let Some(output) = &self.tool_live {
                 lines.push(Line::from(Span::styled(
                     format!("  {}", output.lines().last().unwrap_or_default()),
@@ -720,7 +747,7 @@ impl App {
                 Span::styled("┃ ", Style::default()),
                 Span::styled(
                     format!("[image {}]", crate::image::label(image)),
-                    Style::default().add_modifier(Modifier::DIM),
+                    Style::default().fg(theme::palette().muted),
                 ),
             ]));
         }
@@ -975,6 +1002,19 @@ mod tests {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("abcdefghij", 5), "abcd…");
         assert_eq!(truncate("abcdefghij", 0), "…");
+    }
+
+    #[test]
+    fn tool_lines_fill_the_width_but_keep_padding() {
+        let call = format!("Ran {}", "x".repeat(200));
+        let mut lines = Vec::new();
+        push_transcript_entry(&mut lines, &Entry::Tool(vec![call]), 40);
+        assert_eq!(lines[0].width(), 40 - TEXT_PADDING);
+        assert!(line_text(&lines[0]).ends_with('…'));
+
+        let mut lines = Vec::new();
+        push_transcript_entry(&mut lines, &Entry::Tool(vec!["Ran ls".into()]), 40);
+        assert_eq!(line_text(&lines[0]), "● Ran ls");
     }
 
     #[test]
