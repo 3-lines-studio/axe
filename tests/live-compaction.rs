@@ -173,19 +173,27 @@ fn live_model_continues_through_repeated_compaction() {
 }
 
 #[derive(Default)]
-struct ForcedCompactionSink {
+struct ForcedObserver {
     calls: BTreeMap<String, usize>,
+}
+
+impl run::Observer for ForcedObserver {
+    fn event(&mut self, event: run::AgentEvent<'_>) {
+        if let run::AgentEvent::ToolStart(call) = event {
+            *self
+                .calls
+                .entry(format!("{}:{}", call.name, call.arguments))
+                .or_default() += 1;
+        }
+    }
+}
+
+#[derive(Default)]
+struct ForcedControl {
     forced: usize,
 }
 
-impl run::Sink for ForcedCompactionSink {
-    fn tool_start(&mut self, call: &ToolCall) {
-        *self
-            .calls
-            .entry(format!("{}:{}", call.name, call.arguments))
-            .or_default() += 1;
-    }
-
+impl run::Control for ForcedControl {
     fn should_compact(&mut self, _input: usize, _output: usize) -> bool {
         if self.forced >= 6 {
             return false;
@@ -244,14 +252,15 @@ fn live_agent_finishes_a_repository_task_across_forced_compactions() {
         message: message("user", prompt),
     }];
     let tools = tools::build_tools(root.to_str().expect("project path"));
-    let mut sink = ForcedCompactionSink::default();
+    let mut observer = ForcedObserver::default();
+    let mut control = ForcedControl::default();
     let mut state = session::SessionState::default();
     let mut compactions = 0;
     let mut restarts = 0;
 
     loop {
         let context = session::context_messages(&entries);
-        let end = run::run_stream(
+        let end = run::run_stream_with(
             &provider,
             &run::RunOptions {
                 model: &model,
@@ -261,7 +270,8 @@ fn live_agent_finishes_a_repository_task_across_forced_compactions() {
             },
             &context,
             &Arc::new(AtomicBool::new(false)),
-            &mut sink,
+            &mut observer,
+            &mut control,
         );
         append_run(&mut entries, context.len(), &end.messages);
         state.record(&end.usage, &end.context);
@@ -299,12 +309,12 @@ fn live_agent_finishes_a_repository_task_across_forced_compactions() {
         .expect("run test");
     let report = std::fs::read_to_string(root.join("report.txt")).unwrap_or_default();
     let protected = std::fs::read_to_string(root.join("protected.txt")).unwrap_or_default();
-    let repeated_calls: usize = sink
+    let repeated_calls: usize = observer
         .calls
         .values()
         .map(|count| count.saturating_sub(1))
         .sum();
-    let repeated = sink
+    let repeated = observer
         .calls
         .iter()
         .filter(|(_, count)| **count > 1)
@@ -313,7 +323,7 @@ fn live_agent_finishes_a_repository_task_across_forced_compactions() {
         .join(" | ");
     println!(
         "compactions={compactions} tool_calls={} repeated_calls={repeated_calls} repeated={repeated}",
-        sink.calls.values().sum::<usize>()
+        observer.calls.values().sum::<usize>()
     );
     let _ = std::fs::remove_dir_all(&root);
 

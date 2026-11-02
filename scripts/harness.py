@@ -580,8 +580,6 @@ def case(fn):
     return fn
 
 
-def entries_of(path):
-    return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
 
 
 def invalid_transcript(msgs):

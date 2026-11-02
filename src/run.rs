@@ -47,23 +47,6 @@ fn sleep_with_cancel(ms: u64, cancel: &Arc<AtomicBool>) -> Result<(), Error> {
     Ok(())
 }
 
-pub trait Sink {
-    fn assistant_delta(&mut self, _text: &str) {}
-    fn assistant_done(&mut self) {}
-    fn tool_start(&mut self, _call: &ToolCall) {}
-    fn tool_delta(&mut self, _call: &ToolCall, _text: &str) {}
-    fn tool_result(&mut self, _call: &ToolCall, _output: &ToolOutput, _elapsed: Duration) {}
-    fn tokens(&mut self, _input: usize, _output: usize, _cached_input: usize) {}
-    fn should_compact(&mut self, _input: usize, _output: usize) -> bool {
-        false
-    }
-    fn assistant(&mut self, _turn: usize, _msg: &Message, _usage: Usage) {}
-    fn tool(&mut self, _turn: usize, _msg: &Message) {}
-    fn pending_user_input(&mut self) -> Option<String> {
-        None
-    }
-}
-
 #[derive(Debug)]
 pub enum AgentEvent<'a> {
     AssistantDelta(&'a str),
@@ -111,47 +94,6 @@ pub trait Control {
 pub trait RuntimeHooks: Observer + Control {}
 impl<T: Observer + Control + ?Sized> RuntimeHooks for T {}
 
-struct SinkAdapter<'a> {
-    sink: &'a mut dyn Sink,
-}
-
-impl Observer for SinkAdapter<'_> {
-    fn event(&mut self, event: AgentEvent<'_>) {
-        match event {
-            AgentEvent::AssistantDelta(text) => self.sink.assistant_delta(text),
-            AgentEvent::AssistantDone => self.sink.assistant_done(),
-            AgentEvent::ToolStart(call) => self.sink.tool_start(call),
-            AgentEvent::ToolDelta { call, text } => self.sink.tool_delta(call, text),
-            AgentEvent::ToolResult {
-                call,
-                output,
-                elapsed,
-            } => self.sink.tool_result(call, output, elapsed),
-            AgentEvent::Tokens {
-                input,
-                output,
-                cached_input,
-            } => self.sink.tokens(input, output, cached_input),
-            AgentEvent::Assistant {
-                turn,
-                message,
-                usage,
-            } => self.sink.assistant(turn, message, usage),
-            AgentEvent::Tool { turn, message } => self.sink.tool(turn, message),
-        }
-    }
-}
-
-impl Control for SinkAdapter<'_> {
-    fn pending_user_input(&mut self) -> Option<String> {
-        self.sink.pending_user_input()
-    }
-
-    fn should_compact(&mut self, input: usize, output: usize) -> bool {
-        self.sink.should_compact(input, output)
-    }
-}
-
 struct HooksPair<'a> {
     observer: &'a mut dyn Observer,
     control: &'a mut dyn Control,
@@ -193,17 +135,6 @@ pub struct RunEnd {
     pub usage: Usage,
     pub context: Usage,
     pub outcome: Outcome,
-}
-
-pub fn run_stream<P: Provider>(
-    provider: &P,
-    opts: &RunOptions,
-    msgs: &[Message],
-    cancel: &Arc<AtomicBool>,
-    sink: &mut dyn Sink,
-) -> RunEnd {
-    let mut hooks = SinkAdapter { sink };
-    run_inner(provider, opts, msgs, cancel, &mut hooks)
 }
 
 pub fn run_stream_with<P: Provider>(

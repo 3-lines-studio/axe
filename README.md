@@ -97,7 +97,9 @@ axe = { git = "https://github.com/3-lines-studio/axe", rev = "<commit>" }
 let tools = axe::tools::build_tools("/tmp/project");
 let system = axe::system_prompt(&tools);
 let provider = axe::OpenAI::new("https://api.deepseek.com", api_key).effort("max");
-let end = axe::run::run_stream(&provider, &opts, &history, &cancel, &mut sink);
+let end = axe::run::run_stream_with(
+    &provider, &opts, &history, &cancel, &mut observer, &mut control,
+);
 ```
 
 The `tui` feature is on by default and can be turned off with

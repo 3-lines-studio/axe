@@ -11,11 +11,6 @@ pub enum Entry {
         message: Message,
     },
     Reset,
-    ToolIntent {
-        id: String,
-        name: String,
-        arguments: String,
-    },
     Compaction {
         summary: String,
         tokens_before: usize,
@@ -217,7 +212,6 @@ pub fn context_messages_with(entries: &[Entry], options: ContextOptions) -> Vec<
                 out.extend(retained.iter().cloned());
             }
             Entry::Reset => out.clear(),
-            Entry::ToolIntent { .. } => {}
         }
     }
     out
@@ -808,23 +802,6 @@ mod tests {
         assert_eq!(messages[0].role, "user");
         assert!(messages[0].content.contains("summary"));
         assert!(!messages[0].content.contains("forgotten"));
-    }
-
-    #[test]
-    fn a_tool_intent_never_reaches_the_model() {
-        let entries = vec![
-            Entry::ToolIntent {
-                id: "call-1".into(),
-                name: "read".into(),
-                arguments: "{}".into(),
-            },
-            Entry::Message {
-                message: message("user", "hola"),
-            },
-        ];
-        let messages = context_messages(&entries);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "hola");
     }
 
     #[test]

@@ -29,6 +29,16 @@ struct TestEvent {
     usage: Usage,
 }
 
+struct NoObserver;
+
+impl run::Observer for NoObserver {
+    fn event(&mut self, _event: run::AgentEvent<'_>) {}
+}
+
+struct NoControl;
+
+impl run::Control for NoControl {}
+
 struct TestAgent<P> {
     provider: P,
     tools: Vec<Tool>,
@@ -66,8 +76,9 @@ impl<P: Provider> TestAgent<P> {
     }
 
     fn run(&mut self, messages: &[Message]) -> Result<Vec<Message>, TestError> {
-        let mut sink = TestSink { on: self.on.take() };
-        let end = run::run_stream(
+        let mut observer = TestObserver { on: self.on.take() };
+        let mut control = NoControl;
+        let end = run::run_stream_with(
             &self.provider,
             &run::RunOptions {
                 model: "",
@@ -77,9 +88,10 @@ impl<P: Provider> TestAgent<P> {
             },
             messages,
             &Arc::new(AtomicBool::new(false)),
-            &mut sink,
+            &mut observer,
+            &mut control,
         );
-        self.on = sink.on;
+        self.on = observer.on;
         match end.outcome {
             run::Outcome::Done | run::Outcome::Cancelled | run::Outcome::Compact => {
                 Ok(end.messages)
@@ -90,22 +102,19 @@ impl<P: Provider> TestAgent<P> {
     }
 }
 
-struct TestSink {
+struct TestObserver {
     on: Option<Box<dyn FnMut(TestEvent)>>,
 }
 
-impl run::Sink for TestSink {
-    fn assistant(&mut self, _turn: usize, _message: &Message, usage: Usage) {
+impl run::Observer for TestObserver {
+    fn event(&mut self, event: run::AgentEvent<'_>) {
+        let usage = match event {
+            run::AgentEvent::Assistant { usage, .. } => usage,
+            run::AgentEvent::Tool { .. } => Usage::default(),
+            _ => return,
+        };
         if let Some(on) = &mut self.on {
             on(TestEvent { usage });
-        }
-    }
-
-    fn tool(&mut self, _turn: usize, _message: &Message) {
-        if let Some(on) = &mut self.on {
-            on(TestEvent {
-                usage: Usage::default(),
-            });
         }
     }
 }
@@ -467,7 +476,9 @@ fn run_end_separates_last_context_usage_from_totals() {
         responses: RefCell::new(responses),
         requests: RefCell::new(Vec::new()),
     };
-    let end = run::run_stream(
+    let mut observer = TestObserver { on: None };
+    let mut control = NoControl;
+    let end = run::run_stream_with(
         &p,
         &run::RunOptions {
             model: "",
@@ -477,7 +488,8 @@ fn run_end_separates_last_context_usage_from_totals() {
         },
         &[user("hi")],
         &Arc::new(AtomicBool::new(false)),
-        &mut TestSink { on: None },
+        &mut observer,
+        &mut control,
     );
     assert!(
         matches!(end.outcome, run::Outcome::Done),
@@ -663,7 +675,7 @@ struct Steering {
     polled: usize,
 }
 
-impl axe::run::Sink for Steering {
+impl axe::run::Control for Steering {
     fn pending_user_input(&mut self) -> Option<String> {
         self.polled += 1;
         match self.polled {
@@ -697,13 +709,15 @@ fn run_injects_steering_between_turns() {
         tools: &[],
         max_turns: 5,
     };
-    let mut sink = Steering { polled: 0 };
-    let end = axe::run::run_stream(
+    let mut observer = NoObserver;
+    let mut control = Steering { polled: 0 };
+    let end = axe::run::run_stream_with(
         &p,
         &opts,
         &[user("go")],
         &Arc::new(AtomicBool::new(false)),
-        &mut sink,
+        &mut observer,
+        &mut control,
     );
     assert!(
         matches!(end.outcome, axe::run::Outcome::Done),
@@ -840,8 +854,8 @@ fn repeated_compaction_keeps_a_bounded_continuation_context() {
 
 #[test]
 fn run_compact_outcome_leaves_transcript() {
-    struct CompactSink;
-    impl axe::run::Sink for CompactSink {
+    struct CompactControl;
+    impl axe::run::Control for CompactControl {
         fn should_compact(&mut self, _input: usize, _output: usize) -> bool {
             true
         }
@@ -874,13 +888,15 @@ fn run_compact_outcome_leaves_transcript() {
         tools: &[echo],
         max_turns: 8,
     };
-    let mut sink = CompactSink;
-    let end = axe::run::run_stream(
+    let mut observer = NoObserver;
+    let mut control = CompactControl;
+    let end = axe::run::run_stream_with(
         &p,
         &opts,
         &[user("go")],
         &Arc::new(AtomicBool::new(false)),
-        &mut sink,
+        &mut observer,
+        &mut control,
     );
     assert!(
         matches!(end.outcome, axe::run::Outcome::Compact),
@@ -1013,10 +1029,6 @@ fn drop_incomplete_tool_calls() {
     assert_eq!(msgs2.len(), 1);
 }
 
-struct NopSink;
-
-impl axe::run::Sink for NopSink {}
-
 #[test]
 fn run_cancel_mid_batch_synthesizes_results() {
     struct CancelProvider;
@@ -1075,7 +1087,16 @@ fn run_cancel_mid_batch_synthesizes_results() {
         tools: &[boom],
         max_turns: 5,
     };
-    let end = axe::run::run_stream(&CancelProvider, &opts, &[user("go")], &cancel, &mut NopSink);
+    let mut observer = NoObserver;
+    let mut control = NoControl;
+    let end = axe::run::run_stream_with(
+        &CancelProvider,
+        &opts,
+        &[user("go")],
+        &cancel,
+        &mut observer,
+        &mut control,
+    );
     assert!(
         matches!(end.outcome, axe::run::Outcome::Cancelled),
         "{:?}",
@@ -1102,9 +1123,9 @@ fn run_cancel_mid_batch_synthesizes_results() {
 
 #[test]
 fn run_compacts_after_complete_tool_batch() {
-    struct CompactSink;
+    struct CompactControl;
 
-    impl axe::run::Sink for CompactSink {
+    impl axe::run::Control for CompactControl {
         fn should_compact(&mut self, input: usize, output: usize) -> bool {
             input + output > 250_000
         }
@@ -1133,13 +1154,15 @@ fn run_compacts_after_complete_tool_batch() {
         tools: &[tool],
         max_turns: 5,
     };
-    let mut sink = CompactSink;
-    let end = axe::run::run_stream(
+    let mut observer = NoObserver;
+    let mut control = CompactControl;
+    let end = axe::run::run_stream_with(
         &provider,
         &opts,
         &[user("work")],
         &Arc::new(AtomicBool::new(false)),
-        &mut sink,
+        &mut observer,
+        &mut control,
     );
     assert!(matches!(end.outcome, axe::run::Outcome::Compact));
     assert_eq!(end.messages.len(), 3);
@@ -1168,10 +1191,6 @@ impl run::Observer for RecordingObserver {
         });
     }
 }
-
-struct NoControl;
-
-impl run::Control for NoControl {}
 
 #[test]
 fn the_observer_sees_streamed_and_completed_events() {
