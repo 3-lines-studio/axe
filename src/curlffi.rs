@@ -1,7 +1,7 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_void};
 use std::sync::OnceLock;
 
-const CURL_GLOBAL_DEFAULT: c_long = 3;
+const CURL_GLOBAL_NOTHING: c_long = 0;
 const CURLOPT_WRITEDATA: c_int = 10001;
 const CURLOPT_URL: c_int = 10002;
 const CURLOPT_TIMEOUT: c_int = 13;
@@ -72,7 +72,7 @@ unsafe fn load() -> Result<Curl, String> {
         let handle = unsafe {
             libc::dlopen(
                 lib.as_ptr() as *const libc::c_char,
-                libc::RTLD_NOW | libc::RTLD_LOCAL,
+                libc::RTLD_LAZY | libc::RTLD_LOCAL,
             )
         };
         if !handle.is_null() {
@@ -131,7 +131,7 @@ unsafe fn load_syms(handle: *mut libc::c_void) -> Result<Curl, String> {
             ),
         }
     };
-    if unsafe { (c.global_init)(CURL_GLOBAL_DEFAULT) } != 0 {
+    if unsafe { (c.global_init)(CURL_GLOBAL_NOTHING) } != 0 {
         return Err("curl_global_init failed".into());
     }
     Ok(c)

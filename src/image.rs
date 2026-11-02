@@ -28,9 +28,14 @@ pub fn attach_data(source: &str, data: &[u8]) -> Result<Image, String> {
     })
 }
 
+pub fn looks_like_image(data: &[u8]) -> bool {
+    sniff(&data[..data.len().min(16)]).is_some()
+}
+
 pub fn attach_bytes(source: &str, data: &[u8]) -> Option<Image> {
-    sniff(&data[..data.len().min(16)])?;
-    attach_data(source, data).ok()
+    looks_like_image(data)
+        .then(|| attach_data(source, data).ok())
+        .flatten()
 }
 
 pub fn attach_if_image(path: &str) -> Option<Image> {

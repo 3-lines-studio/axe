@@ -17,6 +17,21 @@ pub struct Entry {
 pub trait Machine: Send + Sync {
     fn read(&self, path: &str) -> Result<Vec<u8>, String>;
 
+    fn read_head(&self, path: &str, limit: usize) -> Result<Vec<u8>, String> {
+        let data = self.read(path)?;
+        Ok(data[..data.len().min(limit)].to_vec())
+    }
+
+    fn read_text(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<String, String> {
+        let data = self.read(path)?;
+        Ok(crate::tools::read_text_bytes(&data, offset, limit))
+    }
+
     fn write(&self, path: &str, bytes: &[u8]) -> Result<(), String>;
 
     fn list(&self, path: &str) -> Result<Vec<Entry>, String>;
@@ -41,6 +56,29 @@ impl Local {
 impl Machine for Local {
     fn read(&self, path: &str) -> Result<Vec<u8>, String> {
         std::fs::read(resolve(&self.dir, path)).map_err(|e| e.to_string())
+    }
+
+    fn read_head(&self, path: &str, limit: usize) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(resolve(&self.dir, path)).map_err(|e| e.to_string())?;
+        let mut head = vec![0; limit];
+        let read = file.read(&mut head).map_err(|e| e.to_string())?;
+        head.truncate(read);
+        Ok(head)
+    }
+
+    fn read_text(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<String, String> {
+        let file = std::fs::File::open(resolve(&self.dir, path)).map_err(|e| e.to_string())?;
+        Ok(crate::tools::read_text_reader(
+            std::io::BufReader::new(file),
+            offset,
+            limit,
+        ))
     }
 
     fn write(&self, path: &str, bytes: &[u8]) -> Result<(), String> {

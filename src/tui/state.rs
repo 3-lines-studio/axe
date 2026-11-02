@@ -1,5 +1,5 @@
 use super::App;
-use super::render::{assistant_entry, byte_at_column, dropped_image_path, render_markdown};
+use super::render::{assistant_entry, byte_at_column, dropped_image_path};
 use super::runtime::TurnEvent;
 use crate::app;
 use crate::session;
@@ -507,23 +507,20 @@ impl App {
             .map_or(self.input.len(), |index| self.cursor + index)
     }
 
-    pub(super) fn drain_events(&mut self) {
+    pub(super) fn drain_events(&mut self) -> bool {
         let Some(receiver) = self.events.take() else {
-            return;
+            return false;
         };
+        let mut changed = false;
         let mut compact_after = false;
         let mut turn_after = false;
         while let Ok(event) = receiver.try_recv() {
+            changed = true;
             match event {
                 TurnEvent::AssistantDelta(delta) => {
-                    if let Some(Entry::Assistant {
-                        source,
-                        rendered,
-                        width,
-                    }) = self.entries.last_mut()
-                    {
+                    if let Some(Entry::Assistant { source, .. }) = self.entries.last_mut() {
                         source.push_str(&delta);
-                        *rendered = render_markdown(source, *width);
+                        self.markdown_dirty = true;
                     } else {
                         self.entries.push(assistant_entry(delta, self.width));
                     }
@@ -623,5 +620,6 @@ impl App {
         } else if self.running || self.compacting {
             self.events = Some(receiver);
         }
+        changed
     }
 }

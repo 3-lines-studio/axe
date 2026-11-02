@@ -136,6 +136,7 @@ fn run_app(
         rewind_items: Vec::new(),
         esc_armed: None,
         resume_id: None,
+        markdown_dirty: false,
     };
     if let Some(id) = app.cfg.resume.clone() {
         if id.is_empty() {
@@ -144,18 +145,35 @@ fn run_app(
             app.resume(&id);
         }
     }
+    let mut dirty = true;
+    let mut last_tick = Instant::now();
     loop {
-        app.drain_events();
+        if app.drain_events() {
+            dirty = true;
+        }
         if app.want_quit {
             app.on_exit();
             return Ok(());
         }
-        terminal
-            .draw(|frame| app.draw(frame))
-            .map_err(|error| error.to_string())?;
-        if !event::poll(Duration::from_millis(30)).map_err(|error| error.to_string())? {
+        if (app.running || app.compacting) && last_tick.elapsed() >= Duration::from_secs(1) {
+            dirty = true;
+            last_tick = Instant::now();
+        }
+        if dirty {
+            terminal
+                .draw(|frame| app.draw(frame))
+                .map_err(|error| error.to_string())?;
+            dirty = false;
+        }
+        let wait = if app.running || app.compacting {
+            Duration::from_millis(30)
+        } else {
+            Duration::from_millis(250)
+        };
+        if !event::poll(wait).map_err(|error| error.to_string())? {
             continue;
         }
+        dirty = true;
         match event::read().map_err(|error| error.to_string())? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if app.handle_key(key) {
@@ -217,6 +235,7 @@ struct App {
     rewind_items: Vec<app::RewindItem>,
     esc_armed: Option<Instant>,
     resume_id: Option<String>,
+    markdown_dirty: bool,
 }
 
 impl App {
@@ -549,6 +568,7 @@ impl App {
     }
 
     fn sync_markdown_width(&mut self, width: usize) {
+        let mut resized = false;
         for entry in &mut self.entries {
             if let Entry::Assistant {
                 source,
@@ -559,7 +579,22 @@ impl App {
             {
                 *rendered = render_markdown(source, width);
                 *entry_width = width;
+                resized = true;
             }
+        }
+        if self.markdown_dirty {
+            if !resized
+                && let Some(Entry::Assistant {
+                    source, rendered, ..
+                }) = self
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| matches!(entry, Entry::Assistant { .. }))
+            {
+                *rendered = render_markdown(source, width);
+            }
+            self.markdown_dirty = false;
         }
     }
 

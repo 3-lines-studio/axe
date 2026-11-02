@@ -471,6 +471,37 @@ mod tests {
     }
 
     #[test]
+    fn edit_patch_counts_a_final_line_without_newline() {
+        let edits = [super::EditArg {
+            old_text: "b".into(),
+            new_text: "B".into(),
+        }];
+        let patch = apply_edits("f.txt", "a\nb", &edits).unwrap().patch;
+        assert!(patch.contains("@@ -1,2 +1,2 @@"), "{patch}");
+        assert!(patch.contains("-b\n+B"), "{patch}");
+    }
+
+    #[test]
+    fn edit_patch_covers_multiple_groups() {
+        let text = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n";
+        let edits = [
+            super::EditArg {
+                old_text: "b\n".into(),
+                new_text: "B\n".into(),
+            },
+            super::EditArg {
+                old_text: "k\n".into(),
+                new_text: "K\n".into(),
+            },
+        ];
+        let patch = apply_edits("f.txt", text, &edits).unwrap().patch;
+        assert_eq!(
+            patch,
+            "--- f.txt\n+++ f.txt\n@@ -1,6 +1,6 @@\n a\n-b\n+B\n c\n d\n e\n f\n@@ -7,6 +7,6 @@\n g\n h\n i\n j\n-k\n+K\n l\n"
+        );
+    }
+
+    #[test]
     fn edit_truncates_large_patch() {
         let old: String = (0..500).map(|i| format!("old line {i}\n")).collect();
         let new: String = (0..500).map(|i| format!("new line {i}\n")).collect();
@@ -710,11 +741,21 @@ struct ReadArgs {
     limit: Option<usize>,
 }
 
-fn read_text(a: &ReadArgs, data: &[u8]) -> String {
-    use std::io::BufRead;
-    let start = a.offset.unwrap_or(1).saturating_sub(1);
-    let limit = a.limit.unwrap_or(usize::MAX);
-    let mut reader = std::io::BufReader::new(std::io::Cursor::new(data));
+pub(crate) fn read_text_bytes(data: &[u8], offset: Option<usize>, limit: Option<usize>) -> String {
+    read_text_reader(
+        std::io::BufReader::new(std::io::Cursor::new(data)),
+        offset,
+        limit,
+    )
+}
+
+pub(crate) fn read_text_reader<R: std::io::BufRead>(
+    mut reader: R,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> String {
+    let start = offset.unwrap_or(1).saturating_sub(1);
+    let limit = limit.unwrap_or(usize::MAX);
     let mut line = Vec::new();
     let mut output = String::new();
     let mut total = 0usize;
@@ -757,14 +798,8 @@ fn read_text(a: &ReadArgs, data: &[u8]) -> String {
                 if buf.is_empty() {
                     break;
                 }
-                for &byte in buf {
-                    if byte == b'\n' {
-                        total += 1;
-                        trailing = false;
-                    } else {
-                        trailing = true;
-                    }
-                }
+                total += buf.iter().filter(|&&byte| byte == b'\n').count();
+                trailing = buf.last().is_some_and(|&byte| byte != b'\n');
                 let len = buf.len();
                 reader.consume(len);
             }
@@ -804,10 +839,10 @@ fn read_text(a: &ReadArgs, data: &[u8]) -> String {
         output.push_str(&text);
         shown += 1;
     }
-    if a.offset.is_some() && start >= total {
+    if offset.is_some() && start >= total {
         return format!(
             "error: offset {} is beyond end of file ({} lines total)",
-            a.offset.unwrap_or(1),
+            offset.unwrap_or(1),
             total
         );
     }
@@ -846,24 +881,34 @@ pub fn read(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
         "Read the contents of a file. Output is truncated to 16KB. Use offset/limit for large files. When you need the full file, continue with the suggested offset. Reading a JPEG, PNG, GIF, or WebP attaches the image so you can see it.",
         r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"integer","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"integer","description":"Maximum number of lines to read"}},"required":["path"]}"#,
         move |a: ReadArgs| {
-            let data = match machine.read(&a.path) {
-                Ok(data) => data,
+            let head = match machine.read_head(&a.path, 8192) {
+                Ok(head) => head,
                 Err(e) => return ToolOutput::text(format!("error: {e}")),
             };
-            if let Some(image) = crate::image::attach_bytes(&a.path, &data) {
-                return ToolOutput {
-                    text: format!("Attached {} for viewing.", a.path),
-                    images: vec![image],
-                    error: false,
-                };
+            if crate::image::looks_like_image(&head) {
+                match machine.read(&a.path) {
+                    Ok(data) => {
+                        if let Some(image) = crate::image::attach_bytes(&a.path, &data) {
+                            return ToolOutput {
+                                text: format!("Attached {} for viewing.", a.path),
+                                images: vec![image],
+                                error: false,
+                            };
+                        }
+                    }
+                    Err(e) => return ToolOutput::text(format!("error: {e}")),
+                }
             }
-            if looks_binary(&data) {
+            if looks_binary(&head) {
                 return ToolOutput::text(format!(
                     "error: {} is a binary file; read handles text files and JPEG, PNG, GIF, and WebP images",
                     a.path
                 ));
             }
-            ToolOutput::text(read_text(&a, &data))
+            match machine.read_text(&a.path, a.offset, a.limit) {
+                Ok(text) => ToolOutput::text(text),
+                Err(e) => ToolOutput::text(format!("error: {e}")),
+            }
         },
     );
     t.snippet = "Read file contents (truncated, use offset to continue); images are attached so you can see them".to_string();
@@ -1132,17 +1177,18 @@ fn find_exact(
     content: &str,
     olds: &[String],
     news: &[String],
-) -> Result<Vec<Matched>, String> {
+) -> Result<Option<Vec<Matched>>, String> {
     let total = olds.len();
     let mut matched = Vec::with_capacity(total);
+    let mut duplicate = None;
     for (i, old) in olds.iter().enumerate() {
         let Some(start) = content.find(old.as_str()) else {
-            return Err(not_found_error(path, i, total));
+            return Ok(None);
         };
         let remaining = &content[start + old.len()..];
-        if remaining.contains(old.as_str()) {
+        if duplicate.is_none() && remaining.contains(old.as_str()) {
             let n = 1 + remaining.matches(old.as_str()).count();
-            return Err(duplicate_error(path, i, total, n));
+            duplicate = Some(duplicate_error(path, i, total, n));
         }
         matched.push(Matched {
             edit: i,
@@ -1151,7 +1197,10 @@ fn find_exact(
             new_text: news[i].clone(),
         });
     }
-    Ok(matched)
+    match duplicate {
+        Some(error) => Err(error),
+        None => Ok(Some(matched)),
+    }
 }
 
 fn find_fuzzy(
@@ -1203,6 +1252,130 @@ fn line_range(spans: &[(usize, usize)], start: usize, end: usize) -> Option<(usi
         return None;
     }
     Some((start_line, end_line + 1))
+}
+
+struct ExactGroup {
+    start: usize,
+    end: usize,
+    edits: Vec<usize>,
+}
+
+fn exact_group_regions(content: &str, matched: &[Matched]) -> Vec<ExactGroup> {
+    let mut groups: Vec<ExactGroup> = Vec::new();
+    for (i, m) in matched.iter().enumerate() {
+        let start = content[..m.start].rfind('\n').map_or(0, |p| p + 1);
+        let end = m.start + m.len;
+        let end = if content.as_bytes()[end - 1] == b'\n' {
+            end
+        } else {
+            content[end..]
+                .find('\n')
+                .map_or(content.len(), |p| end + p + 1)
+        };
+        if let Some(cur) = groups.last_mut()
+            && start < cur.end
+        {
+            cur.end = cur.end.max(end);
+            cur.edits.push(i);
+            continue;
+        }
+        groups.push(ExactGroup {
+            start,
+            end,
+            edits: vec![i],
+        });
+    }
+    groups
+}
+
+fn exact_group_block(source: &str, group: &ExactGroup, matched: &[Matched]) -> String {
+    let mut block = source[group.start..group.end].to_string();
+    for &i in group.edits.iter().rev() {
+        let m = &matched[i];
+        let s = m.start - group.start;
+        block.replace_range(s..s + m.len, &m.new_text);
+    }
+    block
+}
+
+fn line_count(text: &str) -> usize {
+    text.bytes().filter(|&b| b == b'\n').count()
+        + usize::from(!text.is_empty() && !text.ends_with('\n'))
+}
+
+fn lines_before(content: &str, mut pos: usize, count: usize) -> usize {
+    for _ in 0..count {
+        if pos == 0 {
+            break;
+        }
+        let previous = content[..pos - 1].rfind('\n').map_or(0, |p| p + 1);
+        pos = previous;
+    }
+    pos
+}
+
+fn lines_after(content: &str, mut pos: usize, count: usize) -> usize {
+    for _ in 0..count {
+        if pos >= content.len() {
+            break;
+        }
+        let Some(next) = content[pos..].find('\n') else {
+            return content.len();
+        };
+        pos += next + 1;
+    }
+    pos
+}
+
+fn exact_unified_patch(path: &str, old: &str, groups: &[ExactGroup], blocks: &[String]) -> String {
+    const CONTEXT: usize = 4;
+    let mut out = format!("--- {path}\n+++ {path}\n");
+    let mut new_offset: isize = 0;
+    let mut line_cursor = 0;
+    let mut start_line = 0;
+    for (index, group) in groups.iter().enumerate() {
+        start_line += old[line_cursor..group.start]
+            .bytes()
+            .filter(|&b| b == b'\n')
+            .count();
+        line_cursor = group.start;
+        let mut old_start = lines_before(old, group.start, CONTEXT);
+        if index > 0 {
+            old_start = old_start.max(groups[index - 1].end);
+        }
+        let mut old_end = lines_after(old, group.end, CONTEXT);
+        if let Some(next) = groups.get(index + 1) {
+            old_end = old_end.min(next.start);
+        }
+        let before = line_count(&old[old_start..group.start]);
+        let old_lines = line_count(&old[group.start..group.end]);
+        let after = line_count(&old[group.end..old_end]);
+        let old_start_line = start_line - before;
+        let old_count = before + old_lines + after;
+        let added = split_lines(&blocks[index]);
+        let new_start = (old_start_line as isize + new_offset + 1).max(1);
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            old_start_line + 1,
+            old_count,
+            new_start,
+            before + added.len() + after
+        ));
+        for line in old[old_start..group.start].lines() {
+            out.push_str(&format!(" {line}\n"));
+        }
+        for line in old[group.start..group.end].lines() {
+            out.push_str(&format!("-{line}\n"));
+        }
+        for line in &added {
+            out.push_str(&format!("+{line}\n"));
+        }
+        for line in old[group.end..old_end].lines() {
+            out.push_str(&format!(" {line}\n"));
+        }
+        new_offset += added.len() as isize - old_lines as isize;
+    }
+    truncate_patch(out)
 }
 
 fn group_regions(spans: &[(usize, usize)], matched: &[Matched]) -> Vec<Group> {
@@ -1379,16 +1552,14 @@ fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<Applied, 
         news.push(normalize_lf(&e.new_text).into_owned());
     }
 
-    if olds.iter().all(|old| normalized.contains(old.as_str())) {
-        let mut matched = find_exact(path, &normalized, &olds, &news)?;
+    if let Some(mut matched) = find_exact(path, &normalized, &olds, &news)? {
         check_overlap(path, &mut matched)?;
-        let spans = line_spans(&normalized);
-        let groups = group_regions(&spans, &matched);
+        let groups = exact_group_regions(&normalized, &matched);
         let blocks: Vec<String> = groups
             .iter()
-            .map(|g| group_block(&normalized, &spans, g, &matched))
+            .map(|g| exact_group_block(&normalized, g, &matched))
             .collect();
-        let patch = unified_patch(path, &normalized, &spans, &groups, &blocks);
+        let patch = exact_unified_patch(path, &normalized, &groups, &blocks);
         let out = apply_exact(body, &matched);
         if out == body {
             return Err(no_change_error(path, edits.len()));

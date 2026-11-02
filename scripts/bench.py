@@ -180,7 +180,20 @@ def run(binary, index, scenario):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        _, status, usage = os.wait4(process.pid, 0)
+        peak_rss = 0
+        while True:
+            try:
+                status_text = Path(f"/proc/{process.pid}/status").read_text()
+            except FileNotFoundError:
+                status_text = ""
+            for line in status_text.splitlines():
+                if line.startswith("VmHWM:"):
+                    peak_rss = max(peak_rss, int(line.split()[1]))
+                    break
+            pid, status, usage = os.wait4(process.pid, os.WNOHANG)
+            if pid:
+                break
+            time.sleep(0.001)
         code = os.waitstatus_to_exitcode(status)
         process.returncode = code
         elapsed = (time.perf_counter_ns() - started) / 1_000_000
@@ -195,7 +208,7 @@ def run(binary, index, scenario):
     with lock:
         sizes = request_bytes.pop(run_id)
         count = len(connections.pop(run_id))
-    return elapsed, cpu, usage.ru_maxrss, sum(sizes), count
+    return elapsed, cpu, peak_rss, sum(sizes), count
 
 
 scenarios = (
