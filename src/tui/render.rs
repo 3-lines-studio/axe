@@ -368,6 +368,14 @@ pub(super) fn cursor_row_col(input: &str, cursor: usize, width: usize) -> (usize
     (row, col)
 }
 
+/// First composer row to draw so `cursor_row` stays inside `height` rows.
+pub(super) fn input_scroll(cursor_row: usize, lines: usize, height: usize) -> usize {
+    let cursor_row = cursor_row.min(lines.saturating_sub(1));
+    (cursor_row + 1)
+        .saturating_sub(height)
+        .min(lines.saturating_sub(height))
+}
+
 /// Display columns a string occupies on screen (wide and zero-width aware).
 pub(super) fn columns(text: &str) -> usize {
     text.chars().map(char_columns).sum()

@@ -530,6 +530,10 @@ impl App {
         let composer_lines = input_lines + self.attachments.len();
         let input_height =
             composer_lines.clamp(1, frame.area().height.saturating_div(2) as usize) as u16;
+        let (cursor_row, cursor_col) = self.cursor_position(input_width);
+        let cursor_row =
+            (self.attachments.len() + cursor_row).min(composer_lines.saturating_sub(1));
+        let visible_start = input_scroll(cursor_row, composer_lines, input_height as usize);
         let activity_height = match (&self.tool, self.turn.busy()) {
             (
                 ToolActivity::Running {
@@ -604,7 +608,7 @@ impl App {
             }
             frame.render_widget(Paragraph::new(lines).style(Style::default()), areas[1]);
         }
-        let input = Paragraph::new(self.input_text(input_width));
+        let input = Paragraph::new(self.input_text(input_width)).scroll((visible_start as u16, 0));
         frame.render_widget(input, areas[2]);
         if let Overlay::Picker(picker) = &self.overlay {
             let mut lines = vec![Line::from(Span::styled(
@@ -662,15 +666,9 @@ impl App {
         }
         frame.render_widget(Clear, areas[4]);
         frame.render_widget(Paragraph::new(status).style(Style::default()), areas[4]);
-        let (cursor_row, cursor_col) = self.cursor_position(input_width);
-        let cursor_row = self.attachments.len() + cursor_row;
-        let visible_start = composer_lines.saturating_sub(input_height as usize);
-        let cursor_row = cursor_row
-            .saturating_sub(visible_start)
-            .min(input_height.saturating_sub(1) as usize);
         frame.set_cursor_position((
             areas[2].x + 2 + cursor_col as u16,
-            areas[2].y + cursor_row as u16,
+            areas[2].y + (cursor_row - visible_start) as u16,
         ));
     }
 
@@ -1142,6 +1140,16 @@ mod tests {
         assert_eq!(cursor_row_col("abcdef", 3, 5), (0, 3));
         assert_eq!(cursor_row_col("abcdef", 5, 5), (1, 0));
         assert_eq!(cursor_row_col("ab\ncd", 4, 5), (1, 1));
+    }
+
+    #[test]
+    fn input_scroll_keeps_the_cursor_visible() {
+        assert_eq!(input_scroll(0, 4, 10), 0);
+        assert_eq!(input_scroll(9, 10, 10), 0);
+        assert_eq!(input_scroll(0, 100, 10), 0);
+        assert_eq!(input_scroll(99, 100, 10), 90);
+        assert_eq!(input_scroll(42, 100, 10), 33);
+        assert_eq!(input_scroll(100, 100, 10), 90);
     }
 
     #[test]
