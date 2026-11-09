@@ -17,6 +17,7 @@ pub mod openai;
 pub mod run;
 pub mod sentinel;
 pub mod session;
+pub mod skills;
 pub mod tools;
 #[cfg(feature = "tui")]
 pub mod tui;

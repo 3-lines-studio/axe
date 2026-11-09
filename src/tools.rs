@@ -8,10 +8,13 @@ const DEFAULT_BASH_TIMEOUT: u64 = 120;
 const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub fn build_tools(dir: &str) -> Vec<Tool> {
-    build_tools_with(
-        std::sync::Arc::new(crate::machine::Local::new(dir)),
-        crate::web::Web::from_env(),
-    )
+    build_tools_for(dir, crate::web::Web::from_env())
+}
+
+pub fn build_tools_for(dir: &str, web: Option<crate::web::Web>) -> Vec<Tool> {
+    let mut tools = build_tools_with(std::sync::Arc::new(crate::machine::Local::new(dir)), web);
+    tools.extend(crate::skills::tools(std::path::Path::new(dir)));
+    tools
 }
 
 pub fn build_tools_on(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Vec<Tool> {

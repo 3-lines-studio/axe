@@ -10,6 +10,7 @@ pub enum Command {
     Compact,
     Copy,
     Image,
+    Skill,
     Quit,
 }
 
@@ -73,6 +74,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         action: Command::Image,
     },
     CommandSpec {
+        command: "/skill",
+        help: "/skill NAME",
+        description: "load a skill's instructions and run them",
+        category: "Skills",
+        action: Command::Skill,
+    },
+    CommandSpec {
         command: "/quit",
         help: "/quit",
         description: "exit the interactive shell",
@@ -120,6 +128,23 @@ pub fn command_search(query: &str) -> Vec<CommandSpec> {
                 || spec.category.to_lowercase().contains(&query)
         })
         .cloned()
+        .collect()
+}
+
+pub fn skill_query(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("/skill ")?;
+    if rest.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(rest)
+}
+
+pub fn skill_matches(skills: &[crate::skills::Skill], prefix: &str) -> Vec<String> {
+    let prefix = prefix.to_lowercase();
+    skills
+        .iter()
+        .filter(|skill| skill.name.to_lowercase().starts_with(&prefix))
+        .map(|skill| skill.name.clone())
         .collect()
 }
 
@@ -343,6 +368,29 @@ mod tests {
         assert_eq!(parse_command("/compact now"), Some(Command::Compact));
         assert_eq!(parse_command("missing"), None);
         assert_eq!(command_matches("res")[0].action, Command::Resume);
+    }
+
+    #[test]
+    fn offers_skill_names_after_the_skill_command() {
+        let skill = |name: &str, location: &str| crate::skills::Skill {
+            name: name.into(),
+            description: "does a thing".into(),
+            location: location.into(),
+        };
+        let skills = vec![
+            skill("code-review", "/tmp/review/SKILL.md"),
+            skill("pdf-processing", "/tmp/pdf/SKILL.md"),
+        ];
+        assert_eq!(skill_query("/skill "), Some(""));
+        assert_eq!(skill_query("/skill p"), Some("p"));
+        assert_eq!(skill_query("/skill pdf done"), None);
+        assert_eq!(skill_query("/skills"), None);
+        assert_eq!(
+            skill_matches(&skills, ""),
+            ["code-review", "pdf-processing"]
+        );
+        assert_eq!(skill_matches(&skills, "p"), ["pdf-processing"]);
+        assert_eq!(skill_matches(&skills, "zzz").len(), 0);
     }
 
     #[test]

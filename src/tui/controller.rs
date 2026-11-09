@@ -19,8 +19,8 @@ impl App {
     }
 
     pub(super) fn tools(&self) -> Vec<crate::Tool> {
-        crate::tools::build_tools_with(
-            Arc::new(crate::machine::Local::new(&self.cfg.dir)),
+        crate::tools::build_tools_for(
+            &self.cfg.dir,
             crate::web::Web::for_key(&self.cfg.base, &self.cfg.api_key),
         )
     }
@@ -154,6 +154,7 @@ impl App {
                         | app::Command::Resume
                         | app::Command::Rewind
                         | app::Command::Compact
+                        | app::Command::Skill
                 )
             )
         {
@@ -182,10 +183,63 @@ impl App {
             Some(app::Command::Compact) => self.start_compaction(),
             Some(app::Command::Copy) => self.copy_last(),
             Some(app::Command::Image) => self.attach(argument),
+            Some(app::Command::Skill) => match argument {
+                Some(name) if !name.is_empty() => self.activate_skill(name),
+                _ => self
+                    .entries
+                    .push(Entry::Notice("usage: /skill NAME".into())),
+            },
             None => self
                 .entries
                 .push(Entry::Notice(format!("unknown command: {input}"))),
         }
+    }
+
+    pub(super) fn activate_skill(&mut self, name: &str) {
+        let Some(skill) = self.skills.iter().find(|skill| skill.name == name).cloned() else {
+            let installed = self
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let notice = if installed.is_empty() {
+                "no skills installed".to_string()
+            } else {
+                format!("unknown skill: {name}; installed: {installed}")
+            };
+            self.entries.push(Entry::Notice(notice));
+            return;
+        };
+        let body = match crate::skills::render(&skill) {
+            Ok(body) => body,
+            Err(error) => {
+                self.entries.push(Entry::Notice(error));
+                return;
+            }
+        };
+        self.entries.push(Entry::User {
+            text: format!("/skill {name}"),
+            images: Vec::new(),
+        });
+        self.messages.push(Message {
+            role: "user".into(),
+            content: body,
+            tool_calls: Vec::new(),
+            tool_call_id: Default::default(),
+            reasoning: String::new(),
+            images: Vec::new(),
+        });
+        let entry = session::Entry::Message {
+            message: self.messages.last().unwrap().clone(),
+        };
+        if let Err(error) = self.cfg.store.append(&[entry]) {
+            self.entries
+                .push(Entry::Notice(format!("error: save session: {error}")));
+        }
+        self.transcript_dirty_full = true;
+        self.follow = true;
+        self.start_turn();
     }
 
     pub(super) fn attach(&mut self, argument: Option<&str>) {

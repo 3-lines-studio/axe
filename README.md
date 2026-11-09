@@ -9,9 +9,10 @@ Axe includes:
 - Project-scoped sessions, resume, rewind, and compaction
 - `read`, `write`, `edit`, and unsandboxed `bash`
 - `search` and `fetch` through DeepSeek's tools API
+- Agent Skills, discovered on disk and loaded on demand
 - A library surface for embedding the loop in another program
 
-It has no plugins, external tools, skills, or sidecar.
+It has no plugins, external tools, or sidecar.
 
 ## Install
 
@@ -85,6 +86,25 @@ base = "https://api.deepseek.com"
 `DEEPSEEK_API_KEY` or `OPENAI_API_KEY` overrides `api_key`; the same key is used for the model and, when the base URL is DeepSeek, for the `search` and `fetch` tools. The command-line `--model` and `--base` flags override the file. Reasoning effort defaults to `max`. Set `context_window` to enable automatic compaction before the configured limit. Extra system instructions go in `SYSTEM.md` beside the config file; `--system` replaces the full built-in system prompt for that run.
 
 Sessions are scoped by project and stored under the same Axe config directory. Starting a fresh TUI archives the prior live session for that project.
+
+## Skills
+
+Axe reads [Agent Skills](https://agentskills.io) from disk: any subdirectory with a `SKILL.md` file. It looks in, in increasing precedence:
+
+- `~/.config/axe/skills` (or `$XDG_CONFIG_HOME/axe/skills`)
+- `~/.agents/skills`
+- `<project>/.agents/skills`
+- `<project>/.axe/skills`
+
+A project skill shadows a user skill with the same `name`. Skills without a `description` in their frontmatter are skipped.
+
+Nothing is loaded into the prompt up front. The agent gets two tools: `list_skills` returns the name and description of every installed skill, and `load_skill NAME` returns one skill's `SKILL.md` body, its directory, and the files it bundles. The agent reads those bundled files with `read` only when the instructions ask for it. If no skills are installed, neither tool is added.
+
+In the TUI, `/skill NAME` loads a skill without waiting for the model to pick it. Type `/skill ` and the installed names complete.
+
+```sh
+npx skills add anthropics/skills
+```
 
 ## Use as a library
 

@@ -100,8 +100,10 @@ fn run_app(
     cfg: TuiConfig,
 ) -> Result<(), String> {
     cfg.store.archive();
+    let skills = crate::skills::discover(std::path::Path::new(&cfg.dir));
     let mut app = App {
         cfg,
+        skills,
         entries: Vec::new(),
         messages: Vec::new(),
         input: String::new(),
@@ -241,6 +243,7 @@ struct App {
     want_quit: bool,
     ctrl_c_armed: Option<Instant>,
     picker: Option<Picker>,
+    skills: Vec<crate::skills::Skill>,
     help_open: bool,
     help_selected: usize,
     resume_open: bool,
@@ -662,7 +665,9 @@ impl App {
         for message in messages {
             match message.role.as_str() {
                 "user" => self.entries.push(Entry::User {
-                    text: message.content.clone(),
+                    text: crate::skills::activated_name(&message.content)
+                        .map(|name| format!("/skill {name}"))
+                        .unwrap_or_else(|| message.content.clone()),
                     images: message.images.iter().map(crate::image::label).collect(),
                 }),
                 "assistant" => {

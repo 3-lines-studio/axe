@@ -920,6 +920,46 @@ def tui_help_screen(h, axe):
 
 
 @case
+def tui_skill_command(h, axe):
+    """`/skill` completes the installed skill names, and the picked skill's
+    instructions reach the model as a user turn with the frontmatter gone."""
+    skill = h.work / ".agents" / "skills" / "pdf-processing"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: pdf-processing\ndescription: Handles PDFs.\n---\n"
+        "# PDF\n\nRun scripts/extract.py\n"
+    )
+    (skill / "scripts" / "extract.py").write_text("print(1)\n")
+    with h.mock(ANSWER_SCENARIO) as srv:
+        t = h.tui(axe, base=srv.base_url)
+        try:
+            t.expect("Run /help")
+            t.type("/skill p")
+            t.expect("pdf-processing")
+            t.key("enter")
+            t.expect("/skill pdf-processing")
+            t.key("enter")
+            t.expect("Done")
+            t.type("/quit\r")
+            check(t.wait_exit() == 0, "exit code %s" % t.proc.poll())
+        finally:
+            t.close()
+        t2 = h.tui(axe, ["--resume", "last"], base=srv.base_url)
+        try:
+            t2.expect("Run /help")
+            t2.expect("/skill pdf-processing")
+            t2.type("/quit\r")
+            check(t2.wait_exit() == 0, "resumed session exit")
+        finally:
+            t2.close()
+        sent = body_msg(srv, 0, "user")[-1]["content"]
+    check('<skill_content name="pdf-processing">' in sent, sent)
+    check("Run scripts/extract.py" in sent, sent)
+    check("scripts/extract.py" in sent, sent)
+    check("description: Handles PDFs." not in sent, sent)
+
+
+@case
 def oneshot_reads_image(h, axe):
     """The model pulls an image into its own context by reading the file: the
     tool result carries the image, so no user turn is needed."""

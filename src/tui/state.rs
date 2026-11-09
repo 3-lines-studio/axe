@@ -28,6 +28,7 @@ pub(super) enum Entry {
 pub(super) enum PickerKind {
     Commands,
     Files,
+    Skills,
 }
 
 pub(super) struct Picker {
@@ -303,6 +304,24 @@ impl App {
             });
             return;
         }
+        if let Some(prefix) = app::skill_query(&self.input[..self.cursor]) {
+            let items = app::skill_matches(&self.skills, prefix);
+            let selected = self
+                .picker
+                .as_ref()
+                .filter(|picker| picker.kind == PickerKind::Skills)
+                .map_or(0, |picker| {
+                    picker.selected.min(items.len().saturating_sub(1))
+                });
+            self.picker = (!items.is_empty()).then_some(Picker {
+                kind: PickerKind::Skills,
+                start: self.cursor - prefix.len(),
+                end: self.cursor,
+                items,
+                selected,
+            });
+            return;
+        }
         let start = self.input[..self.cursor]
             .rfind(|character: char| {
                 character.is_whitespace()
@@ -349,10 +368,10 @@ impl App {
         let Some(item) = picker.items.get(picker.selected) else {
             return;
         };
-        let value = if picker.kind == PickerKind::Files {
-            format!("@{item}")
-        } else {
-            item.clone()
+        let value = match picker.kind {
+            PickerKind::Files => format!("@{item}"),
+            PickerKind::Skills => format!("{item} "),
+            PickerKind::Commands => item.clone(),
         };
         self.input.replace_range(picker.start..picker.end, &value);
         self.cursor = picker.start + value.len();

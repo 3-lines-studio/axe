@@ -500,10 +500,7 @@ fn api_key(fc: &FileConfig) -> String {
 }
 
 fn build_tools(dir: &str, base: &str, key: &str) -> Vec<Tool> {
-    axe::tools::build_tools_with(
-        Arc::new(axe::machine::Local::new(dir)),
-        axe::web::Web::for_key(base, key),
-    )
+    axe::tools::build_tools_for(dir, axe::web::Web::for_key(base, key))
 }
 
 fn work_dir(cfg: &Config) -> String {
