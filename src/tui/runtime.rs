@@ -1,7 +1,7 @@
 use crate::Message;
 use crate::Usage;
 use crate::app;
-use crate::run::{AgentEvent, Control, Observer};
+use crate::run::{AgentEvent, Control, Observer, Outcome};
 use crate::session;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -16,8 +16,7 @@ pub(super) enum TurnEvent {
         messages: Vec<Message>,
         usage: Usage,
         context: Usage,
-        error: Option<String>,
-        compact: bool,
+        outcome: Outcome,
     },
 }
 

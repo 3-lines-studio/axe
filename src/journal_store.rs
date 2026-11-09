@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 const CURRENT: &str = "session.current";
-const RESUME: &str = "session.resume_id";
 
 pub struct JournalStore {
     dir: PathBuf,
@@ -87,10 +86,6 @@ impl JournalStore {
         self.set_current(id.clone());
         id
     }
-
-    fn resume_path(&self) -> PathBuf {
-        self.dir.join(RESUME)
-    }
 }
 
 impl Store for JournalStore {
@@ -109,9 +104,8 @@ impl Store for JournalStore {
     fn append(&self, entries: &[Entry]) -> std::io::Result<()> {
         let id = self.current_id();
         self.with_journal(|journal| {
-            journal
-                .commit_session(&id, entries.to_vec(), Vec::new())
-                .map(|_| ())
+            journal.commit_session(&id, entries.to_vec())?;
+            journal.maybe_snapshot()
         })
     }
 
@@ -135,9 +129,8 @@ impl Store for JournalStore {
             state.point(index, state.context_tokens());
         }
         self.with_journal(|journal| {
-            journal
-                .commit_session_with_state(&id, entries.to_vec(), Vec::new(), Some(state))
-                .map(|_| ())
+            journal.commit_session_with_state(&id, entries.to_vec(), Some(state))?;
+            journal.maybe_snapshot()
         })
     }
 
@@ -177,14 +170,6 @@ impl Store for JournalStore {
         Ok(true)
     }
 
-    fn discard(&self) {
-        let id = self.current_id();
-        let _ = self.with_journal(|journal| {
-            journal.replace_session(&id, Vec::new(), SessionState::default())
-        });
-        self.write_current();
-    }
-
     fn list(&self) -> Vec<SessionMeta> {
         let mut grouped: BTreeMap<SessionId, Vec<session::Record>> = BTreeMap::new();
         for record in self.records() {
@@ -217,20 +202,5 @@ impl Store for JournalStore {
         }
         self.set_current(id);
         Some(records.into_iter().map(|record| record.entry).collect())
-    }
-
-    fn resume_id(&self) -> Option<String> {
-        let id = std::fs::read_to_string(self.resume_path()).ok()?;
-        SessionId::new(id.trim()).map(|id| id.as_str().to_string())
-    }
-
-    fn set_resume_id(&self, id: &str) {
-        if let Some(id) = SessionId::new(id) {
-            let _ = crate::atomic_write(&self.resume_path(), id.as_str().as_bytes());
-        }
-    }
-
-    fn clear_resume_id(&self) {
-        let _ = std::fs::remove_file(self.resume_path());
     }
 }

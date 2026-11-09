@@ -16,7 +16,7 @@ struct Config {
     spec: ModelSpec,
     system: String,
     dir: String,
-    resume: Option<String>,
+    resume: Option<axe::app::Resume>,
     images: Vec<Image>,
 }
 
@@ -94,7 +94,7 @@ fn main() {
         }
         prompt = vec![b];
     }
-    if cfg.resume.as_deref() == Some("") {
+    if matches!(cfg.resume, Some(axe::app::Resume::Picker)) {
         eprintln!("error: --resume needs last or a session id in one-shot mode");
         std::process::exit(2);
     }
@@ -128,7 +128,7 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
             std::process::exit(0);
         }
         if a == "-r" {
-            cfg.resume = Some(String::new());
+            cfg.resume = Some(axe::app::Resume::Picker);
             i += 1;
             continue;
         }
@@ -137,16 +137,20 @@ fn parse_args(args: &[String], fc: &FileConfig) -> Result<(Config, Vec<String>),
             if let Some(next) = args.get(i + 1)
                 && !next.starts_with('-')
             {
-                cfg.resume = Some(next.clone());
+                cfg.resume = Some(axe::app::Resume::Session(next.clone()));
                 i += 2;
                 continue;
             }
-            cfg.resume = Some(String::new());
+            cfg.resume = Some(axe::app::Resume::Picker);
             i += 1;
             continue;
         }
         if let Some(v) = a.strip_prefix("--resume=") {
-            cfg.resume = Some(v.to_string());
+            cfg.resume = Some(if v.is_empty() {
+                axe::app::Resume::Picker
+            } else {
+                axe::app::Resume::Session(v.to_string())
+            });
             i += 1;
             continue;
         }
@@ -295,7 +299,7 @@ fn one_shot(cfg: &Config, fc: &FileConfig, prompt: &[String]) {
     let mut history = Vec::new();
     let mut session_entries = Vec::new();
     let mut session_state = SessionState::default();
-    if let Some(id) = &cfg.resume {
+    if let Some(axe::app::Resume::Session(id)) = &cfg.resume {
         store.archive();
         let loaded = if id == "last" {
             store

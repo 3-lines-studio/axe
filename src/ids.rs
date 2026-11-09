@@ -49,28 +49,6 @@ impl fmt::Display for Seq {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct TaskId(pub u64);
-
-impl TaskId {
-    pub fn next(self) -> Self {
-        Self(self.0 + 1)
-    }
-
-    pub fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl fmt::Display for TaskId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(String);
@@ -119,7 +97,6 @@ mod tests {
     fn ids_advance_without_reuse() {
         assert_eq!(EntryId(4).next(), EntryId(5));
         assert_eq!(Seq(4).next(), Seq(5));
-        assert_eq!(TaskId(4).next(), TaskId(5));
     }
 
     #[test]

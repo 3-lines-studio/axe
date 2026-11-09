@@ -1,6 +1,12 @@
 use crate::session::{self, Entry, Store};
 use crate::{Message, ToolCall};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Resume {
+    Picker,
+    Session(String),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Help,

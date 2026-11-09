@@ -23,7 +23,7 @@ pub mod tools;
 pub mod tui;
 pub mod web;
 
-pub use ids::{EntryId, Seq, SessionId, TaskId};
+pub use ids::{EntryId, Seq, SessionId};
 pub use openai::OpenAI;
 
 pub fn system_prompt(tools: &[Tool]) -> String {

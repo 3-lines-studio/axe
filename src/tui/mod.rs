@@ -3,8 +3,8 @@ use crate::session::{self, SessionState, Store};
 use crate::{Image, Message};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -35,6 +35,8 @@ use state::{Entry, Picker};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+const ARM_WINDOW: Duration = Duration::from_millis(800);
+
 pub struct TuiConfig {
     pub base: String,
     pub model: String,
@@ -43,7 +45,202 @@ pub struct TuiConfig {
     pub dir: String,
     pub store: Arc<dyn Store>,
     pub api_key: String,
-    pub resume: Option<String>,
+    pub resume: Option<app::Resume>,
+}
+
+#[derive(Default)]
+struct DoublePress {
+    at: Option<Instant>,
+}
+
+impl DoublePress {
+    fn armed(&self) -> bool {
+        self.at.is_some_and(|at| at.elapsed() < ARM_WINDOW)
+    }
+
+    fn arm(&mut self) {
+        self.at = Some(Instant::now());
+    }
+
+    fn clear(&mut self) {
+        self.at = None;
+    }
+}
+
+enum Turn {
+    Idle,
+    Running {
+        events: Receiver<TurnEvent>,
+        steer: Sender<String>,
+        base: usize,
+    },
+    Compacting {
+        events: Receiver<TurnEvent>,
+        resume: bool,
+    },
+}
+
+impl Turn {
+    fn busy(&self) -> bool {
+        !matches!(self, Turn::Idle)
+    }
+
+    fn compacting(&self) -> bool {
+        matches!(self, Turn::Compacting { .. })
+    }
+}
+
+enum ToolActivity {
+    Idle,
+    Running {
+        label: String,
+        output: Option<String>,
+    },
+}
+
+enum Scroll {
+    Bottom,
+    At(u16),
+}
+
+impl Scroll {
+    fn row(&self, max: u16) -> u16 {
+        match self {
+            Scroll::Bottom => max,
+            Scroll::At(row) => (*row).min(max),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct Catalog {
+    query: String,
+    selected: usize,
+}
+
+enum CatalogKey {
+    Close,
+    Select,
+    Keep,
+}
+
+impl Catalog {
+    fn key(&mut self, key: KeyEvent, count: usize) -> CatalogKey {
+        match key.code {
+            KeyCode::Esc => return CatalogKey::Close,
+            KeyCode::Enter => return CatalogKey::Select,
+            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down => {
+                self.selected = (self.selected + 1).min(count.saturating_sub(1));
+            }
+            _ => {
+                if self.edit(key) {
+                    self.selected = 0;
+                }
+            }
+        }
+        CatalogKey::Keep
+    }
+
+    fn edit(&mut self, key: KeyEvent) -> bool {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char(character) => {
+                self.query.push(character);
+                true
+            }
+            KeyCode::Backspace => {
+                self.query.pop();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+enum Overlay {
+    None,
+    Picker(Picker),
+    Help(Catalog),
+    Resume {
+        catalog: Catalog,
+        sessions: Vec<session::SessionMeta>,
+    },
+    Rewind {
+        catalog: Catalog,
+        items: Vec<app::RewindItem>,
+    },
+    RewindPending,
+}
+
+enum Selection {
+    Command(app::Command),
+    Session(String),
+    Rewind(usize),
+}
+
+enum SessionOrigin {
+    Live,
+    Resumed(String),
+}
+
+enum Next {
+    Keep,
+    Idle,
+    Failed,
+    Lost,
+    Compact { resume: bool },
+    Turn,
+}
+
+struct TranscriptCache {
+    lines: Vec<Line<'static>>,
+    width: usize,
+    entries: usize,
+    dirty: bool,
+}
+
+impl Default for TranscriptCache {
+    fn default() -> Self {
+        Self {
+            lines: Vec::new(),
+            width: 0,
+            entries: 0,
+            dirty: true,
+        }
+    }
+}
+
+impl TranscriptCache {
+    fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+
+    fn text(&mut self, entries: &[Entry], width: usize) -> Text<'static> {
+        let live = matches!(entries.last(), Some(Entry::Assistant { .. }));
+        let prefix = entries.len() - usize::from(live);
+        if self.dirty || self.width != width || self.entries > prefix {
+            self.lines.clear();
+            push_transcript_header(&mut self.lines);
+            self.width = width;
+            self.entries = 0;
+            self.dirty = false;
+        }
+        while self.entries < prefix {
+            push_transcript_entry(&mut self.lines, &entries[self.entries], width);
+            self.entries += 1;
+        }
+        let mut lines = self.lines.clone();
+        if live {
+            push_transcript_entry(&mut lines, &entries[prefix], width);
+        }
+        Text::from(lines)
+    }
 }
 
 struct TerminalRestore {
@@ -109,16 +306,12 @@ fn run_app(
         input: String::new(),
         cursor: 0,
         attachments: Vec::new(),
-        scroll: 0,
+        scroll: Scroll::Bottom,
         max_scroll: 0,
         page_size: 1,
-        follow: true,
-        running: false,
-        compacting: false,
+        turn: Turn::Idle,
+        tool: ToolActivity::Idle,
         cancel: Arc::new(AtomicBool::new(false)),
-        events: None,
-        steer: None,
-        retry_after_compact: false,
         overflow_retried: false,
         input_tokens: 0,
         output_tokens: 0,
@@ -127,39 +320,21 @@ fn run_app(
         session_state: SessionState::default(),
         turn_started: Instant::now(),
         spinner_frame: 0,
-        tool_running: None,
-        tool_live: None,
         width: 80,
         history: Vec::new(),
         history_index: None,
         want_quit: false,
-        ctrl_c_armed: None,
-        picker: None,
-        help_open: false,
-        help_selected: 0,
-        resume_open: false,
-        resume_selected: 0,
-        sessions: Vec::new(),
-        catalog_query: String::new(),
-        rewind_open: false,
-        rewind_selected: 0,
-        rewind_items: Vec::new(),
-        esc_armed: None,
-        resume_id: None,
+        ctrl_c: DoublePress::default(),
+        esc: DoublePress::default(),
+        overlay: Overlay::None,
+        origin: SessionOrigin::Live,
         markdown_dirty: false,
-        turn_base_len: 0,
-        transcript_dirty_full: true,
-        transcript_cache_width: 0,
-        transcript_cache_entries: 0,
-        transcript_cache: Vec::new(),
-        pending_rewind: false,
+        transcript: TranscriptCache::default(),
     };
-    if let Some(id) = app.cfg.resume.clone() {
-        if id.is_empty() {
-            app.open_resume();
-        } else {
-            app.resume(&id);
-        }
+    match app.cfg.resume.clone() {
+        Some(app::Resume::Picker) => app.open_resume(),
+        Some(app::Resume::Session(id)) => app.resume(&id),
+        None => {}
     }
     let mut dirty = true;
     loop {
@@ -170,7 +345,7 @@ fn run_app(
             app.on_exit();
             return Ok(());
         }
-        if app.running || app.compacting {
+        if app.turn.busy() {
             let frame = spinner_frame(app.turn_started.elapsed());
             if frame != app.spinner_frame {
                 app.spinner_frame = frame;
@@ -183,7 +358,7 @@ fn run_app(
                 .map_err(|error| error.to_string())?;
             dirty = false;
         }
-        let wait = if app.running || app.compacting {
+        let wait = if app.turn.busy() {
             Duration::from_millis(30)
         } else {
             Duration::from_millis(250)
@@ -217,16 +392,12 @@ struct App {
     input: String,
     cursor: usize,
     attachments: Vec<Image>,
-    scroll: u16,
+    scroll: Scroll,
     max_scroll: u16,
     page_size: u16,
-    follow: bool,
-    running: bool,
-    compacting: bool,
+    turn: Turn,
+    tool: ToolActivity,
     cancel: Arc<AtomicBool>,
-    events: Option<Receiver<TurnEvent>>,
-    steer: Option<Sender<String>>,
-    retry_after_compact: bool,
     overflow_retried: bool,
     input_tokens: usize,
     output_tokens: usize,
@@ -235,33 +406,17 @@ struct App {
     session_state: SessionState,
     turn_started: Instant,
     spinner_frame: usize,
-    tool_running: Option<String>,
-    tool_live: Option<String>,
     width: usize,
     history: Vec<String>,
     history_index: Option<usize>,
     want_quit: bool,
-    ctrl_c_armed: Option<Instant>,
-    picker: Option<Picker>,
+    ctrl_c: DoublePress,
+    esc: DoublePress,
+    overlay: Overlay,
     skills: Vec<crate::skills::Skill>,
-    help_open: bool,
-    help_selected: usize,
-    resume_open: bool,
-    resume_selected: usize,
-    sessions: Vec<session::SessionMeta>,
-    catalog_query: String,
-    rewind_open: bool,
-    rewind_selected: usize,
-    rewind_items: Vec<app::RewindItem>,
-    esc_armed: Option<Instant>,
-    resume_id: Option<String>,
+    origin: SessionOrigin,
     markdown_dirty: bool,
-    turn_base_len: usize,
-    transcript_dirty_full: bool,
-    transcript_cache_width: usize,
-    transcript_cache_entries: usize,
-    transcript_cache: Vec<Line<'static>>,
-    pending_rewind: bool,
+    transcript: TranscriptCache,
 }
 
 fn push_transcript_header(lines: &mut Vec<Line<'static>>) {
@@ -337,19 +492,32 @@ fn push_transcript_entry(lines: &mut Vec<Line<'static>>, entry: &Entry, width: u
     lines.push(Line::default());
 }
 
+fn filtered_sessions<'a>(
+    sessions: &'a [session::SessionMeta],
+    query: &str,
+) -> Vec<&'a session::SessionMeta> {
+    let query = query.to_lowercase();
+    sessions
+        .iter()
+        .filter(|session| {
+            query.is_empty()
+                || session.title.to_lowercase().contains(&query)
+                || session.id.to_lowercase().contains(&query)
+        })
+        .collect()
+}
+
 impl App {
     fn draw(&mut self, frame: &mut ratatui::Frame) {
-        if self.help_open {
-            self.draw_help(frame);
-            return;
-        }
-        if self.resume_open {
-            self.draw_resume(frame);
-            return;
-        }
-        if self.rewind_open {
-            self.draw_rewind(frame);
-            return;
+        match &self.overlay {
+            Overlay::Help(catalog) => return self.draw_help(frame, catalog),
+            Overlay::Resume { catalog, sessions } => {
+                return self.draw_resume(frame, catalog, sessions);
+            }
+            Overlay::Rewind { catalog, items } => {
+                return self.draw_rewind(frame, catalog, items);
+            }
+            _ => {}
         }
         self.sync_picker();
         let width = frame.area().width.max(1);
@@ -362,15 +530,19 @@ impl App {
         let composer_lines = input_lines + self.attachments.len();
         let input_height =
             composer_lines.clamp(1, frame.area().height.saturating_div(2) as usize) as u16;
-        let activity_height = if self.tool_live.is_some() {
-            2
-        } else {
-            u16::from(self.running || self.compacting)
+        let activity_height = match (&self.tool, self.turn.busy()) {
+            (
+                ToolActivity::Running {
+                    output: Some(_), ..
+                },
+                _,
+            ) => 2,
+            _ => u16::from(self.turn.busy()),
         };
-        let picker_height = self
-            .picker
-            .as_ref()
-            .map_or(0, |picker| picker.items.len().min(6) as u16 + 2);
+        let picker_height = match &self.overlay {
+            Overlay::Picker(picker) => picker.items.len().min(6) as u16 + 2,
+            _ => 0,
+        };
         let areas = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -384,27 +556,22 @@ impl App {
         let transcript_width = areas[0].width.max(1) as usize;
         self.width = transcript_width;
         self.sync_markdown_width(transcript_width);
-        let transcript = self.transcript(transcript_width);
+        let transcript = self.transcript.text(&self.entries, transcript_width);
         let transcript = Paragraph::new(transcript).wrap(Wrap { trim: false });
         let line_count = transcript.line_count(areas[0].width.max(1)) as u16;
         self.page_size = areas[0].height.max(1);
         self.max_scroll = line_count.saturating_sub(self.page_size);
-        if self.follow {
-            self.scroll = self.max_scroll;
-        } else {
-            self.scroll = self.scroll.min(self.max_scroll);
-        }
-        let transcript = transcript.scroll((self.scroll, 0));
+        let transcript = transcript.scroll((self.scroll.row(self.max_scroll), 0));
         frame.render_widget(transcript, areas[0]);
-        if self.running || self.compacting {
+        if self.turn.busy() {
             let palette = theme::palette();
             let elapsed = self.turn_started.elapsed();
-            let (label, color) = if self.compacting {
-                ("Compacting".to_string(), palette.secondary)
-            } else if let Some(tool) = &self.tool_running {
-                (tool.clone(), palette.tool)
-            } else {
-                (
+            let (label, color) = match &self.tool {
+                ToolActivity::Running { label, .. } => (label.clone(), palette.tool),
+                ToolActivity::Idle if self.turn.compacting() => {
+                    ("Compacting".to_string(), palette.secondary)
+                }
+                ToolActivity::Idle => (
                     format!(
                         "Thinking ({}s) (↑{} ↓{})",
                         elapsed.as_secs(),
@@ -412,7 +579,7 @@ impl App {
                         format_tokens(self.output_tokens)
                     ),
                     palette.strong,
-                )
+                ),
             };
             let mut lines = vec![Line::from(vec![
                 Span::styled(
@@ -425,7 +592,11 @@ impl App {
                     Style::default(),
                 ),
             ])];
-            if let Some(output) = &self.tool_live {
+            if let ToolActivity::Running {
+                output: Some(output),
+                ..
+            } = &self.tool
+            {
                 lines.push(Line::from(Span::styled(
                     format!("  {}", output.lines().last().unwrap_or_default()),
                     Style::default(),
@@ -435,7 +606,7 @@ impl App {
         }
         let input = Paragraph::new(self.input_text(input_width));
         frame.render_widget(input, areas[2]);
-        if let Some(picker) = &self.picker {
+        if let Overlay::Picker(picker) = &self.overlay {
             let mut lines = vec![Line::from(Span::styled(
                 "─".repeat(width as usize),
                 Style::default(),
@@ -455,7 +626,7 @@ impl App {
             )));
             frame.render_widget(Paragraph::new(lines), areas[3]);
         }
-        let mut status = if self.ctrl_c_armed.is_some() {
+        let mut status = if self.ctrl_c.armed() {
             "press ctrl+c again to exit".to_string()
         } else {
             let mut parts = vec![self.cfg.model.clone()];
@@ -482,8 +653,12 @@ impl App {
             }
             parts.join(" · ")
         };
-        if !self.follow {
-            status.push_str(&format!(" · {}/{}", self.scroll, self.max_scroll));
+        if !matches!(self.scroll, Scroll::Bottom) {
+            status.push_str(&format!(
+                " · {}/{}",
+                self.scroll.row(self.max_scroll),
+                self.max_scroll
+            ));
         }
         frame.render_widget(Clear, areas[4]);
         frame.render_widget(Paragraph::new(status).style(Style::default()), areas[4]);
@@ -499,27 +674,11 @@ impl App {
         ));
     }
 
-    fn filtered_sessions(&self) -> Vec<&session::SessionMeta> {
-        let query = self.catalog_query.to_lowercase();
-        self.sessions
-            .iter()
-            .filter(|session| {
-                query.is_empty()
-                    || session.title.to_lowercase().contains(&query)
-                    || session.id.to_lowercase().contains(&query)
-            })
-            .collect()
-    }
-
-    fn filtered_rewind_items(&self) -> Vec<app::RewindItem> {
-        app::filter_rewind_items(&self.rewind_items, &self.catalog_query)
-    }
-
-    fn draw_help(&self, frame: &mut ratatui::Frame) {
-        let commands = app::command_search(&self.catalog_query);
+    fn draw_help(&self, frame: &mut ratatui::Frame, catalog: &Catalog) {
+        let commands = app::command_search(&catalog.query);
         let area = frame.area();
         let visible = area.height.saturating_sub(4) as usize;
-        let start = self.help_selected.saturating_sub(visible.saturating_sub(1));
+        let start = catalog.selected.saturating_sub(visible.saturating_sub(1));
         let mut lines = vec![
             Line::from(Span::styled(
                 format!("Help {}", commands.len()),
@@ -528,7 +687,7 @@ impl App {
             Line::default(),
         ];
         for (index, command) in commands.iter().enumerate().skip(start).take(visible) {
-            let style = if index == self.help_selected {
+            let style = if index == catalog.selected {
                 Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
             } else {
                 Style::default()
@@ -546,20 +705,23 @@ impl App {
         lines.push(Line::from(Span::styled(
             format!(
                 "Search: {}     ↑↓ Navigate     Enter Open     Esc Close",
-                self.catalog_query
+                catalog.query
             ),
             Style::default(),
         )));
         frame.render_widget(Paragraph::new(lines), area);
     }
 
-    fn draw_resume(&self, frame: &mut ratatui::Frame) {
-        let sessions = self.filtered_sessions();
+    fn draw_resume(
+        &self,
+        frame: &mut ratatui::Frame,
+        catalog: &Catalog,
+        sessions: &[session::SessionMeta],
+    ) {
+        let sessions = filtered_sessions(sessions, &catalog.query);
         let area = frame.area();
         let visible = area.height.saturating_sub(4) as usize;
-        let start = self
-            .resume_selected
-            .saturating_sub(visible.saturating_sub(1));
+        let start = catalog.selected.saturating_sub(visible.saturating_sub(1));
         let mut lines = vec![
             Line::from(Span::styled(
                 format!("Resume {}", sessions.len()),
@@ -568,7 +730,7 @@ impl App {
             Line::default(),
         ];
         for (index, session) in sessions.iter().enumerate().skip(start).take(visible) {
-            let style = if index == self.resume_selected {
+            let style = if index == catalog.selected {
                 Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
             } else {
                 Style::default()
@@ -594,7 +756,7 @@ impl App {
         lines.push(Line::from(Span::styled(
             format!(
                 "Search: {}     ↑↓ Navigate     Enter Resume     Esc Close",
-                self.catalog_query
+                catalog.query
             ),
             Style::default(),
         )));
@@ -602,24 +764,30 @@ impl App {
     }
 
     fn open_rewind(&mut self) {
-        if self.running {
-            self.pending_rewind = true;
+        if self.turn.busy() {
+            self.overlay = Overlay::RewindPending;
             return;
         }
-        self.rewind_items = app::rewind_items(&self.messages);
-        self.catalog_query.clear();
-        self.rewind_selected = self.rewind_items.len().saturating_sub(1);
-        self.rewind_open = true;
-        self.picker = None;
+        let items = app::rewind_items(&self.messages);
+        self.overlay = Overlay::Rewind {
+            catalog: Catalog {
+                query: String::new(),
+                selected: items.len().saturating_sub(1),
+            },
+            items,
+        };
     }
 
-    fn draw_rewind(&self, frame: &mut ratatui::Frame) {
-        let items = self.filtered_rewind_items();
+    fn draw_rewind(
+        &self,
+        frame: &mut ratatui::Frame,
+        catalog: &Catalog,
+        items: &[app::RewindItem],
+    ) {
+        let items = app::filter_rewind_items(items, &catalog.query);
         let area = frame.area();
         let visible = area.height.saturating_sub(4) as usize;
-        let start = self
-            .rewind_selected
-            .saturating_sub(visible.saturating_sub(1));
+        let start = catalog.selected.saturating_sub(visible.saturating_sub(1));
         let mut lines = vec![
             Line::from(Span::styled(
                 format!("Rewind {}", items.len()),
@@ -628,7 +796,7 @@ impl App {
             Line::default(),
         ];
         for (index, item) in items.iter().enumerate().skip(start).take(visible) {
-            let style = if index == self.rewind_selected {
+            let style = if index == catalog.selected {
                 Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
             } else {
                 Style::default()
@@ -646,7 +814,7 @@ impl App {
         lines.push(Line::from(Span::styled(
             format!(
                 "Search: {}     ↑↓ Navigate     Enter Rewind     Esc Close",
-                self.catalog_query
+                catalog.query
             ),
             Style::default(),
         )));
@@ -654,13 +822,12 @@ impl App {
     }
 
     fn rebuild_transcript(&mut self) {
-        self.transcript_dirty_full = true;
         let messages = self.messages.clone();
         self.rebuild_transcript_from(&messages);
     }
 
     fn rebuild_transcript_from(&mut self, messages: &[Message]) {
-        self.transcript_dirty_full = true;
+        self.transcript.invalidate();
         self.entries.clear();
         for message in messages {
             match message.role.as_str() {
@@ -718,31 +885,6 @@ impl App {
             }
             self.markdown_dirty = false;
         }
-    }
-
-    fn transcript(&mut self, width: usize) -> Text<'static> {
-        let last_is_assistant = matches!(self.entries.last(), Some(Entry::Assistant { .. }));
-        let prefix = self.entries.len() - usize::from(last_is_assistant);
-        let reset = self.transcript_dirty_full
-            || self.transcript_cache_width != width
-            || self.transcript_cache_entries > prefix;
-        if reset {
-            self.transcript_cache.clear();
-            push_transcript_header(&mut self.transcript_cache);
-            self.transcript_cache_width = width;
-            self.transcript_cache_entries = 0;
-            self.transcript_dirty_full = false;
-        }
-        while self.transcript_cache_entries < prefix {
-            let entry = &self.entries[self.transcript_cache_entries];
-            push_transcript_entry(&mut self.transcript_cache, entry, width);
-            self.transcript_cache_entries += 1;
-        }
-        let mut lines = self.transcript_cache.clone();
-        if last_is_assistant {
-            push_transcript_entry(&mut lines, &self.entries[prefix], width);
-        }
-        Text::from(lines)
     }
 
     fn input_text(&self, width: usize) -> Text<'static> {
@@ -1020,6 +1162,34 @@ mod tests {
         let mut lines = Vec::new();
         push_transcript_entry(&mut lines, &Entry::Tool(vec!["Ran ls".into()]), 40);
         assert_eq!(line_text(&lines[0]), "● Ran ls");
+    }
+
+    #[test]
+    fn catalog_keeps_its_selection_inside_the_list() {
+        let mut catalog = Catalog::default();
+        assert!(matches!(
+            catalog.key(KeyEvent::from(KeyCode::Up), 3),
+            CatalogKey::Keep
+        ));
+        assert_eq!(catalog.selected, 0);
+        for _ in 0..5 {
+            catalog.key(KeyEvent::from(KeyCode::Down), 3);
+        }
+        assert_eq!(catalog.selected, 2);
+        catalog.key(KeyEvent::from(KeyCode::Char('a')), 3);
+        assert_eq!(catalog.query, "a");
+        assert_eq!(catalog.selected, 0);
+        assert!(matches!(
+            catalog.key(KeyEvent::from(KeyCode::Esc), 3),
+            CatalogKey::Close
+        ));
+    }
+
+    #[test]
+    fn scroll_past_the_end_follows_the_bottom_again() {
+        assert_eq!(Scroll::Bottom.row(10), 10);
+        assert_eq!(Scroll::At(4).row(10), 4);
+        assert_eq!(Scroll::At(40).row(10), 10);
     }
 
     #[test]

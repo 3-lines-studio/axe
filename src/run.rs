@@ -514,7 +514,7 @@ fn stream<P: Provider>(
         let started = Instant::now();
         let handle = provider.stream(&req, cancel);
         let mut calls = Vec::new();
-        let mut forwarded = 0usize;
+        let mut committed = false;
         let mut first_event = false;
         while let Ok(ev) = handle.events().recv() {
             match ev {
@@ -526,7 +526,7 @@ fn stream<P: Provider>(
                         ));
                         first_event = true;
                     }
-                    forwarded += 1;
+                    committed = true;
                     hooks.event(AgentEvent::AssistantDelta(&d));
                 }
                 StreamEvent::ToolCall(c) => {
@@ -537,7 +537,7 @@ fn stream<P: Provider>(
                         ));
                         first_event = true;
                     }
-                    forwarded += 1;
+                    committed = true;
                     calls.push(c);
                 }
                 StreamEvent::Tokens {
@@ -564,12 +564,12 @@ fn stream<P: Provider>(
                 return Ok((resp, calls));
             }
             Ok(resp) => {
-                if attempt >= MAX_RETRIES || forwarded > 0 {
+                if attempt >= MAX_RETRIES || committed {
                     return Err(format!("provider interrupted: {}", resp.stop_reason));
                 }
             }
             Err(e) => {
-                if attempt >= MAX_RETRIES || forwarded > 0 || !retryable(&e) {
+                if attempt >= MAX_RETRIES || committed || !retryable(&e) {
                     return Err(e.to_string());
                 }
             }

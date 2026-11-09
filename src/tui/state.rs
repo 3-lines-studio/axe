@@ -1,14 +1,16 @@
-use super::App;
 use super::render::{assistant_entry, byte_at_column, dropped_image_path};
 use super::runtime::TurnEvent;
 use super::status::{self, State};
+use super::{
+    App, CatalogKey, Next, Overlay, Scroll, Selection, ToolActivity, Turn, filtered_sessions,
+};
 use crate::app;
+use crate::run::Outcome;
 use crate::session;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
 
 pub(super) enum Entry {
     User {
@@ -41,81 +43,10 @@ pub(super) struct Picker {
 
 impl App {
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
-        if self.rewind_open {
-            match key.code {
-                KeyCode::Esc => self.rewind_open = false,
-                KeyCode::Up => {
-                    self.rewind_selected = self.rewind_selected.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    self.rewind_selected = (self.rewind_selected + 1)
-                        .min(self.filtered_rewind_items().len().saturating_sub(1));
-                }
-                KeyCode::Enter => {
-                    if let Some(index) = self
-                        .filtered_rewind_items()
-                        .get(self.rewind_selected)
-                        .map(|item| item.message_index)
-                    {
-                        self.rewind_open = false;
-                        self.rewind_to(index);
-                    }
-                }
-                _ if self.edit_catalog_query(key) => self.rewind_selected = 0,
-                _ => {}
-            }
-            return false;
+        if key.code != KeyCode::Esc {
+            self.esc.clear();
         }
-        if self.resume_open {
-            match key.code {
-                KeyCode::Esc => self.resume_open = false,
-                KeyCode::Up => {
-                    self.resume_selected = self.resume_selected.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    self.resume_selected = (self.resume_selected + 1)
-                        .min(self.filtered_sessions().len().saturating_sub(1));
-                }
-                KeyCode::Enter => {
-                    if let Some(id) = self
-                        .filtered_sessions()
-                        .get(self.resume_selected)
-                        .map(|session| session.id.clone())
-                    {
-                        self.resume_open = false;
-                        self.resume(&id);
-                    }
-                }
-                _ if self.edit_catalog_query(key) => self.resume_selected = 0,
-                _ => {}
-            }
-            return false;
-        }
-        if self.help_open {
-            match key.code {
-                KeyCode::Esc => self.help_open = false,
-                KeyCode::Up => {
-                    self.help_selected = self.help_selected.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    self.help_selected = (self.help_selected + 1).min(
-                        app::command_search(&self.catalog_query)
-                            .len()
-                            .saturating_sub(1),
-                    );
-                }
-                KeyCode::Enter => {
-                    if let Some(command) = app::command_search(&self.catalog_query)
-                        .get(self.help_selected)
-                        .map(|command| command.command)
-                    {
-                        self.help_open = false;
-                        self.run_command(command);
-                    }
-                }
-                _ if self.edit_catalog_query(key) => self.help_selected = 0,
-                _ => {}
-            }
+        if self.handle_overlay(key) {
             return false;
         }
         if key.code == KeyCode::Enter
@@ -124,10 +55,10 @@ impl App {
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
         {
             self.insert('\n');
-            self.picker = None;
+            self.overlay = Overlay::None;
             return false;
         }
-        if self.picker.is_some() {
+        if matches!(self.overlay, Overlay::Picker(_)) {
             match key.code {
                 KeyCode::Up => {
                     self.move_picker(true);
@@ -142,7 +73,7 @@ impl App {
                     return false;
                 }
                 KeyCode::Esc => {
-                    self.picker = None;
+                    self.overlay = Overlay::None;
                     return false;
                 }
                 _ => {}
@@ -165,7 +96,7 @@ impl App {
                 }
                 KeyCode::Char('j') => {
                     self.insert('\n');
-                    self.picker = None;
+                    self.overlay = Overlay::None;
                     return false;
                 }
                 KeyCode::Char('u') => {
@@ -190,22 +121,7 @@ impl App {
                     self.cursor = self.input.len();
                     return false;
                 }
-                KeyCode::Char('c') => {
-                    if self.running {
-                        self.cancel.store(true, Ordering::Relaxed);
-                    } else if self
-                        .ctrl_c_armed
-                        .is_some_and(|armed| armed.elapsed() < Duration::from_millis(800))
-                    {
-                        return true;
-                    } else if self.input.is_empty() {
-                        self.ctrl_c_armed = Some(Instant::now());
-                    } else {
-                        self.input.clear();
-                        self.cursor = 0;
-                    }
-                    return false;
-                }
+                KeyCode::Char('c') => return self.interrupt(),
                 _ => {}
             }
         }
@@ -249,14 +165,11 @@ impl App {
             KeyCode::PageUp => self.scroll_up(self.page_size.saturating_sub(1)),
             KeyCode::PageDown => self.scroll_down(self.page_size.saturating_sub(1)),
             KeyCode::Esc => {
-                if self
-                    .esc_armed
-                    .is_some_and(|armed| armed.elapsed() < Duration::from_millis(800))
-                {
-                    self.esc_armed = None;
+                if self.esc.armed() {
+                    self.esc.clear();
                     self.open_rewind();
                 } else {
-                    self.esc_armed = Some(Instant::now());
+                    self.esc.arm();
                 }
             }
             _ => {}
@@ -264,62 +177,102 @@ impl App {
         false
     }
 
-    pub(super) fn edit_catalog_query(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                self.catalog_query.push(character);
-                true
+    fn interrupt(&mut self) -> bool {
+        if matches!(self.turn, Turn::Running { .. }) {
+            self.cancel.store(true, Ordering::Relaxed);
+            return false;
+        }
+        if self.ctrl_c.armed() {
+            return true;
+        }
+        if self.input.is_empty() {
+            self.ctrl_c.arm();
+        } else {
+            self.input.clear();
+            self.cursor = 0;
+        }
+        false
+    }
+
+    fn handle_overlay(&mut self, key: KeyEvent) -> bool {
+        let count = self.overlay_count();
+        let action = match &mut self.overlay {
+            Overlay::None | Overlay::Picker(_) | Overlay::RewindPending => return false,
+            Overlay::Help(catalog) => catalog.key(key, count),
+            Overlay::Resume { catalog, .. } => catalog.key(key, count),
+            Overlay::Rewind { catalog, .. } => catalog.key(key, count),
+        };
+        match action {
+            CatalogKey::Keep => {}
+            CatalogKey::Close => self.overlay = Overlay::None,
+            CatalogKey::Select => self.select_overlay(),
+        }
+        true
+    }
+
+    fn overlay_count(&self) -> usize {
+        match &self.overlay {
+            Overlay::Help(catalog) => app::command_search(&catalog.query).len(),
+            Overlay::Resume { catalog, sessions } => {
+                filtered_sessions(sessions, &catalog.query).len()
             }
-            KeyCode::Backspace => {
-                self.catalog_query.pop();
-                true
+            Overlay::Rewind { catalog, items } => {
+                app::filter_rewind_items(items, &catalog.query).len()
             }
-            _ => false,
+            _ => 0,
+        }
+    }
+
+    fn selection(&self) -> Option<Selection> {
+        match &self.overlay {
+            Overlay::Help(catalog) => app::command_search(&catalog.query)
+                .get(catalog.selected)
+                .map(|spec| Selection::Command(spec.action)),
+            Overlay::Resume { catalog, sessions } => filtered_sessions(sessions, &catalog.query)
+                .get(catalog.selected)
+                .map(|session| Selection::Session(session.id.clone())),
+            Overlay::Rewind { catalog, items } => app::filter_rewind_items(items, &catalog.query)
+                .get(catalog.selected)
+                .map(|item| Selection::Rewind(item.message_index)),
+            _ => None,
+        }
+    }
+
+    fn select_overlay(&mut self) {
+        let Some(selection) = self.selection() else {
+            return;
+        };
+        self.overlay = Overlay::None;
+        match selection {
+            Selection::Command(command) => self.execute(command, None),
+            Selection::Session(id) => self.resume(&id),
+            Selection::Rewind(index) => self.rewind_to(index),
         }
     }
 
     pub(super) fn sync_picker(&mut self) {
+        if !matches!(self.overlay, Overlay::None | Overlay::Picker(_)) {
+            return;
+        }
         if self.input.starts_with('/') && !self.input[..self.cursor].contains(char::is_whitespace) {
             let items = app::command_matches(&self.input[1..self.cursor])
                 .into_iter()
                 .map(|spec| spec.command.to_string())
                 .collect::<Vec<_>>();
-            let selected = self
-                .picker
-                .as_ref()
-                .filter(|picker| picker.kind == PickerKind::Commands)
-                .map_or(0, |picker| {
-                    picker.selected.min(items.len().saturating_sub(1))
-                });
-            self.picker = (!items.is_empty()).then_some(Picker {
-                kind: PickerKind::Commands,
-                start: 0,
-                end: self.cursor,
-                items,
-                selected,
-            });
+            let selected = self.picker_selection(PickerKind::Commands, &items);
+            self.set_picker(PickerKind::Commands, 0, self.cursor, items, selected);
             return;
         }
         if let Some(prefix) = app::skill_query(&self.input[..self.cursor]) {
             let items = app::skill_matches(&self.skills, prefix);
-            let selected = self
-                .picker
-                .as_ref()
-                .filter(|picker| picker.kind == PickerKind::Skills)
-                .map_or(0, |picker| {
-                    picker.selected.min(items.len().saturating_sub(1))
-                });
-            self.picker = (!items.is_empty()).then_some(Picker {
-                kind: PickerKind::Skills,
-                start: self.cursor - prefix.len(),
-                end: self.cursor,
+            let selected = self.picker_selection(PickerKind::Skills, &items);
+            self.set_picker(
+                PickerKind::Skills,
+                self.cursor - prefix.len(),
+                self.cursor,
                 items,
                 selected,
-            });
+            );
             return;
         }
         let start = self.input[..self.cursor]
@@ -330,30 +283,51 @@ impl App {
             .map_or(0, |index| index + 1);
         if self.input[start..self.cursor].starts_with('@') {
             let items = app::file_matches(&self.input[start + 1..self.cursor], &self.cfg.dir);
-            let selected = self
-                .picker
-                .as_ref()
-                .filter(|picker| picker.kind == PickerKind::Files)
-                .map_or(0, |picker| {
-                    picker.selected.min(items.len().saturating_sub(1))
-                });
-            self.picker = (!items.is_empty()).then_some(Picker {
-                kind: PickerKind::Files,
-                start,
-                end: self.cursor,
-                items,
-                selected,
-            });
+            let selected = self.picker_selection(PickerKind::Files, &items);
+            self.set_picker(PickerKind::Files, start, self.cursor, items, selected);
             return;
         }
-        self.picker = None;
+        self.overlay = Overlay::None;
+    }
+
+    fn picker_selection(&self, kind: PickerKind, items: &[String]) -> usize {
+        match &self.overlay {
+            Overlay::Picker(picker) if picker.kind == kind => {
+                picker.selected.min(items.len().saturating_sub(1))
+            }
+            _ => 0,
+        }
+    }
+
+    fn set_picker(
+        &mut self,
+        kind: PickerKind,
+        start: usize,
+        end: usize,
+        items: Vec<String>,
+        selected: usize,
+    ) {
+        self.overlay = if items.is_empty() {
+            Overlay::None
+        } else {
+            Overlay::Picker(Picker {
+                kind,
+                start,
+                end,
+                items,
+                selected,
+            })
+        };
     }
 
     pub(super) fn move_picker(&mut self, up: bool) {
-        let Some(picker) = &mut self.picker else {
+        let Overlay::Picker(picker) = &mut self.overlay else {
             return;
         };
         let count = picker.items.len();
+        if count == 0 {
+            return;
+        }
         if up {
             picker.selected = (picker.selected + count - 1) % count;
         } else {
@@ -362,8 +336,12 @@ impl App {
     }
 
     pub(super) fn select_picker(&mut self) {
-        let Some(picker) = self.picker.take() else {
-            return;
+        let picker = match std::mem::replace(&mut self.overlay, Overlay::None) {
+            Overlay::Picker(picker) => picker,
+            other => {
+                self.overlay = other;
+                return;
+            }
         };
         let Some(item) = picker.items.get(picker.selected) else {
             return;
@@ -381,13 +359,17 @@ impl App {
     }
 
     pub(super) fn scroll_up(&mut self, rows: u16) {
-        self.follow = false;
-        self.scroll = self.scroll.saturating_sub(rows);
+        self.scroll = Scroll::At(self.scroll.row(self.max_scroll).saturating_sub(rows));
     }
 
     pub(super) fn scroll_down(&mut self, rows: u16) {
-        self.scroll = self.scroll.saturating_add(rows).min(self.max_scroll);
-        self.follow = self.scroll == self.max_scroll;
+        let max = self.max_scroll;
+        let row = self.scroll.row(max).saturating_add(rows).min(max);
+        self.scroll = if row == max {
+            Scroll::Bottom
+        } else {
+            Scroll::At(row)
+        };
     }
 
     pub(super) fn paste(&mut self, text: &str) {
@@ -565,14 +547,15 @@ impl App {
     }
 
     pub(super) fn drain_events(&mut self) -> bool {
-        let Some(receiver) = self.events.take() else {
-            return false;
+        let turn = std::mem::replace(&mut self.turn, Turn::Idle);
+        let (events, base, resume) = match &turn {
+            Turn::Idle => return false,
+            Turn::Running { events, base, .. } => (events, *base, false),
+            Turn::Compacting { events, resume } => (events, 0, *resume),
         };
         let mut changed = false;
-        let mut compact_after = false;
-        let mut turn_after = false;
-        let mut failed = false;
-        while let Ok(event) = receiver.try_recv() {
+        let mut next = Next::Keep;
+        while let Ok(event) = events.try_recv() {
             changed = true;
             match event {
                 TurnEvent::AssistantDelta(delta) => {
@@ -584,14 +567,19 @@ impl App {
                     }
                 }
                 TurnEvent::ToolStart(label) => {
-                    self.tool_running = Some(label);
-                    self.tool_live = None;
+                    self.tool = ToolActivity::Running {
+                        label,
+                        output: None,
+                    };
                 }
-                TurnEvent::ToolDelta(output) => self.tool_live = Some(output),
+                TurnEvent::ToolDelta(output) => {
+                    if let ToolActivity::Running { output: live, .. } = &mut self.tool {
+                        *live = Some(output);
+                    }
+                }
                 TurnEvent::ToolResult(label) => {
-                    self.transcript_dirty_full = true;
-                    self.tool_running = None;
-                    self.tool_live = None;
+                    self.transcript.invalidate();
+                    self.tool = ToolActivity::Idle;
                     if let Some(Entry::Tool(calls)) = self.entries.last_mut() {
                         calls.push(label);
                     } else {
@@ -605,9 +593,8 @@ impl App {
                     self.output_tokens = usage.output;
                 }
                 TurnEvent::Compacted(result) => {
-                    self.transcript_dirty_full = true;
-                    self.compacting = false;
-                    match result {
+                    self.transcript.invalidate();
+                    next = match result {
                         Ok((summary, tokens_before, retained, mut entries)) => {
                             let entry = session::Entry::Compaction {
                                 summary,
@@ -619,31 +606,33 @@ impl App {
                             {
                                 self.entries
                                     .push(Entry::Notice(format!("error: save session: {error}")));
-                                continue;
+                                Next::Idle
+                            } else {
+                                entries.push(entry);
+                                self.messages = session::context_messages(&entries);
+                                self.input_tokens = 0;
+                                self.output_tokens = 0;
+                                self.rebuild_transcript();
+                                self.entries.push(Entry::Notice("compacted".into()));
+                                if resume { Next::Turn } else { Next::Idle }
                             }
-                            entries.push(entry);
-                            self.messages = session::context_messages(&entries);
-                            self.input_tokens = 0;
-                            self.output_tokens = 0;
-                            self.rebuild_transcript();
-                            self.entries.push(Entry::Notice("compacted".into()));
-                            turn_after = self.retry_after_compact;
-                            self.retry_after_compact = false;
                         }
-                        Err(error) => self
-                            .entries
-                            .push(Entry::Notice(format!("compaction failed: {error}"))),
-                    }
+                        Err(error) => {
+                            self.entries
+                                .push(Entry::Notice(format!("compaction failed: {error}")));
+                            Next::Idle
+                        }
+                    };
                 }
                 TurnEvent::End {
                     messages,
                     usage,
                     context,
-                    error,
-                    compact,
+                    outcome,
                 } => {
-                    self.transcript_dirty_full = true;
-                    let entries: Vec<_> = messages[self.turn_base_len..]
+                    self.transcript.invalidate();
+                    self.tool = ToolActivity::Idle;
+                    let entries: Vec<_> = messages[base..]
                         .iter()
                         .cloned()
                         .map(|message| session::Entry::Message { message })
@@ -655,46 +644,60 @@ impl App {
                             .push(Entry::Notice(format!("error: save session: {error}")));
                     }
                     self.messages = messages;
-                    self.turn_base_len = 0;
                     self.session_state = state;
                     self.session_input = self.session_state.input;
                     self.session_output = self.session_state.output;
                     self.input_tokens = self.session_state.context_input;
                     self.output_tokens = self.session_state.context_output;
-                    self.running = false;
-                    self.steer = None;
-                    let rewinding = self.pending_rewind;
-                    if rewinding {
-                        self.pending_rewind = false;
+                    if matches!(self.overlay, Overlay::RewindPending) {
                         self.open_rewind();
+                        next = Next::Idle;
+                        continue;
                     }
-                    compact_after = compact
-                        || error.as_deref().is_some_and(session::is_overflow_error)
-                            && !self.overflow_retried;
-                    if compact_after {
-                        self.retry_after_compact = true;
-                        self.overflow_retried = true;
-                    } else if let Some(error) = error {
-                        failed = true;
-                        self.entries.push(Entry::Notice(format!("error: {error}")));
-                    }
-                    if rewinding {
-                        compact_after = false;
-                        turn_after = false;
-                    }
+                    next = match outcome {
+                        Outcome::Done | Outcome::Cancelled => Next::Idle,
+                        Outcome::Compact => Next::Compact { resume: true },
+                        Outcome::MaxTurns => {
+                            self.entries
+                                .push(Entry::Notice("error: stopped: max turns reached".into()));
+                            Next::Failed
+                        }
+                        Outcome::Failed(error)
+                            if session::is_overflow_error(&error) && !self.overflow_retried =>
+                        {
+                            self.overflow_retried = true;
+                            Next::Compact { resume: true }
+                        }
+                        Outcome::Failed(error) => {
+                            self.entries.push(Entry::Notice(format!("error: {error}")));
+                            Next::Failed
+                        }
+                    };
                 }
             }
         }
-        if compact_after {
-            self.start_compaction();
-        } else if turn_after {
-            self.start_turn();
-        } else if self.running || self.compacting {
-            self.events = Some(receiver);
-        } else if failed {
-            status::report(State::Error);
-        } else {
-            status::report(State::Idle);
+        if matches!(next, Next::Keep)
+            && matches!(
+                events.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            )
+        {
+            next = Next::Lost;
+        }
+        match next {
+            Next::Keep => self.turn = turn,
+            Next::Idle => status::report(State::Idle),
+            Next::Failed => status::report(State::Error),
+            Next::Lost => {
+                self.entries.push(Entry::Notice(
+                    "error: the turn ended without a result".into(),
+                ));
+                self.transcript.invalidate();
+                self.tool = ToolActivity::Idle;
+                status::report(State::Error);
+            }
+            Next::Compact { resume } => self.start_compaction(resume),
+            Next::Turn => self.start_turn(),
         }
         changed
     }

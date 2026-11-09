@@ -255,17 +255,19 @@ fn run_request(
     if stream && status == 200 {
         let response = {
             let acc = acc.borrow();
-            if let Some(message) = &acc.stream_error {
-                return Err(Error::Provider(format!("openai: {message}")));
+            match &acc.outcome {
+                StreamOutcome::Failed(message) => {
+                    return Err(Error::Provider(format!("openai: {message}")));
+                }
+                StreamOutcome::Nothing => {
+                    let snippet =
+                        String::from_utf8_lossy(&acc.raw[..acc.raw.len().min(200)]).into_owned();
+                    return Err(Error::Provider(format!(
+                        "openai: invalid response body: {snippet}"
+                    )));
+                }
+                StreamOutcome::Started => acc.response(),
             }
-            if acc.events == 0 {
-                let snippet =
-                    String::from_utf8_lossy(&acc.raw[..acc.raw.len().min(200)]).into_owned();
-                return Err(Error::Provider(format!(
-                    "openai: invalid response body: {snippet}"
-                )));
-            }
-            acc.response()
         };
         acc.borrow().finish(tx);
         return Ok(response);
@@ -349,6 +351,14 @@ impl Provider for OpenAI {
 }
 
 #[derive(Clone, Default)]
+enum StreamOutcome {
+    #[default]
+    Nothing,
+    Started,
+    Failed(String),
+}
+
+#[derive(Clone, Default)]
 struct StreamAcc {
     raw: Vec<u8>,
     buf: Vec<u8>,
@@ -358,8 +368,7 @@ struct StreamAcc {
     usage: OaUsage,
     out_tokens: usize,
     finish_reason: Option<String>,
-    stream_error: Option<String>,
-    events: usize,
+    outcome: StreamOutcome,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -471,7 +480,9 @@ impl StreamAcc {
         if payload.is_empty() {
             return;
         }
-        self.events += 1;
+        if matches!(self.outcome, StreamOutcome::Nothing) {
+            self.outcome = StreamOutcome::Started;
+        }
         if payload == "[DONE]" {
             return;
         }
@@ -479,7 +490,7 @@ impl StreamAcc {
             return;
         };
         if let Some(error) = chunk.error {
-            self.stream_error = Some(error.message);
+            self.outcome = StreamOutcome::Failed(error.message);
             return;
         }
         if let Some(tx) = tx
@@ -804,7 +815,7 @@ mod tests {
     fn malformed_body_produces_no_events() {
         let mut acc = StreamAcc::default();
         feed_all(&mut acc, &[b"<html>502 Bad Gateway</html>"]);
-        assert_eq!(acc.events, 0);
+        assert!(matches!(acc.outcome, StreamOutcome::Nothing));
         assert_eq!(acc.raw, b"<html>502 Bad Gateway</html>");
     }
 
@@ -815,7 +826,9 @@ mod tests {
             &mut acc,
             &[b"data: {\"error\":{\"message\":\"provider failed\",\"code\":502},\"choices\":[{\"finish_reason\":\"error\",\"delta\":{}}]}\n\n"],
         );
-        assert_eq!(acc.stream_error.as_deref(), Some("provider failed"));
+        assert!(
+            matches!(&acc.outcome, StreamOutcome::Failed(message) if message == "provider failed")
+        );
     }
 
     #[test]

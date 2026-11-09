@@ -2,10 +2,11 @@ use super::App;
 use super::runtime::{RatatuiObserver, TuiControl, TurnEvent};
 use super::state::Entry;
 use super::status::{self, State};
+use super::{Catalog, Overlay, SessionOrigin, Turn};
 use crate::Message;
 use crate::app;
 use crate::openai::OpenAI;
-use crate::run::{self, Outcome, RunOptions};
+use crate::run::{self, RunOptions};
 use crate::session::{self, SessionState};
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -26,46 +27,42 @@ impl App {
     }
 
     pub(super) fn on_exit(&mut self) {
-        match self.resume_id.take() {
-            Some(id) => {
-                if !self.cfg.store.continue_archived_live(&id).unwrap_or(false) {
-                    let entries = self.cfg.store.live();
-                    let _ = self.cfg.store.continue_archived(&id, &entries);
-                }
-            }
-            None => {
+        match &self.origin {
+            SessionOrigin::Resumed(_) => self.close_session(),
+            SessionOrigin::Live => {
                 self.cfg.store.archive();
             }
         }
     }
 
+    fn close_session(&mut self) {
+        let SessionOrigin::Resumed(id) = std::mem::replace(&mut self.origin, SessionOrigin::Live)
+        else {
+            return;
+        };
+        if !self.cfg.store.continue_archived_live(&id).unwrap_or(false) {
+            let entries = self.cfg.store.live();
+            let _ = self.cfg.store.continue_archived(&id, &entries);
+        }
+    }
+
     pub(super) fn open_resume(&mut self) {
-        self.sessions = self.cfg.store.list();
-        self.catalog_query.clear();
-        self.resume_selected = 0;
-        self.resume_open = true;
-        self.picker = None;
+        self.overlay = Overlay::Resume {
+            catalog: Catalog::default(),
+            sessions: self.cfg.store.list(),
+        };
     }
 
     pub(super) fn resume(&mut self, id: &str) {
-        if let Some(previous) = self.resume_id.take()
-            && !self
-                .cfg
-                .store
-                .continue_archived_live(&previous)
-                .unwrap_or(false)
-        {
-            let entries = self.cfg.store.live();
-            let _ = self.cfg.store.continue_archived(&previous, &entries);
-        }
+        self.close_session();
         let Some((id, entries)) = app::load_session(self.cfg.store.as_ref(), id) else {
             self.entries
                 .push(Entry::Notice(format!("no such session: {id}")));
             return;
         };
-        self.resume_id = Some(id.clone());
-        self.cfg.store.set_resume_id(&id);
-        let transcript = session::after_reset(&entries)
+        self.origin = SessionOrigin::Resumed(id);
+        self.overflow_retried = false;
+        let transcript = session::current_segment(&entries)
             .iter()
             .filter_map(|entry| match entry {
                 session::Entry::Message { message } => Some(message.clone()),
@@ -100,7 +97,12 @@ impl App {
             self.run_command(&command);
             return;
         }
-        if self.running && !self.attachments.is_empty() {
+        if self.turn.compacting() {
+            self.entries
+                .push(Entry::Notice("compacting; wait before sending".into()));
+            return;
+        }
+        if matches!(self.turn, Turn::Running { .. }) && !self.attachments.is_empty() {
             self.entries.push(Entry::Notice(
                 "agent is running; images attach to the next message".into(),
             ));
@@ -116,13 +118,12 @@ impl App {
             text: raw,
             images: images.iter().map(crate::image::label).collect(),
         });
-        self.transcript_dirty_full = true;
-        if self.running {
-            if let Some(steer) = &self.steer {
-                let _ = steer.send(content);
-            }
+        self.transcript.invalidate();
+        if let Turn::Running { steer, .. } = &self.turn {
+            let _ = steer.send(content);
             return;
         }
+        self.overflow_retried = false;
         self.messages.push(Message {
             role: "user".into(),
             content,
@@ -138,24 +139,30 @@ impl App {
             self.entries
                 .push(Entry::Notice(format!("error: save session: {error}")));
         }
-        self.follow = true;
+        self.scroll = super::Scroll::Bottom;
         self.start_turn();
     }
 
     pub(super) fn run_command(&mut self, input: &str) {
         let argument = input.split_once(' ').map(|(_, argument)| argument.trim());
-        let command = app::parse_command(input);
-        self.transcript_dirty_full = true;
-        if self.running
+        self.transcript.invalidate();
+        match app::parse_command(input) {
+            Some(command) => self.execute(command, argument),
+            None => self
+                .entries
+                .push(Entry::Notice(format!("unknown command: {input}"))),
+        }
+    }
+
+    pub(super) fn execute(&mut self, command: app::Command, argument: Option<&str>) {
+        if self.turn.busy()
             && matches!(
                 command,
-                Some(
-                    app::Command::New
-                        | app::Command::Resume
-                        | app::Command::Rewind
-                        | app::Command::Compact
-                        | app::Command::Skill
-                )
+                app::Command::New
+                    | app::Command::Resume
+                    | app::Command::Rewind
+                    | app::Command::Compact
+                    | app::Command::Skill
             )
         {
             self.entries.push(Entry::Notice(
@@ -164,34 +171,27 @@ impl App {
             return;
         }
         match command {
-            Some(app::Command::Quit) => self.want_quit = true,
-            Some(app::Command::Help) => {
-                self.catalog_query.clear();
-                self.help_open = true;
-                self.help_selected = 0;
-                self.picker = None;
-            }
-            Some(app::Command::New) => {
+            app::Command::Quit => self.want_quit = true,
+            app::Command::Help => self.overlay = Overlay::Help(Catalog::default()),
+            app::Command::New => {
+                self.close_session();
                 self.cfg.store.archive();
                 self.clear_session();
             }
-            Some(app::Command::Resume) => match argument {
+            app::Command::Resume => match argument {
                 Some(id) if !id.is_empty() => self.resume(id),
                 _ => self.open_resume(),
             },
-            Some(app::Command::Rewind) => self.open_rewind(),
-            Some(app::Command::Compact) => self.start_compaction(),
-            Some(app::Command::Copy) => self.copy_last(),
-            Some(app::Command::Image) => self.attach(argument),
-            Some(app::Command::Skill) => match argument {
+            app::Command::Rewind => self.open_rewind(),
+            app::Command::Compact => self.start_compaction(false),
+            app::Command::Copy => self.copy_last(),
+            app::Command::Image => self.attach(argument),
+            app::Command::Skill => match argument {
                 Some(name) if !name.is_empty() => self.activate_skill(name),
                 _ => self
                     .entries
                     .push(Entry::Notice("usage: /skill NAME".into())),
             },
-            None => self
-                .entries
-                .push(Entry::Notice(format!("unknown command: {input}"))),
         }
     }
 
@@ -237,13 +237,14 @@ impl App {
             self.entries
                 .push(Entry::Notice(format!("error: save session: {error}")));
         }
-        self.transcript_dirty_full = true;
-        self.follow = true;
+        self.transcript.invalidate();
+        self.overflow_retried = false;
+        self.scroll = super::Scroll::Bottom;
         self.start_turn();
     }
 
     pub(super) fn attach(&mut self, argument: Option<&str>) {
-        self.transcript_dirty_full = true;
+        self.transcript.invalidate();
         let Some(argument) = argument.filter(|argument| !argument.is_empty()) else {
             let attached = self
                 .attachments
@@ -279,7 +280,7 @@ impl App {
     }
 
     pub(super) fn clear_session(&mut self) {
-        self.transcript_dirty_full = true;
+        self.transcript.invalidate();
         self.entries.clear();
         self.messages.clear();
         self.input_tokens = 0;
@@ -289,7 +290,10 @@ impl App {
         self.session_state = SessionState::default();
         self.history.clear();
         self.history_index = None;
-        self.follow = true;
+        self.scroll = super::Scroll::Bottom;
+        self.origin = SessionOrigin::Live;
+        self.overflow_retried = false;
+        self.overlay = Overlay::None;
     }
 
     pub(super) fn rewind_to(&mut self, index: usize) {
@@ -309,6 +313,7 @@ impl App {
         self.session_input = 0;
         self.session_output = 0;
         self.session_state = SessionState::default();
+        self.overflow_retried = false;
         self.rebuild_transcript();
         self.entries.push(Entry::Notice(format!(
             "rewound · {} messages remaining",
@@ -331,10 +336,14 @@ impl App {
             .push(Entry::Notice("copied last response".into()));
     }
 
-    pub(super) fn start_compaction(&mut self) {
-        if self.compacting {
+    pub(super) fn start_compaction(&mut self, resume: bool) {
+        if self.turn.compacting() {
             self.entries
                 .push(Entry::Notice("already compacting".into()));
+            return;
+        }
+        if self.turn.busy() {
+            self.entries.push(Entry::Notice("agent is running".into()));
             return;
         }
         if self.messages.len() < 4 {
@@ -347,8 +356,10 @@ impl App {
         let entries = self.cfg.store.live();
         let state = self.cfg.store.state();
         let (sender, receiver) = mpsc::channel();
-        self.events = Some(receiver);
-        self.compacting = true;
+        self.turn = Turn::Compacting {
+            events: receiver,
+            resume,
+        };
         self.turn_started = Instant::now();
         status::report(State::Working);
         std::thread::spawn(move || {
@@ -365,8 +376,11 @@ impl App {
     }
 
     pub(super) fn start_turn(&mut self) {
+        if self.turn.busy() {
+            return;
+        }
         let messages = std::mem::take(&mut self.messages);
-        self.turn_base_len = messages.len();
+        let base = messages.len();
         let provider = self.provider();
         let model = self.cfg.model.clone();
         let system = self.cfg.system.clone();
@@ -380,9 +394,11 @@ impl App {
         self.cancel = cancel.clone();
         let (sender, receiver) = mpsc::channel();
         let (steer, steer_receiver) = mpsc::channel();
-        self.events = Some(receiver);
-        self.steer = Some(steer);
-        self.running = true;
+        self.turn = Turn::Running {
+            events: receiver,
+            steer,
+            base,
+        };
         self.turn_started = Instant::now();
         status::report(State::Working);
         std::thread::spawn(move || {
@@ -406,18 +422,11 @@ impl App {
                     &mut control,
                 )
             };
-            let compact = matches!(end.outcome, Outcome::Compact);
-            let error = match end.outcome {
-                Outcome::Done | Outcome::Cancelled | Outcome::Compact => None,
-                Outcome::MaxTurns => Some("stopped: max turns reached".into()),
-                Outcome::Failed(error) => Some(error),
-            };
             let _ = sender.send(TurnEvent::End {
                 messages: end.messages,
                 usage: end.usage,
                 context: end.context,
-                error,
-                compact,
+                outcome: end.outcome,
             });
         });
     }

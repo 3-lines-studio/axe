@@ -194,6 +194,11 @@ fn reap(child: &mut std::process::Child, grace: std::time::Duration) {
     }
 }
 
+enum ShellEnd {
+    Exited(std::process::ExitStatus),
+    TimedOut,
+}
+
 pub fn run_shell(dir: &str, command: &str, timeout: u64, progress: &mut dyn FnMut(&str)) -> String {
     let tag = BASH_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     ensure_sigint_handler();
@@ -236,25 +241,19 @@ pub fn run_shell(dir: &str, command: &str, timeout: u64, progress: &mut dyn FnMu
     }
     let _guard = PgidGuard(pgid);
     let pidfd = child_pidfd(child.id());
-    let mut exit: Option<std::process::ExitStatus> = None;
-    let mut timed_out = false;
     let started = std::time::Instant::now();
     let timeout_dur = std::time::Duration::from_secs(timeout);
     let mut last_progress = std::time::Instant::now();
-    loop {
+    let end = loop {
         match child.try_wait() {
-            Ok(Some(st)) => {
-                exit = Some(st);
-                break;
-            }
+            Ok(Some(status)) => break ShellEnd::Exited(status),
             Ok(None) => {
                 if started.elapsed() >= timeout_dur {
                     unsafe {
                         libc::kill(-(child.id() as i32), libc::SIGKILL);
                     }
                     reap(&mut child, KILL_GRACE);
-                    timed_out = true;
-                    break;
+                    break ShellEnd::TimedOut;
                 }
                 if last_progress.elapsed() >= std::time::Duration::from_millis(100) {
                     last_progress = std::time::Instant::now();
@@ -277,7 +276,7 @@ pub fn run_shell(dir: &str, command: &str, timeout: u64, progress: &mut dyn FnMu
                 return format!("error: {e}");
             }
         }
-    }
+    };
     let truncated = std::fs::metadata(&out_path)
         .map(|metadata| metadata.len() > MAX_OUTPUT as u64)
         .unwrap_or(false);
@@ -297,18 +296,16 @@ pub fn run_shell(dir: &str, command: &str, timeout: u64, progress: &mut dyn FnMu
     } else {
         let _ = std::fs::remove_file(&out_path);
     }
-    if timed_out {
+    let failure = match end {
+        ShellEnd::TimedOut => Some(format!("command timed out after {timeout} seconds")),
+        ShellEnd::Exited(status) if !status.success() => Some(status_str(status)),
+        ShellEnd::Exited(_) => None,
+    };
+    if let Some(failure) = failure {
         if !display.is_empty() && !display.ends_with('\n') {
             display.push('\n');
         }
-        display.push_str(&format!("error: command timed out after {timeout} seconds"));
-    } else if let Some(st) = exit
-        && !st.success()
-    {
-        if !display.is_empty() && !display.ends_with('\n') {
-            display.push('\n');
-        }
-        display.push_str(&format!("error: {}", status_str(st)));
+        display.push_str(&format!("error: {failure}"));
     }
     display
 }

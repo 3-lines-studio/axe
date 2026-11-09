@@ -85,15 +85,9 @@ pub trait Store: Send + Sync {
 
     fn continue_archived_live(&self, id: &str) -> std::io::Result<bool>;
 
-    fn discard(&self);
-
     fn list(&self) -> Vec<SessionMeta>;
 
     fn load(&self, id: &str) -> Option<Vec<Entry>>;
-
-    fn resume_id(&self) -> Option<String>;
-    fn set_resume_id(&self, id: &str);
-    fn clear_resume_id(&self);
 
     fn state(&self) -> SessionState {
         SessionState::default()
@@ -161,7 +155,7 @@ pub fn context_messages(entries: &[Entry]) -> Vec<Message> {
 }
 
 pub fn context_messages_with(entries: &[Entry], options: ContextOptions) -> Vec<Message> {
-    let entries = after_reset(entries);
+    let entries = current_segment(entries);
     if !entries
         .iter()
         .any(|entry| matches!(entry, Entry::Compaction { .. }))
@@ -217,13 +211,24 @@ pub fn context_messages_with(entries: &[Entry], options: ContextOptions) -> Vec<
     out
 }
 
-pub(crate) fn after_reset(entries: &[Entry]) -> &[Entry] {
-    let start = entries
+pub(crate) fn reset_start(entries: &[Entry]) -> usize {
+    entries
         .iter()
         .rposition(|entry| matches!(entry, Entry::Reset))
         .map(|at| at + 1)
-        .unwrap_or(0);
-    &entries[start..]
+        .unwrap_or(0)
+}
+
+pub(crate) fn current_segment(entries: &[Entry]) -> &[Entry] {
+    &entries[reset_start(entries)..]
+}
+
+fn compaction_start(entries: &[Entry]) -> usize {
+    entries
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::Compaction { .. }))
+        .map(|at| at + 1)
+        .unwrap_or(0)
 }
 
 fn original_task(entries: &[Entry]) -> &str {
@@ -249,42 +254,45 @@ struct WorkspaceArgs<'a> {
 }
 
 fn workspace_state(entries: &[Entry]) -> String {
-    let mut calls = HashMap::new();
+    let msgs: Vec<&Message> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Message { message } => Some(message),
+            _ => None,
+        })
+        .collect();
+    let calls = calls_by_id(&msgs);
     let mut read = Vec::new();
     let mut modified = Vec::new();
     let mut commands = VecDeque::with_capacity(8);
-    for entry in entries {
-        let Entry::Message { message } = entry else {
-            continue;
-        };
-        if message.role == "assistant" {
-            for call in &message.tool_calls {
-                let arguments = serde_json::from_str::<WorkspaceArgs>(&call.arguments).ok();
-                let path = arguments
-                    .as_ref()
-                    .and_then(|arguments| arguments.path.as_deref())
-                    .map(str::to_string);
-                let command = arguments
-                    .as_ref()
-                    .and_then(|arguments| arguments.command.as_deref())
-                    .map(str::to_string);
-                calls.insert(call.id.clone(), (call.name.clone(), path, command));
-            }
-            continue;
-        }
+    for (index, message) in msgs.iter().enumerate() {
         if message.role != "tool" {
             continue;
         }
-        let failed = message.content.trim_start().starts_with("error:");
-        let Some((name, path, command)) = calls.remove(&message.tool_call_id) else {
+        let Some(call_index) = calls.get(message.tool_call_id.as_str()) else {
             continue;
         };
-        if name == "bash" {
+        if *call_index >= index {
+            continue;
+        }
+        let call = &msgs[*call_index].tool_calls;
+        let Some(call) = call.iter().find(|call| call.id == message.tool_call_id) else {
+            continue;
+        };
+        let arguments = serde_json::from_str::<WorkspaceArgs>(&call.arguments).ok();
+        let path = arguments
+            .as_ref()
+            .and_then(|arguments| arguments.path.as_deref());
+        let command = arguments
+            .as_ref()
+            .and_then(|arguments| arguments.command.as_deref());
+        let failed = message.content.trim_start().starts_with("error:");
+        if call.name == "bash" {
             if commands.len() == 8 {
                 commands.pop_front();
             }
             commands.push_back((
-                command.unwrap_or_else(|| "unknown command".into()),
+                command.unwrap_or("unknown command").to_string(),
                 message.content.as_str(),
                 failed,
             ));
@@ -296,9 +304,9 @@ fn workspace_state(entries: &[Entry]) -> String {
         let Some(path) = path else {
             continue;
         };
-        match name.as_str() {
-            "read" => read.push(path),
-            "write" | "edit" => modified.push(path),
+        match call.name.as_str() {
+            "read" => read.push(path.to_string()),
+            "write" | "edit" => modified.push(path.to_string()),
             _ => {}
         }
     }
@@ -379,8 +387,21 @@ fn entry_turns(entries: &[Entry]) -> usize {
     entries.iter().fold(0, next_turns)
 }
 
-pub fn drop_incomplete_tool_calls(msgs: &mut Vec<Message>) {
-    let mut results: HashMap<&str, usize> = HashMap::new();
+fn calls_by_id<'a>(msgs: &[&'a Message]) -> HashMap<&'a str, usize> {
+    let mut calls = HashMap::new();
+    for (index, message) in msgs.iter().enumerate() {
+        if message.role != "assistant" {
+            continue;
+        }
+        for call in &message.tool_calls {
+            calls.entry(call.id.as_str()).or_insert(index);
+        }
+    }
+    calls
+}
+
+fn results_by_id<'a>(msgs: &[&'a Message]) -> HashMap<&'a str, usize> {
+    let mut results = HashMap::new();
     for (index, message) in msgs.iter().enumerate() {
         if message.role == "tool" {
             results
@@ -388,6 +409,12 @@ pub fn drop_incomplete_tool_calls(msgs: &mut Vec<Message>) {
                 .or_insert(index);
         }
     }
+    results
+}
+
+pub fn drop_incomplete_tool_calls(msgs: &mut Vec<Message>) {
+    let refs: Vec<&Message> = msgs.iter().collect();
+    let results = results_by_id(&refs);
     let mut used = vec![false; msgs.len()];
     let mut out: Vec<Message> = Vec::with_capacity(msgs.len());
     for (index, message) in msgs.iter().enumerate() {
@@ -421,41 +448,40 @@ pub fn drop_incomplete_tool_calls(msgs: &mut Vec<Message>) {
 
 const RETAIN_TOKENS: usize = 20_000;
 
-fn after_reset_start(entries: &[Entry]) -> usize {
-    entries
-        .iter()
-        .rposition(|entry| matches!(entry, Entry::Reset))
-        .map(|at| at + 1)
-        .unwrap_or(0)
+struct Split {
+    retained: Vec<Message>,
+    summarized: Vec<Message>,
 }
 
-fn split_retained_state(
-    entries: &[Entry],
-    options: ContextOptions,
-    state: &SessionState,
-) -> (Vec<Message>, Vec<Message>) {
-    let start = after_reset_start(entries);
+fn split_last_turn(mut msgs: Vec<Message>) -> Split {
+    let start = msgs
+        .iter()
+        .rposition(|message| message.role == "user")
+        .unwrap_or(msgs.len());
+    Split {
+        retained: msgs.split_off(start),
+        summarized: msgs,
+    }
+}
+
+fn split_retained_state(entries: &[Entry], options: ContextOptions, state: &SessionState) -> Split {
+    let start = reset_start(entries);
     let entries = &entries[start..];
     let msgs = context_messages_with(entries, options);
     let current_tokens = state.context_tokens();
     if current_tokens == 0 {
         return split_last_turn(msgs);
     }
-    let mut points = BTreeMap::new();
-    for point in &state.points {
-        if point.index >= start {
-            points.insert(point.index - start, point.tokens);
-        }
-    }
+    let points: BTreeMap<usize, usize> = state
+        .points
+        .iter()
+        .filter(|point| point.index >= start)
+        .map(|point| (point.index - start, point.tokens))
+        .collect();
     let mut message_count = msgs.len();
     let mut retained_start = message_count;
-    let active_start = entries
-        .iter()
-        .rposition(|entry| matches!(entry, Entry::Compaction { .. }))
-        .map(|index| index + 1)
-        .unwrap_or(0);
     for (index, entry) in entries.iter().enumerate().rev() {
-        if index < active_start {
+        if index < compaction_start(entries) {
             break;
         }
         if let Entry::Message { .. } = entry {
@@ -473,16 +499,10 @@ fn split_retained_state(
     }
     let mut summarized = msgs;
     let retained = summarized.split_off(retained_start);
-    (retained, summarized)
-}
-
-fn split_last_turn(mut msgs: Vec<Message>) -> (Vec<Message>, Vec<Message>) {
-    let start = msgs
-        .iter()
-        .rposition(|message| message.role == "user")
-        .unwrap_or(msgs.len());
-    let retained = msgs.split_off(start);
-    (retained, msgs)
+    Split {
+        retained,
+        summarized,
+    }
 }
 
 fn serialize_conversation(msgs: &[Message]) -> String {
@@ -668,12 +688,15 @@ pub fn compact_with_state(
     options: ContextOptions,
 ) -> Result<(String, usize, Vec<Message>), String> {
     let tokens_before = state.context_tokens();
-    let (mut retained, to_summarize) = split_retained_state(entries, options, state);
+    let Split {
+        mut retained,
+        summarized,
+    } = split_retained_state(entries, options, state);
     drop_incomplete_tool_calls(&mut retained);
-    if to_summarize.is_empty() {
+    if summarized.is_empty() {
         return Err("nothing to summarize".into());
     }
-    let conversation = serialize_conversation(&to_summarize);
+    let conversation = serialize_conversation(&summarized);
     let first = request_summary(provider, model, &conversation, None).unwrap_or_default();
     let summary = if valid_summary(&first) {
         first
@@ -691,7 +714,7 @@ pub fn compact_with_state(
             second
         } else {
             fallback_summary(
-                &to_summarize,
+                &summarized,
                 if second.is_empty() { &first } else { &second },
             )
         }
@@ -732,6 +755,22 @@ mod tests {
             reasoning: String::new(),
             images: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_current_segment_starts_after_the_last_reset() {
+        let entries = vec![
+            Entry::Message {
+                message: message("user", "before"),
+            },
+            Entry::Reset,
+            Entry::Message {
+                message: message("user", "after"),
+            },
+        ];
+        assert_eq!(reset_start(&entries), 2);
+        assert_eq!(current_segment(&entries).len(), 1);
+        assert_eq!(current_segment(&entries[..2]).len(), 0);
     }
 
     fn call(id: &str) -> crate::ToolCall {
@@ -857,8 +896,10 @@ mod tests {
             ],
             ..SessionState::default()
         };
-        let (retained, summarized) =
-            split_retained_state(&entries, ContextOptions::default(), &state);
+        let Split {
+            retained,
+            summarized,
+        } = split_retained_state(&entries, ContextOptions::default(), &state);
         assert_eq!(state.context_tokens(), 125_100);
         assert_eq!(retained.len(), 5);
         assert_eq!(retained[0].content, "middle answer");
