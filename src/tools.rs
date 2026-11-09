@@ -200,6 +200,17 @@ enum ShellEnd {
 }
 
 pub fn run_shell(dir: &str, command: &str, timeout: u64, progress: &mut dyn FnMut(&str)) -> String {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    run_shell_with_env(dir, command, timeout, &env, progress)
+}
+
+pub fn run_shell_with_env(
+    dir: &str,
+    command: &str,
+    timeout: u64,
+    env: &[(String, String)],
+    progress: &mut dyn FnMut(&str),
+) -> String {
     let tag = BASH_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     ensure_sigint_handler();
     let out_path = std::env::temp_dir().join(format!("axe-bash-{}-{tag}.out", std::process::id()));
@@ -223,6 +234,8 @@ pub fn run_shell(dir: &str, command: &str, timeout: u64, progress: &mut dyn FnMu
     if !dir.is_empty() {
         cmd.current_dir(dir);
     }
+    cmd.env_clear()
+        .envs(env.iter().map(|(key, value)| (key, value)));
     cmd.stdout(std::process::Stdio::from(out_file));
     cmd.stderr(std::process::Stdio::from(err_file));
     cmd.process_group(0);
@@ -338,6 +351,19 @@ fn status_str(st: std::process::ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::{apply_edits, sanitize};
+
+    #[test]
+    fn the_child_environment_is_exactly_the_caller_one() {
+        let env = vec![
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("ALFRED_TEST".to_string(), "yes".to_string()),
+        ];
+        let out =
+            super::run_shell_with_env("", "printf %s \"$ALFRED_TEST\"", 10, &env, &mut |_| {});
+        assert_eq!(out, "yes");
+        let out = super::run_shell_with_env("", "printf %s \"$HOME\"", 10, &env, &mut |_| {});
+        assert_eq!(out, "");
+    }
 
     #[test]
     fn sanitize_strips_control_characters() {
