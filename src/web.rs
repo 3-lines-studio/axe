@@ -199,6 +199,7 @@ impl Web {
             .client
             .send(
                 &crate::http::Request {
+                    method: crate::http::Method::Post,
                     url,
                     headers: &headers,
                     body,

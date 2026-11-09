@@ -8,7 +8,7 @@ use std::sync::mpsc;
 pub mod app;
 pub mod curlffi;
 pub mod durable;
-mod http;
+pub mod http;
 pub mod ids;
 pub mod image;
 pub mod journal_store;

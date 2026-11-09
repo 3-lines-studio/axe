@@ -13,6 +13,8 @@ const CURLOPT_FAILONERROR: c_int = 45;
 const CURLOPT_POST: c_int = 47;
 const CURLOPT_FOLLOWLOCATION: c_int = 52;
 const CURLOPT_POSTFIELDSIZE: c_int = 60;
+const CURLOPT_CUSTOMREQUEST: c_int = 10036;
+const CURLOPT_HEADERDATA: c_int = 10029;
 const CURLOPT_MAXREDIRS: c_int = 68;
 const CURLOPT_CONNECTTIMEOUT: c_int = 78;
 const CURLOPT_LOW_SPEED_LIMIT: c_int = 19;
@@ -21,6 +23,7 @@ const CURLOPT_NOSIGNAL: c_int = 99;
 const CURLOPT_ACCEPT_ENCODING: c_int = 10102;
 const CURLOPT_PROGRESSDATA: c_int = 10057;
 const CURLOPT_WRITEFUNCTION: c_int = 20011;
+const CURLOPT_HEADERFUNCTION: c_int = 20079;
 const CURLOPT_PROGRESSFUNCTION: c_int = 20056;
 const CURLINFO_EFFECTIVE_URL: c_int = 0x100001;
 const CURLINFO_RESPONSE_CODE: c_int = 0x200002;
@@ -29,12 +32,14 @@ const CURLINFO_NUM_CONNECTS: c_int = 0x20001a;
 
 pub type WriteCb = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize;
 pub type ProgressCb = unsafe extern "C" fn(*mut c_void, f64, f64, f64, f64) -> c_int;
+pub type HeaderCb = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize;
 
 type SetoptString = unsafe extern "C" fn(*mut c_void, c_int, *const c_char) -> c_int;
 type SetoptLong = unsafe extern "C" fn(*mut c_void, c_int, c_long) -> c_int;
 type SetoptPtr = unsafe extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int;
 type SetoptWriteCb = unsafe extern "C" fn(*mut c_void, c_int, WriteCb) -> c_int;
 type SetoptProgressCb = unsafe extern "C" fn(*mut c_void, c_int, ProgressCb) -> c_int;
+type SetoptHeaderCb = unsafe extern "C" fn(*mut c_void, c_int, HeaderCb) -> c_int;
 type GetinfoLong = unsafe extern "C" fn(*mut c_void, c_int, *mut c_long) -> c_int;
 type GetinfoString = unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char) -> c_int;
 
@@ -46,6 +51,7 @@ struct Curl {
     setopt_ptr: SetoptPtr,
     setopt_write_cb: SetoptWriteCb,
     setopt_progress_cb: SetoptProgressCb,
+    setopt_header_cb: SetoptHeaderCb,
     perform: unsafe extern "C" fn(*mut c_void) -> c_int,
     getinfo_long: GetinfoLong,
     getinfo_string: GetinfoString,
@@ -106,6 +112,7 @@ unsafe fn load_syms(handle: *mut libc::c_void) -> Result<Curl, String> {
             setopt_ptr: std::mem::transmute::<*mut c_void, SetoptPtr>(setopt),
             setopt_write_cb: std::mem::transmute::<*mut c_void, SetoptWriteCb>(setopt),
             setopt_progress_cb: std::mem::transmute::<*mut c_void, SetoptProgressCb>(setopt),
+            setopt_header_cb: std::mem::transmute::<*mut c_void, SetoptHeaderCb>(setopt),
             perform: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void) -> c_int>(
                 sym(b"curl_easy_perform")?,
             ),
@@ -175,6 +182,16 @@ impl Easy {
         setopt_long(self, CURLOPT_POST, 1)
     }
 
+    pub fn custom_request(&mut self, method: &str) -> Result<(), String> {
+        let s = CString::new(method).map_err(|_| "method contains NUL".to_string())?;
+        setopt(self, CURLOPT_CUSTOMREQUEST, s.as_ptr())
+    }
+
+    pub fn method(&mut self, method: &str) -> Result<(), String> {
+        setopt_long(self, CURLOPT_POST, i32::from(method == "POST") as c_long)?;
+        self.custom_request(method)
+    }
+
     pub fn post_fields(&mut self, body: &[u8]) -> Result<(), String> {
         setopt(self, CURLOPT_POSTFIELDS, body.as_ptr() as *const c_char)?;
         setopt_long(self, CURLOPT_POSTFIELDSIZE, body.len() as c_long)
@@ -238,6 +255,8 @@ impl Easy {
             write_data: std::ptr::null_mut(),
             progress_fn: None,
             progress_data: std::ptr::null_mut(),
+            header_fn: None,
+            header_data: std::ptr::null_mut(),
         }
     }
 
@@ -333,6 +352,15 @@ fn setopt_write_cb(e: &Easy, opt: c_int, f: WriteCb) -> Result<(), String> {
     Ok(())
 }
 
+fn setopt_header_cb(e: &Easy, opt: c_int, f: HeaderCb) -> Result<(), String> {
+    let c = curl()?;
+    let r = unsafe { (c.setopt_header_cb)(e.handle, opt, f) };
+    if r != 0 {
+        return Err(curl_err(c, r));
+    }
+    Ok(())
+}
+
 fn setopt_progress_cb(e: &Easy, opt: c_int, f: ProgressCb) -> Result<(), String> {
     let c = curl()?;
     let r = unsafe { (c.setopt_progress_cb)(e.handle, opt, f) };
@@ -356,6 +384,8 @@ pub struct Transfer<'a> {
     write_data: *mut c_void,
     progress_fn: Option<ProgressCb>,
     progress_data: *mut c_void,
+    header_fn: Option<HeaderCb>,
+    header_data: *mut c_void,
 }
 
 impl<'a> Transfer<'a> {
@@ -369,6 +399,11 @@ impl<'a> Transfer<'a> {
         self.progress_data = data;
     }
 
+    pub fn header_function(&mut self, f: HeaderCb, data: *mut c_void) {
+        self.header_fn = Some(f);
+        self.header_data = data;
+    }
+
     pub fn perform(&mut self) -> Result<(), String> {
         let e = &mut *self.easy;
         if let Some(f) = self.write_fn {
@@ -379,6 +414,10 @@ impl<'a> Transfer<'a> {
             setopt_progress_cb(e, CURLOPT_PROGRESSFUNCTION, f)?;
             setopt_ptr(e, CURLOPT_PROGRESSDATA, self.progress_data)?;
             setopt_long(e, CURLOPT_NOPROGRESS, 0)?;
+        }
+        if let Some(f) = self.header_fn {
+            setopt_header_cb(e, CURLOPT_HEADERFUNCTION, f)?;
+            setopt_ptr(e, CURLOPT_HEADERDATA, self.header_data)?;
         }
         let c = curl()?;
         let r = unsafe { (c.perform)(e.handle) };

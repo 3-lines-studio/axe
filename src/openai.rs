@@ -239,6 +239,7 @@ fn run_request(
     let status = client
         .send(
             &crate::http::Request {
+                method: crate::http::Method::Post,
                 url,
                 headers,
                 body,
