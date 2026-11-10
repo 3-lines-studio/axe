@@ -148,20 +148,22 @@ python3 scripts/eval.py --model deepseek-flash --runs 3
 python3 scripts/eval.py --bin target/release/axe --runs 3
 python3 scripts/eval.py --agent axe --runs 3
 python3 scripts/eval.py --agent pi --runs 3
+python3 scripts/eval.py --filter 'edit|crlf' --runs 3
+python3 scripts/eval.py --runs 3 --out /tmp/eval.json
 DEEPSEEK_API_KEY="..." make eval-compaction
 AXE_EVAL_MODEL=deepseek-flash AXE_EVAL_COMPACTION_CYCLES=10 DEEPSEEK_API_KEY="..." make eval-compaction
 ```
 
-The agent eval loads the endpoint, model, and API key from `~/.config/axe/config` by default and compares Axe with `pi`. Use `--agent` to run one agent. The compaction eval checks required-fact recall and context size after every compaction cycle. Evals cost money and can vary by model, so `make check` does not run them.
+The agent eval loads the endpoint, model, and API key from `~/.config/axe/config` by default and compares Axe with `pi` task by task. Every task runs in a fresh temp directory with a hermetic `HOME`, `XDG_CONFIG_HOME`, and `PI_CODING_AGENT_DIR`, and every check looks at the files on disk instead of the model's prose. Each row reports passes, seconds, fresh and cached input tokens, output tokens, and turns, so a slower or chattier agent shows up even when both pass. Use `--runs` above one to expose flaky tasks, `--filter` for a subset, `--out` to keep a JSON report, `--keep` to keep the directory of a failure, and `--agent` to run one agent. The compaction eval checks required-fact recall and context size after every compaction cycle. Evals cost money and can vary by model, so `make check` does not run them.
 
 ## Web
 
-Two tools over the system libcurl, backed by DeepSeek's tools API:
+One `web` tool over the system libcurl, backed by DeepSeek's tools API, with two modes:
 
-- `search QUERY` returns ranked results with titles, URLs, and snippets.
-- `fetch URL` returns the page as Markdown, without the navigation, ads, and scripts.
+- `web {"search": "QUERY"}` returns ranked results with titles, URLs, and snippets.
+- `web {"fetch": "URL"}` returns the page as Markdown, without the navigation, ads, and scripts.
 
-Both use the same key as the model: `DEEPSEEK_API_KEY`, the axe config key, or `OPENAI_API_KEY`, as long as the base URL is DeepSeek. Without a key the tools are left out of the tool set. `DEEPSEEK_BASE_URL` overrides the web endpoint (default `https://api.deepseek.com`). Weak search results are labelled so the model can tell a thin hit from a good one.
+One tool instead of two keeps a single schema in every request. It uses the same key as the model: `DEEPSEEK_API_KEY`, the axe config key, or `OPENAI_API_KEY`, as long as the base URL is DeepSeek. Without a key the tools are left out of the tool set. `DEEPSEEK_BASE_URL` overrides the web endpoint (default `https://api.deepseek.com`). Weak search results are labelled so the model can tell a thin hit from a good one.
 
 ## Bash
 

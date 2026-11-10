@@ -32,8 +32,7 @@ pub fn build_tools_with(
         bash(machine),
     ];
     if let Some(web) = web {
-        tools.push(crate::web::search(web.clone()));
-        tools.push(crate::web::fetch(web));
+        tools.push(crate::web::web(web));
     }
     tools
 }
@@ -326,8 +325,8 @@ pub fn run_shell_with_env(
 pub fn bash(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
     let mut t = new_tool_with_progress(
         "bash",
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 16KB. The default timeout is 120 seconds.",
-        r#"{"type":"object","properties":{"command":{"type":"string","description":"bash command to run"},"timeout":{"type":"integer","description":"Timeout in seconds (default: 120)"}},"required":["command"]}"#,
+        "Run a bash command in the working directory. Returns stdout and stderr, truncated to the last 16KB. Default timeout 120 seconds.",
+        r#"{"type":"object","properties":{"command":{"type":"string","description":"bash command"},"timeout":{"type":"integer","description":"Timeout in seconds"}},"required":["command"]}"#,
         move |a: BashArgs, progress: &mut dyn FnMut(&str)| {
             if a.timeout == Some(0) {
                 return "error: invalid timeout: must be a positive number of seconds".to_string();
@@ -929,8 +928,8 @@ fn looks_binary(data: &[u8]) -> bool {
 pub fn read(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
     let mut t = new_tool(
         "read",
-        "Read the contents of a file. Output is truncated to 16KB. Use offset/limit for large files. When you need the full file, continue with the suggested offset. Reading a JPEG, PNG, GIF, or WebP attaches the image so you can see it.",
-        r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"integer","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"integer","description":"Maximum number of lines to read"}},"required":["path"]}"#,
+        "Read a file. Output is truncated to 16KB; use offset and limit to continue. A JPEG, PNG, GIF or WebP image is attached so you can see it.",
+        r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"integer","description":"First line to read (1-indexed)"},"limit":{"type":"integer","description":"Maximum number of lines"}},"required":["path"]}"#,
         move |a: ReadArgs| {
             let head = match machine.read_head(&a.path, 8192) {
                 Ok(head) => head,
@@ -975,8 +974,8 @@ struct WriteArgs {
 pub fn write(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
     let mut t = new_tool(
         "write",
-        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
-        r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to write (relative or absolute)"},"content":{"type":"string","description":"Content to write to the file"}},"required":["path","content"]}"#,
+        "Write content to a file. Creates missing parent directories and overwrites the file.",
+        r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"content":{"type":"string","description":"Content to write"}},"required":["path","content"]}"#,
         move |a: WriteArgs| match machine.write(&a.path, a.content.as_bytes()) {
             Ok(()) => format!("wrote {} ({} bytes)", a.path, a.content.len()),
             Err(e) => format!("error: {e}"),
@@ -1639,12 +1638,12 @@ fn apply_edits(path: &str, content: &str, edits: &[EditArg]) -> Result<Applied, 
     })
 }
 
-const EDIT_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.","items":{"type":"object","properties":{"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},"newText":{"type":"string","description":"Replacement text for this targeted edit."}},"required":["oldText","newText"]}}},"required":["path","edits"]}"#;
+const EDIT_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"edits":{"type":"array","description":"Replacements applied to the original file, never to each other","items":{"type":"object","properties":{"oldText":{"type":"string","description":"Exact text to replace, unique in the file"},"newText":{"type":"string","description":"Replacement text"}},"required":["oldText","newText"]}}},"required":["path","edits"]}"#;
 
 pub fn edit(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
     let mut t = new_tool(
         "edit",
-        "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
+        "Edit one file with exact text replacements. Each oldText must match a unique, non-overlapping region of the original file. Merge nearby changes into one edit.",
         EDIT_SCHEMA,
         move |a: EditArgs| {
             if a.edits.is_empty() {

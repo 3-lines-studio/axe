@@ -63,9 +63,13 @@ impl Web {
 }
 
 #[derive(Deserialize)]
-struct SearchArgs {
-    query: String,
+struct WebArgs {
+    #[serde(default)]
+    search: Option<String>,
+    #[serde(default)]
     count: Option<usize>,
+    #[serde(default)]
+    fetch: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -94,11 +98,6 @@ struct Hit {
     site_name: Option<String>,
     #[serde(default)]
     date: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct FetchArgs {
-    url: String,
 }
 
 #[derive(Serialize)]
@@ -226,33 +225,57 @@ impl Web {
     }
 }
 
-pub fn search(web: Web) -> Tool {
+pub fn web(web: Web) -> Tool {
     let mut tool = new_tool(
-        "search",
-        "Search the web with DeepSeek's search engine. Returns a numbered list of results with title, URL, a summary read by models and, when known, site and date. Read one with fetch.",
-        r#"{"type":"object","properties":{"query":{"type":"string","description":"Search query, 1 to 128 characters. Supports site:, \"exact phrase\", -term, -site:, lang:, after: and before:"},"count":{"type":"integer","description":"How many results to return (default 8, max 50)"}},"required":["query"]}"#,
-        move |args: SearchArgs| {
-            let query = args.query.trim();
-            let length = query.chars().count();
-            if length == 0 || length > MAX_QUERY {
-                return format!("error: the query must have 1 to {MAX_QUERY} characters");
-            }
-            let count = args.count.unwrap_or(RESULTS).clamp(1, MAX_RESULTS);
-            let body = match serde_json::to_vec(&SearchRequest { query, count }) {
-                Ok(body) => body,
-                Err(error) => return format!("error: {error}"),
-            };
-            match web.post(SEARCH_PATH, &body) {
-                Ok(reply) => match serde_json::from_slice::<SearchReply>(&reply.body) {
-                    Ok(results) => format_results(&results.results),
-                    Err(error) => format!("error: unexpected search response: {error}"),
-                },
-                Err(error) => format!("error: {error}"),
-            }
+        "web",
+        "Search the web, or fetch a URL as Markdown. Pass search or fetch, not both.",
+        r#"{"type":"object","properties":{"search":{"type":"string","description":"Search query, 1 to 128 characters; supports site:, \"exact phrase\", -term, lang:, after:, before:"},"count":{"type":"integer","description":"Results to return (default 8, max 50)"},"fetch":{"type":"string","description":"HTTP or HTTPS URL to read as Markdown"}}}"#,
+        move |args: WebArgs| match (args.search, args.fetch) {
+            (Some(query), _) => search(&web, &query, args.count),
+            (None, Some(url)) => fetch(&web, &url),
+            (None, None) => "error: pass search or fetch".to_string(),
         },
     );
-    tool.snippet = "Search the web (DeepSeek): 1 to 50 results with summary and date".to_string();
+    tool.snippet = "Search the web or fetch a URL as Markdown".to_string();
     tool
+}
+
+fn search(web: &Web, query: &str, count: Option<usize>) -> String {
+    let query = query.trim();
+    let length = query.chars().count();
+    if length == 0 || length > MAX_QUERY {
+        return format!("error: the query must have 1 to {MAX_QUERY} characters");
+    }
+    let count = count.unwrap_or(RESULTS).clamp(1, MAX_RESULTS);
+    let body = match serde_json::to_vec(&SearchRequest { query, count }) {
+        Ok(body) => body,
+        Err(error) => return format!("error: {error}"),
+    };
+    match web.post(SEARCH_PATH, &body) {
+        Ok(reply) => match serde_json::from_slice::<SearchReply>(&reply.body) {
+            Ok(results) => format_results(&results.results),
+            Err(error) => format!("error: unexpected search response: {error}"),
+        },
+        Err(error) => format!("error: {error}"),
+    }
+}
+
+fn fetch(web: &Web, url: &str) -> String {
+    let url = url.trim();
+    if let Err(error) = check_url(url) {
+        return format!("error: {error}");
+    }
+    let body = match serde_json::to_vec(&FetchRequest { url }) {
+        Ok(body) => body,
+        Err(error) => return format!("error: {error}"),
+    };
+    match web.post(FETCH_PATH, &body) {
+        Ok(reply) => match serde_json::from_slice::<FetchReply>(&reply.body) {
+            Ok(page) => compose(&page),
+            Err(error) => format!("error: unexpected fetch response: {error}"),
+        },
+        Err(error) => format!("error: {error}"),
+    }
 }
 
 fn format_results(hits: &[Hit]) -> String {
@@ -302,33 +325,6 @@ fn format_results(hits: &[Hit]) -> String {
         ));
     }
     out.trim_end().to_string()
-}
-
-pub fn fetch(web: Web) -> Tool {
-    let mut tool = new_tool(
-        "fetch",
-        "Fetch a URL through DeepSeek and return its title and content as Markdown, without the chrome, the navigation or the scripts.",
-        r#"{"type":"object","properties":{"url":{"type":"string","description":"HTTP or HTTPS URL"}},"required":["url"]}"#,
-        move |args: FetchArgs| {
-            let url = args.url.trim();
-            if let Err(error) = check_url(url) {
-                return format!("error: {error}");
-            }
-            let body = match serde_json::to_vec(&FetchRequest { url }) {
-                Ok(body) => body,
-                Err(error) => return format!("error: {error}"),
-            };
-            match web.post(FETCH_PATH, &body) {
-                Ok(reply) => match serde_json::from_slice::<FetchReply>(&reply.body) {
-                    Ok(page) => compose(&page),
-                    Err(error) => format!("error: unexpected fetch response: {error}"),
-                },
-                Err(error) => format!("error: {error}"),
-            }
-        },
-    );
-    tool.snippet = "Fetch a URL as Markdown (DeepSeek)".to_string();
-    tool
 }
 
 fn check_url(url: &str) -> Result<(), String> {
@@ -498,10 +494,7 @@ mod tests {
                 {"title":"Docs","url":"https://doc.rust-lang.org/","snippet":"the book","summary":"","site_name":null,"date":null}
             ]}"#,
         )]);
-        let text = run(
-            &search(Web::at(&base, "k")),
-            r#"{"query":"rust","count":2}"#,
-        );
+        let text = run(&web(Web::at(&base, "k")), r#"{"search":"rust","count":2}"#);
         let requests = server.join().unwrap();
 
         assert!(
@@ -528,7 +521,7 @@ mod tests {
     fn an_empty_result_list_says_so() {
         let (base, server) = serve(vec![(200, r#"{"results":[]}"#)]);
         assert_eq!(
-            run(&search(Web::at(&base, "k")), r#"{"query":"x"}"#),
+            run(&web(Web::at(&base, "k")), r#"{"search":"x"}"#),
             "no results"
         );
         server.join().unwrap();
@@ -536,14 +529,14 @@ mod tests {
 
     #[test]
     fn a_query_outside_the_limits_never_reaches_the_network() {
-        let tool = search(Web::new("k"));
+        let tool = web(Web::new("k"));
         let long = "a".repeat(MAX_QUERY + 1);
-        let text = run(&tool, &format!(r#"{{"query":"{long}"}}"#));
+        let text = run(&tool, &format!(r#"{{"search":"{long}"}}"#));
         assert!(
             text.starts_with("error: the query must have 1 to 128"),
             "{text}"
         );
-        let text = run(&tool, r#"{"query":"   "}"#);
+        let text = run(&tool, r#"{"search":"   "}"#);
         assert!(text.starts_with("error:"), "{text}");
     }
 
@@ -554,8 +547,8 @@ mod tests {
             r#"{"title":"Axe","content":"The loop is the whole thing."}"#,
         )]);
         let text = run(
-            &fetch(Web::at(&base, "k")),
-            r#"{"url":"https://example.com/axe"}"#,
+            &web(Web::at(&base, "k")),
+            r#"{"fetch":"https://example.com/axe"}"#,
         );
         let requests = server.join().unwrap();
 
@@ -579,8 +572,8 @@ mod tests {
             &format!(r#"{{"title":"T","content":"{body}"}}"#),
         )]);
         let text = run(
-            &fetch(Web::at(&base, "k")),
-            r#"{"url":"https://example.com/"}"#,
+            &web(Web::at(&base, "k")),
+            r#"{"fetch":"https://example.com/"}"#,
         );
         server.join().unwrap();
         assert!(text.ends_with("[truncado]"), "{}", text.len());
@@ -589,12 +582,12 @@ mod tests {
 
     #[test]
     fn fetch_rejects_a_url_with_credentials() {
-        let tool = fetch(Web::new("k"));
-        let text = run(&tool, r#"{"url":"https://user:pass@example.com/"}"#);
+        let tool = web(Web::new("k"));
+        let text = run(&tool, r#"{"fetch":"https://user:pass@example.com/"}"#);
         assert!(text.contains("username or password"), "{text}");
-        let text = run(&tool, r#"{"url":"ftp://example.com/"}"#);
+        let text = run(&tool, r#"{"fetch":"ftp://example.com/"}"#);
         assert!(text.starts_with("error:"), "{text}");
-        let text = run(&tool, r#"{"url":"https://"}"#);
+        let text = run(&tool, r#"{"fetch":"https://"}"#);
         assert!(text.contains("no host"), "{text}");
     }
 
@@ -605,8 +598,8 @@ mod tests {
             r#"{"error":{"message":"could not retrieve usable page content","type":"invalid_request_error"}}"#,
         )]);
         let text = run(
-            &fetch(Web::at(&base, "k")),
-            r#"{"url":"https://example.com/missing"}"#,
+            &web(Web::at(&base, "k")),
+            r#"{"fetch":"https://example.com/missing"}"#,
         );
         server.join().unwrap();
         assert_eq!(
@@ -622,8 +615,8 @@ mod tests {
             r#"{"error":{"message":"failed to fetch URL (request_id: x)"}}"#,
         )]);
         let text = run(
-            &fetch(Web::at(&base, "k")),
-            r#"{"url":"https://example.com/missing"}"#,
+            &web(Web::at(&base, "k")),
+            r#"{"fetch":"https://example.com/missing"}"#,
         );
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);
@@ -637,8 +630,8 @@ mod tests {
     fn a_page_blocked_by_policy_reports_it_as_such() {
         let (base, server) = serve(vec![(403, r#"{"error":{"message":"blocked"}}"#)]);
         let text = run(
-            &fetch(Web::at(&base, "k")),
-            r#"{"url":"https://example.com/private"}"#,
+            &web(Web::at(&base, "k")),
+            r#"{"fetch":"https://example.com/private"}"#,
         );
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);
@@ -668,7 +661,7 @@ mod tests {
             200,
             r#"{"results":[{"title":"Junk","url":"https://junk.example/","rerank_score":0.4}]}"#,
         )]);
-        let text = run(&search(Web::at(&base, "k")), r#"{"query":"x"}"#);
+        let text = run(&web(Web::at(&base, "k")), r#"{"search":"x"}"#);
         server.join().unwrap();
         assert!(
             text.ends_with("weak matches: the best hit scores 0.40 of 3; narrow the query or fetch a URL you already know"),
@@ -682,7 +675,7 @@ mod tests {
             200,
             r#"{"results":[{"title":"Good","url":"https://good.example/","rerank_score":2.2}]}"#,
         )]);
-        let text = run(&search(Web::at(&base, "k")), r#"{"query":"x"}"#);
+        let text = run(&web(Web::at(&base, "k")), r#"{"search":"x"}"#);
         server.join().unwrap();
         assert!(!text.contains("weak matches"), "{text}");
     }
@@ -693,7 +686,7 @@ mod tests {
             200,
             r#"{"results":[{"title":"T","url":"https://t.example/"}]}"#,
         )]);
-        let text = run(&search(Web::at(&base, "k")), r#"{"query":"x"}"#);
+        let text = run(&web(Web::at(&base, "k")), r#"{"search":"x"}"#);
         server.join().unwrap();
         assert!(!text.contains("weak matches"), "{text}");
     }
@@ -704,7 +697,7 @@ mod tests {
             200,
             r#"{"results":[{"title":"Low","url":"https://low.example/","rerank_score":0.4},{"title":"High","url":"https://high.example/","rerank_score":2.9}]}"#,
         )]);
-        let text = run(&search(Web::at(&base, "k")), r#"{"query":"x"}"#);
+        let text = run(&web(Web::at(&base, "k")), r#"{"search":"x"}"#);
         server.join().unwrap();
         assert!(text.starts_with("1. High"), "{text}");
         assert!(text.contains("2. Low"), "{text}");
@@ -719,7 +712,7 @@ mod tests {
                 r#"{"results":[{"title":"T","url":"https://t.example/"}]}"#,
             ),
         ]);
-        let text = run(&search(Web::at(&base, "k")), r#"{"query":"x"}"#);
+        let text = run(&web(Web::at(&base, "k")), r#"{"search":"x"}"#);
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(text.starts_with("1. T"), "{text}");
@@ -732,7 +725,7 @@ mod tests {
             (502, "{}"),
             (502, r#"{"error":{"message":"upstream is down"}}"#),
         ]);
-        let text = run(&search(Web::at(&base, "k")), r#"{"query":"x"}"#);
+        let text = run(&web(Web::at(&base, "k")), r#"{"search":"x"}"#);
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), RETRIES + 1);
         assert_eq!(text, "error: DeepSeek had a server error: upstream is down");
