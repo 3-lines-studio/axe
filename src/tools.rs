@@ -354,6 +354,7 @@ mod tests {
 
     #[test]
     fn the_child_environment_is_exactly_the_caller_one() {
+        let _lock = BASH_TEST.lock().unwrap();
         let env = vec![
             ("PATH".to_string(), "/usr/bin:/bin".to_string()),
             ("ALFRED_TEST".to_string(), "yes".to_string()),
