@@ -3,8 +3,8 @@ use crate::session::{self, SessionState, Store};
 use crate::{Image, Message};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -12,11 +12,11 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Clear, Paragraph, Wrap};
-use std::io::{self, Stdout};
+use ratatui::widgets::{Clear, Paragraph};
+use std::io::{self, Stdout, Write};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
@@ -110,6 +110,64 @@ impl Scroll {
             Scroll::At(row) => (*row).min(max),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Point {
+    line: usize,
+    column: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TextSelection {
+    anchor: Point,
+    focus: Point,
+}
+
+impl TextSelection {
+    fn ordered(&self) -> (Point, Point) {
+        let anchor = (self.anchor.line, self.anchor.column);
+        let focus = (self.focus.line, self.focus.column);
+        if focus < anchor {
+            (self.focus, self.anchor)
+        } else {
+            (self.anchor, self.focus)
+        }
+    }
+
+    fn cells(&self, line: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.ordered();
+        if line < start.line || line > end.line {
+            return None;
+        }
+        let first = if line == start.line { start.column } else { 0 };
+        let last = if line == end.line {
+            end.column
+        } else {
+            usize::MAX
+        };
+        Some((first, last))
+    }
+}
+
+/// Selection point under a screen cell, in transcript lines rather than rows.
+fn point_at(area: Rect, scroll: u16, column: u16, row: u16) -> Point {
+    let row = row
+        .saturating_sub(area.y)
+        .min(area.height.saturating_sub(1));
+    let column = column
+        .saturating_sub(area.x)
+        .min(area.width.saturating_sub(1));
+    Point {
+        line: usize::from(scroll) + usize::from(row),
+        column: usize::from(column),
+    }
+}
+
+fn copy_to_clipboard(text: &str) {
+    let encoded = crate::image::base64(text.as_bytes());
+    print!("\u{1b}]52;c;{encoded}\u{1b}\\");
+    let _ = io::stdout().flush();
 }
 
 #[derive(Clone, Default)]
@@ -226,7 +284,7 @@ impl TranscriptCache {
         let prefix = entries.len() - usize::from(live);
         if self.dirty || self.width != width || self.entries > prefix {
             self.lines.clear();
-            push_transcript_header(&mut self.lines);
+            push_transcript_header(&mut self.lines, width);
             self.width = width;
             self.entries = 0;
             self.dirty = false;
@@ -330,6 +388,10 @@ fn run_app(
         origin: SessionOrigin::Live,
         markdown_dirty: false,
         transcript: TranscriptCache::default(),
+        transcript_area: Rect::default(),
+        selection: None,
+        pending_copy: false,
+        flash: None,
     };
     match app.cfg.resume.clone() {
         Some(app::Resume::Picker) => app.open_resume(),
@@ -366,20 +428,19 @@ fn run_app(
         if !event::poll(wait).map_err(|error| error.to_string())? {
             continue;
         }
-        dirty = true;
         match event::read().map_err(|error| error.to_string())? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                dirty = true;
                 if app.handle_key(key) {
                     app.on_exit();
                     return Ok(());
                 }
             }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => app.scroll_up(3),
-                MouseEventKind::ScrollDown => app.scroll_down(3),
-                _ => {}
-            },
-            Event::Paste(text) => app.paste(&text),
+            Event::Mouse(mouse) => dirty |= app.handle_mouse(mouse),
+            Event::Paste(text) => {
+                app.paste(&text);
+                dirty = true;
+            }
             _ => {}
         }
     }
@@ -417,18 +478,24 @@ struct App {
     origin: SessionOrigin,
     markdown_dirty: bool,
     transcript: TranscriptCache,
+    transcript_area: Rect,
+    selection: Option<TextSelection>,
+    pending_copy: bool,
+    flash: Option<String>,
 }
 
-fn push_transcript_header(lines: &mut Vec<Line<'static>>) {
+fn push_transcript_header(lines: &mut Vec<Line<'static>>, width: usize) {
+    let badge = take_columns("axe", width);
+    let rest = take_columns(
+        &format!(" v{VERSION} · Run /help for commands"),
+        width.saturating_sub(columns(&badge)),
+    );
     lines.push(Line::from(vec![
         Span::styled(
-            "axe",
+            badge,
             Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
         ),
-        Span::styled(
-            format!(" v{VERSION} · Run /help for commands"),
-            Style::default(),
-        ),
+        Span::styled(rest, Style::default()),
     ]));
     lines.push(Line::default());
 }
@@ -443,7 +510,7 @@ fn push_transcript_entry(lines: &mut Vec<Line<'static>>, entry: &Entry, width: u
                 lines.push(Line::from(vec![
                     Span::styled("┃ ", Style::default()),
                     Span::styled(
-                        format!("[image {label}]"),
+                        truncate(&format!("[image {label}]"), text_width.saturating_sub(2)),
                         Style::default().fg(theme::palette().muted),
                     ),
                 ]));
@@ -472,7 +539,13 @@ fn push_transcript_entry(lines: &mut Vec<Line<'static>>, entry: &Entry, width: u
             } else {
                 lines.push(Line::from(vec![
                     Span::styled("● ", style),
-                    Span::styled(format!("{} tool calls", calls.len()), style),
+                    Span::styled(
+                        truncate(
+                            &format!("{} tool calls", calls.len()),
+                            text_width.saturating_sub(2),
+                        ),
+                        style,
+                    ),
                 ]));
                 for (index, call) in calls.iter().enumerate() {
                     let branch = if index + 1 == calls.len() {
@@ -487,7 +560,11 @@ fn push_transcript_entry(lines: &mut Vec<Line<'static>>, entry: &Entry, width: u
                 }
             }
         }
-        Entry::Notice(text) => lines.push(Line::from(Span::styled(text.clone(), Style::default()))),
+        Entry::Notice(text) => {
+            for chunk in wrap_input_line(text, width) {
+                lines.push(Line::from(Span::styled(chunk, Style::default())));
+            }
+        }
     }
     lines.push(Line::default());
 }
@@ -559,13 +636,24 @@ impl App {
             .split(frame.area());
         let transcript_width = areas[0].width.max(1) as usize;
         self.width = transcript_width;
+        self.transcript_area = areas[0];
         self.sync_markdown_width(transcript_width);
-        let transcript = self.transcript.text(&self.entries, transcript_width);
-        let transcript = Paragraph::new(transcript).wrap(Wrap { trim: false });
-        let line_count = transcript.line_count(areas[0].width.max(1)) as u16;
+        let mut transcript = self.transcript.text(&self.entries, transcript_width);
+        if self.pending_copy {
+            self.pending_copy = false;
+            self.copy_selection(&transcript);
+        }
+        if let Some(selection) = self.selection {
+            for (index, line) in transcript.lines.iter_mut().enumerate() {
+                if let Some((first, last)) = selection.cells(index) {
+                    *line = select(line, first, last);
+                }
+            }
+        }
+        let rows = transcript.lines.len().min(usize::from(u16::MAX));
         self.page_size = areas[0].height.max(1);
-        self.max_scroll = line_count.saturating_sub(self.page_size);
-        let transcript = transcript.scroll((self.scroll.row(self.max_scroll), 0));
+        self.max_scroll = rows.saturating_sub(usize::from(self.page_size)) as u16;
+        let transcript = Paragraph::new(transcript).scroll((self.scroll.row(self.max_scroll), 0));
         frame.render_widget(transcript, areas[0]);
         if self.turn.busy() {
             let palette = theme::palette();
@@ -630,7 +718,9 @@ impl App {
             )));
             frame.render_widget(Paragraph::new(lines), areas[3]);
         }
-        let mut status = if self.ctrl_c.armed() {
+        let mut status = if let Some(flash) = self.flash.clone() {
+            flash
+        } else if self.ctrl_c.armed() {
             "press ctrl+c again to exit".to_string()
         } else {
             let mut parts = vec![self.cfg.model.clone()];
@@ -657,7 +747,7 @@ impl App {
             }
             parts.join(" · ")
         };
-        if !matches!(self.scroll, Scroll::Bottom) {
+        if self.flash.is_none() && !matches!(self.scroll, Scroll::Bottom) {
             status.push_str(&format!(
                 " · {}/{}",
                 self.scroll.row(self.max_scroll),
@@ -670,6 +760,104 @@ impl App {
             areas[2].x + 2 + cursor_col as u16,
             areas[2].y + (cursor_row - visible_start) as u16,
         ));
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if !matches!(self.overlay, Overlay::None) {
+            return false;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_up(3);
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_down(3);
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => self.anchor_at(mouse.column, mouse.row),
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_to(mouse.column, mouse.row),
+            MouseEventKind::Up(MouseButton::Left) => self.finish_selection(),
+            _ => false,
+        }
+    }
+
+    fn anchor_at(&mut self, column: u16, row: u16) -> bool {
+        let area = self.transcript_area;
+        if row < area.y || row >= area.bottom() || column < area.x || column >= area.right() {
+            return false;
+        }
+        let point = self.point_at(column, row);
+        self.flash = None;
+        self.selection = Some(TextSelection {
+            anchor: point,
+            focus: point,
+        });
+        true
+    }
+
+    fn drag_to(&mut self, column: u16, row: u16) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        let focus = self.point_at(column, row);
+        if focus == selection.focus {
+            return false;
+        }
+        self.selection = Some(TextSelection { focus, ..selection });
+        true
+    }
+
+    fn finish_selection(&mut self) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        let (start, end) = selection.ordered();
+        if start == end {
+            self.selection = None;
+            return true;
+        }
+        self.pending_copy = true;
+        true
+    }
+
+    fn point_at(&self, column: u16, row: u16) -> Point {
+        point_at(
+            self.transcript_area,
+            self.scroll.row(self.max_scroll),
+            column,
+            row,
+        )
+    }
+
+    fn copy_selection(&mut self, transcript: &Text<'static>) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        self.selection = None;
+        let mut lines: Vec<String> = Vec::new();
+        for (index, line) in transcript.lines.iter().enumerate() {
+            let Some((first, last)) = selection.cells(index) else {
+                continue;
+            };
+            let text = selected_text(line, first, last);
+            let text = strip_marker(text.trim_end());
+            if lines.is_empty() && text.is_empty() {
+                continue;
+            }
+            lines.push(text.to_string());
+        }
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            return;
+        }
+        copy_to_clipboard(&lines.join("\n"));
+        self.flash = Some(match lines.len() {
+            1 => "copied 1 line".to_string(),
+            count => format!("copied {count} lines"),
+        });
     }
 
     fn draw_help(&self, frame: &mut ratatui::Frame, catalog: &Catalog) {
@@ -826,6 +1014,7 @@ impl App {
 
     fn rebuild_transcript_from(&mut self, messages: &[Message]) {
         self.transcript.invalidate();
+        self.selection = None;
         self.entries.clear();
         for message in messages {
             match message.role.as_str() {
@@ -917,7 +1106,7 @@ mod tests {
     use super::*;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
-    use ratatui::widgets::Widget;
+    use ratatui::widgets::{Widget, Wrap};
 
     #[test]
     fn markdown_render_is_owned_and_visible() {
@@ -1220,5 +1409,110 @@ mod tests {
         assert_eq!(wrap_input_line("abcde", 5), vec!["abcde"]);
         assert_eq!(wrap_input_line("abcdef", 5), vec!["abcde", "f"]);
         assert_eq!(wrap_input_line("abcdefghij", 5), vec!["abcde", "fghij"]);
+    }
+
+    #[test]
+    fn transcript_lines_never_exceed_the_width() {
+        let source = "# Title\n\nA paragraph long enough to wrap several times over a narrow column.\n\n```rust\nfn main() { println!(\"a very wide line of code\"); }\n```\n\n| a | b |\n|---|---|\n| one | two |\n\n- a list item that also needs wrapping";
+        let entries = vec![
+            Entry::User {
+                text: source.to_string(),
+                images: vec!["shot.png".into()],
+            },
+            Entry::Tool(vec!["Ran ls -la".into(), "Ran cargo test".into()]),
+            Entry::Notice("a notice that is longer than the narrow column is".into()),
+        ];
+        for width in [8usize, 12, 20, 40, 80] {
+            let mut lines = Vec::new();
+            push_transcript_header(&mut lines, width);
+            for entry in &entries {
+                push_transcript_entry(&mut lines, entry, width);
+            }
+            lines.extend(
+                render_markdown(source, width)
+                    .iter()
+                    .flat_map(|line| wrap_markdown_line(line, width)),
+            );
+            for line in &lines {
+                assert!(
+                    line.width() <= width,
+                    "w={width} got {}: {:?}",
+                    line.width(),
+                    line_text(line)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selection_reverses_and_returns_the_dragged_cells() {
+        let line = Line::from(vec![
+            Span::raw("● "),
+            Span::styled("hello world", Style::default()),
+        ]);
+        let marked = select(&line, 2, 6);
+        assert_eq!(line_text(&marked), "● hello world");
+        assert_eq!(
+            marked
+                .spans
+                .iter()
+                .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "hello"
+        );
+        assert_eq!(selected_text(&line, 2, 6), "hello");
+        assert_eq!(selected_text(&line, 2, usize::MAX), "hello world");
+        assert_eq!(selected_text(&line, 20, usize::MAX), "");
+
+        let wide = Line::from(Span::raw(" 这是一段"));
+        assert_eq!(selected_text(&wide, 1, 4), "这是");
+        assert_eq!(selected_text(&wide, 2, 4), "这是");
+        assert_eq!(selected_text(&wide, 2, 5), "这是一");
+    }
+
+    #[test]
+    fn selection_drops_the_two_column_gutter() {
+        assert_eq!(strip_marker("┃ hi"), "hi");
+        assert_eq!(strip_marker("● Ran ls"), "Ran ls");
+        assert_eq!(strip_marker("├ second"), "second");
+        assert_eq!(strip_marker("  code"), "code");
+        assert_eq!(strip_marker("    indented"), "  indented");
+        assert_eq!(strip_marker("│ gutter"), "│ gutter");
+    }
+
+    #[test]
+    fn mouse_cells_map_to_virtual_lines() {
+        let area = Rect::new(0, 2, 40, 10);
+        assert_eq!(point_at(area, 5, 3, 2), Point { line: 5, column: 3 });
+        assert_eq!(
+            point_at(area, 5, 39, 9),
+            Point {
+                line: 12,
+                column: 39
+            }
+        );
+        assert_eq!(point_at(area, 0, 200, 200).line, 9);
+        assert_eq!(point_at(area, 0, 200, 2).column, 39);
+    }
+
+    #[test]
+    fn cancellation_ignores_a_single_cell() {
+        let start = Point { line: 3, column: 4 };
+        let selection = TextSelection {
+            anchor: start,
+            focus: start,
+        };
+        assert_eq!(selection.ordered(), (start, start));
+        assert_eq!(selection.cells(2), None);
+        assert_eq!(selection.cells(3), Some((4, 4)));
+        assert_eq!(selection.cells(4), None);
+
+        let backward = TextSelection {
+            anchor: Point { line: 5, column: 9 },
+            focus: Point { line: 1, column: 2 },
+        };
+        assert_eq!(backward.ordered().0, Point { line: 1, column: 2 });
+        assert_eq!(backward.cells(3), Some((0, usize::MAX)));
     }
 }

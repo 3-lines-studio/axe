@@ -43,6 +43,7 @@ pub(super) struct Picker {
 
 impl App {
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
+        self.flash = None;
         if key.code != KeyCode::Esc {
             self.esc.clear();
         }

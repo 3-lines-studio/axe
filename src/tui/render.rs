@@ -1,5 +1,5 @@
 use super::Entry;
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
@@ -338,6 +338,71 @@ pub(super) fn wrap_markdown_line(line: &Line<'static>, width: usize) -> Vec<Line
 /// Display columns a character occupies; zero for control characters.
 pub(super) fn char_columns(character: char) -> usize {
     character.width().unwrap_or(0)
+}
+
+fn covered(at: usize, width: usize, first: usize, last: usize) -> bool {
+    at + width.max(1) > first && at <= last
+}
+
+fn marked(style: Style, selected: bool) -> Style {
+    if selected {
+        style.add_modifier(Modifier::REVERSED)
+    } else {
+        style
+    }
+}
+
+/// Copy of `line` with the cells `first..=last` reversed.
+pub(super) fn select(line: &Line<'static>, first: usize, last: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut at = 0;
+    for span in &line.spans {
+        let mut run = String::new();
+        let mut selected = false;
+        for character in span.content.chars() {
+            let width = char_columns(character);
+            let covers = covered(at, width, first, last);
+            if !run.is_empty() && covers != selected {
+                spans.push(Span::styled(
+                    std::mem::take(&mut run),
+                    marked(span.style, selected),
+                ));
+            }
+            selected = covers;
+            run.push(character);
+            at += width;
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, marked(span.style, selected)));
+        }
+    }
+    Line::from(spans).style(line.style)
+}
+
+/// Text of `line` under the cells `first..=last`.
+pub(super) fn selected_text(line: &Line<'static>, first: usize, last: usize) -> String {
+    let mut text = String::new();
+    let mut at = 0;
+    for span in &line.spans {
+        for character in span.content.chars() {
+            let width = char_columns(character);
+            if covered(at, width, first, last) {
+                text.push(character);
+            }
+            at += width;
+        }
+    }
+    text
+}
+
+/// Drop the two-column gutter every transcript line starts with.
+pub(super) fn strip_marker(text: &str) -> &str {
+    for marker in ["┃ ", "● ", "├ ", "└ "] {
+        if let Some(rest) = text.strip_prefix(marker) {
+            return rest;
+        }
+    }
+    text.strip_prefix("  ").unwrap_or(text)
 }
 
 /// Row and column of `cursor` under the wrap performed by [`wrap_input_line`].

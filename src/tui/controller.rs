@@ -8,7 +8,6 @@ use crate::app;
 use crate::openai::OpenAI;
 use crate::run::{self, RunOptions};
 use crate::session::{self, SessionState};
-use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
@@ -329,9 +328,7 @@ impl App {
                 .push(Entry::Notice("no assistant response to copy".into()));
             return;
         };
-        let encoded = crate::image::base64(text.as_bytes());
-        print!("\u{1b}]52;c;{encoded}\u{1b}\\");
-        let _ = io::stdout().flush();
+        super::copy_to_clipboard(text);
         self.entries
             .push(Entry::Notice("copied last response".into()));
     }
