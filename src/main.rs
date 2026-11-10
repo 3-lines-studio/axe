@@ -875,8 +875,15 @@ mod tests {
             resume: None,
             images: Vec::new(),
         };
-        let head =
-            "Available tools:\n- bash: run a command\n\nCurrent working directory: /tmp/work";
-        assert!(resolve_system(&cfg, &tools).starts_with(head));
+        let prompt = resolve_system(&cfg, &tools);
+        assert!(
+            prompt.starts_with("Available tools:\n- bash: run a command\n"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("\n\nRules:\n"), "{prompt}");
+        assert!(
+            prompt.contains("\nCurrent working directory: /tmp/work"),
+            "{prompt}"
+        );
     }
 }

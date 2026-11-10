@@ -26,6 +26,12 @@ pub mod web;
 pub use ids::{EntryId, Seq, SessionId};
 pub use openai::OpenAI;
 
+const RULES: &str = "\nRules:\n\
+- Batch independent tool calls in one turn, and group several edits of one file into a single edit call.\n\
+- Use bash for scans and rewrites that span files, and read and edit for a single file.\n\
+- Read a file once, and never re-read what you just wrote.\n\
+- Stop when the work is done and answer in one short line, never a summary of the tool output.\n";
+
 pub fn system_prompt(tools: &[Tool]) -> String {
     let mut out = String::from("Available tools:\n");
     for t in tools {
@@ -33,6 +39,7 @@ pub fn system_prompt(tools: &[Tool]) -> String {
             out.push_str(&format!("- {}: {}\n", t.name, t.snippet));
         }
     }
+    out.push_str(RULES);
     out
 }
 
