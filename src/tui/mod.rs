@@ -1337,6 +1337,35 @@ mod tests {
     }
 
     #[test]
+    fn input_wraps_at_whitespace() {
+        assert_eq!(
+            wrap_input_line("hello world foo", 9),
+            vec!["hello ".to_string(), "world foo".to_string()]
+        );
+        assert_eq!(
+            wrap_input_line("averyverylongword", 5),
+            vec!["avery", "veryl", "ongwo", "rd"]
+        );
+        assert_eq!(wrap_input_line("", 5), vec![String::new()]);
+        for width in 1..40usize {
+            for line in ["hello world foo", "a b", "one two three four five"] {
+                let chunks = wrap_input_line(line, width);
+                assert_eq!(chunks.concat(), line);
+                for chunk in &chunks {
+                    assert!(columns(chunk) <= width.max(1) || chunk.chars().count() == 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_tracks_whitespace_wrapping() {
+        assert_eq!(cursor_row_col("hello world", 5, 7), (0, 5));
+        assert_eq!(cursor_row_col("hello world", 6, 7), (1, 0));
+        assert_eq!(cursor_row_col("hello world", 11, 7), (1, 5));
+    }
+
+    #[test]
     fn input_scroll_keeps_the_cursor_visible() {
         assert_eq!(input_scroll(0, 4, 10), 0);
         assert_eq!(input_scroll(9, 10, 10), 0);

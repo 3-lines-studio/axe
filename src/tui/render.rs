@@ -408,29 +408,24 @@ pub(super) fn strip_marker(text: &str) -> &str {
 /// Row and column of `cursor` under the wrap performed by [`wrap_input_line`].
 pub(super) fn cursor_row_col(input: &str, cursor: usize, width: usize) -> (usize, usize) {
     let mut row = 0;
-    let mut col = 0;
-    for character in input[..cursor].chars() {
-        if character == '\n' {
-            row += 1;
-            col = 0;
-            continue;
+    let mut start = 0;
+    for line in input.split('\n') {
+        let end = start + line.len();
+        let ranges = wrap_ranges(line, width);
+        if cursor <= end {
+            let index = ranges
+                .iter()
+                .position(|(_, to)| cursor < start + to)
+                .unwrap_or(ranges.len() - 1);
+            return (
+                row + index,
+                columns(&input[start + ranges[index].0..cursor]),
+            );
         }
-        let size = char_columns(character);
-        if col + size > width && col > 0 {
-            row += 1;
-            col = 0;
-        }
-        col += size;
+        row += ranges.len();
+        start = end + 1;
     }
-    if let Some(character) = input[cursor..].chars().next()
-        && character != '\n'
-        && col + char_columns(character) > width
-        && col > 0
-    {
-        row += 1;
-        col = 0;
-    }
-    (row, col)
+    (row, 0)
 }
 
 /// First composer row to draw so `cursor_row` stays inside `height` rows.
@@ -552,23 +547,47 @@ pub(super) fn byte_at_column(text: &str, start: usize, end: usize, column: usize
         .map_or(end, |(index, _)| start + index)
 }
 
-pub(super) fn wrap_input_line(line: &str, width: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut used = 0;
-    for character in line.chars() {
-        let size = char_columns(character);
-        if used + size > width && !current.is_empty() {
-            chunks.push(std::mem::take(&mut current));
-            used = 0;
+/// Byte ranges of the rows `line` is drawn on, breaking at whitespace when it
+/// fits and at the display width otherwise. Every character lands in a row.
+fn wrap_ranges(line: &str, width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let characters = line.char_indices().collect::<Vec<_>>();
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < characters.len() {
+        let mut end = start;
+        let mut used = 0;
+        while end < characters.len() {
+            let size = char_columns(characters[end].1);
+            if end > start && used + size > width {
+                break;
+            }
+            used += size;
+            end += 1;
         }
-        current.push(character);
-        used += size;
+        if end < characters.len()
+            && let Some(offset) = characters[start..end]
+                .iter()
+                .rposition(|(_, character)| character.is_whitespace())
+            && offset > 0
+        {
+            end = start + offset + 1;
+        }
+        let to = characters.get(end).map_or(line.len(), |(at, _)| *at);
+        ranges.push((characters[start].0, to));
+        start = end;
     }
-    if !current.is_empty() || chunks.is_empty() {
-        chunks.push(current);
+    if ranges.is_empty() {
+        ranges.push((0, 0));
     }
-    chunks
+    ranges
+}
+
+pub(super) fn wrap_input_line(line: &str, width: usize) -> Vec<String> {
+    wrap_ranges(line, width)
+        .into_iter()
+        .map(|(from, to)| line[from..to].to_string())
+        .collect()
 }
 
 /// Terminals quote or backslash-escape a path dropped onto them; undo that so
