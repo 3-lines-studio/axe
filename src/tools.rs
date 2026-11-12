@@ -1,3 +1,4 @@
+use crate::machine::ShellOutput;
 use crate::{Tool, ToolOutput, new_tool, new_tool_with_progress};
 use serde::Deserialize;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -198,7 +199,12 @@ enum ShellEnd {
     TimedOut,
 }
 
-pub fn run_shell(dir: &str, command: &str, timeout: u64, progress: &mut dyn FnMut(&str)) -> String {
+pub fn run_shell(
+    dir: &str,
+    command: &str,
+    timeout: u64,
+    progress: &mut dyn FnMut(&str),
+) -> ShellOutput {
     let env: Vec<(String, String)> = std::env::vars().collect();
     run_shell_with_env(dir, command, timeout, &env, progress)
 }
@@ -209,7 +215,7 @@ pub fn run_shell_with_env(
     timeout: u64,
     env: &[(String, String)],
     progress: &mut dyn FnMut(&str),
-) -> String {
+) -> ShellOutput {
     let tag = BASH_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     ensure_sigint_handler();
     let out_path = std::env::temp_dir().join(format!("axe-bash-{}-{tag}.out", std::process::id()));
@@ -219,13 +225,13 @@ pub fn run_shell_with_env(
         .open(&out_path)
     {
         Ok(file) => file,
-        Err(e) => return format!("error: {e}"),
+        Err(e) => return ShellOutput::failed(format!("error: {e}")),
     };
     let err_file = match out_file.try_clone() {
         Ok(file) => file,
         Err(e) => {
             let _ = std::fs::remove_file(&out_path);
-            return format!("error: {e}");
+            return ShellOutput::failed(format!("error: {e}"));
         }
     };
     let mut cmd = std::process::Command::new("bash");
@@ -242,14 +248,14 @@ pub fn run_shell_with_env(
         Ok(child) => child,
         Err(e) => {
             let _ = std::fs::remove_file(&out_path);
-            return format!("error: {e}");
+            return ShellOutput::failed(format!("error: {e}"));
         }
     };
     let pgid = child.id() as i32;
     if !register_pgid(pgid) {
         unsafe { libc::kill(-pgid, libc::SIGKILL) };
         reap(&mut child, KILL_GRACE);
-        return "error: too many live bash processes".to_string();
+        return ShellOutput::failed("error: too many live bash processes");
     }
     let _guard = PgidGuard(pgid);
     let pidfd = child_pidfd(child.id());
@@ -285,7 +291,7 @@ pub fn run_shell_with_env(
                 }
                 reap(&mut child, KILL_GRACE);
                 let _ = std::fs::remove_file(&out_path);
-                return format!("error: {e}");
+                return ShellOutput::failed(format!("error: {e}"));
             }
         }
     };
@@ -313,13 +319,16 @@ pub fn run_shell_with_env(
         ShellEnd::Exited(status) if !status.success() => Some(status_str(status)),
         ShellEnd::Exited(_) => None,
     };
-    if let Some(failure) = failure {
+    if let Some(failure) = &failure {
         if !display.is_empty() && !display.ends_with('\n') {
             display.push('\n');
         }
         display.push_str(&format!("error: {failure}"));
     }
-    display
+    ShellOutput {
+        text: display,
+        failed: failure.is_some(),
+    }
 }
 
 pub fn bash(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
@@ -329,10 +338,17 @@ pub fn bash(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
         r#"{"type":"object","properties":{"command":{"type":"string","description":"bash command"},"timeout":{"type":"integer","description":"Timeout in seconds"}},"required":["command"]}"#,
         move |a: BashArgs, progress: &mut dyn FnMut(&str)| {
             if a.timeout == Some(0) {
-                return "error: invalid timeout: must be a positive number of seconds".to_string();
+                return ToolOutput::error(
+                    "error: invalid timeout: must be a positive number of seconds",
+                );
             }
             let timeout = a.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT);
-            machine.run(&a.command, timeout, progress)
+            let output = machine.run(&a.command, timeout, progress);
+            if output.failed {
+                ToolOutput::error(output.text)
+            } else {
+                ToolOutput::text(output.text)
+            }
         },
     );
     t.snippet = "Execute bash commands (ls, grep, find, etc.)".to_string();
@@ -350,6 +366,7 @@ fn status_str(st: std::process::ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::{apply_edits, sanitize};
+    use crate::machine::ShellOutput;
 
     #[test]
     fn the_child_environment_is_exactly_the_caller_one() {
@@ -360,9 +377,9 @@ mod tests {
         ];
         let out =
             super::run_shell_with_env("", "printf %s \"$ALFRED_TEST\"", 10, &env, &mut |_| {});
-        assert_eq!(out, "yes");
+        assert_eq!(out.text, "yes");
         let out = super::run_shell_with_env("", "printf %s \"$HOME\"", 10, &env, &mut |_| {});
-        assert_eq!(out, "");
+        assert_eq!(out.text, "");
     }
 
     #[test]
@@ -662,6 +679,16 @@ mod tests {
     }
 
     #[test]
+    fn a_failing_command_is_marked_as_an_error() {
+        let _lock = BASH_TEST.lock().unwrap();
+        let failed = super::run_shell("", "exit 3", 10, &mut |_| {});
+        assert!(failed.failed);
+        assert!(failed.text.ends_with("error: exit status 3"));
+        let ok = super::run_shell("", "true", 10, &mut |_| {});
+        assert!(!ok.failed);
+    }
+
+    #[test]
     fn bash_truncation_notice() {
         let _lock = BASH_TEST.lock().unwrap();
         let bash = crate::tools::bash(local());
@@ -730,9 +757,9 @@ mod tests {
                 .ok_or_else(|| format!("no such file: {path}"))
         }
 
-        fn run(&self, command: &str, _: u64, _: &mut dyn FnMut(&str)) -> String {
+        fn run(&self, command: &str, _: u64, _: &mut dyn FnMut(&str)) -> ShellOutput {
             self.runs.lock().unwrap().push(command.to_string());
-            format!("ran: {command}")
+            ShellOutput::text(format!("ran: {command}"))
         }
     }
 
@@ -933,7 +960,7 @@ pub fn read(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
         move |a: ReadArgs| {
             let head = match machine.read_head(&a.path, 8192) {
                 Ok(head) => head,
-                Err(e) => return ToolOutput::text(format!("error: {e}")),
+                Err(e) => return ToolOutput::error(format!("error: {e}")),
             };
             if crate::image::looks_like_image(&head) {
                 match machine.read(&a.path) {
@@ -946,18 +973,18 @@ pub fn read(machine: std::sync::Arc<dyn crate::machine::Machine>) -> Tool {
                             };
                         }
                     }
-                    Err(e) => return ToolOutput::text(format!("error: {e}")),
+                    Err(e) => return ToolOutput::error(format!("error: {e}")),
                 }
             }
             if looks_binary(&head) {
-                return ToolOutput::text(format!(
+                return ToolOutput::error(format!(
                     "error: {} is a binary file; read handles text files and JPEG, PNG, GIF, and WebP images",
                     a.path
                 ));
             }
             match machine.read_text(&a.path, a.offset, a.limit) {
                 Ok(text) => ToolOutput::text(text),
-                Err(e) => ToolOutput::text(format!("error: {e}")),
+                Err(e) => ToolOutput::error(format!("error: {e}")),
             }
         },
     );
@@ -997,6 +1024,10 @@ struct EditArg {
 struct EditArgs {
     path: String,
     edits: Vec<EditArg>,
+}
+
+pub(crate) fn edit_count(arguments: &str) -> usize {
+    serde_json::from_str::<EditArgs>(arguments).map_or(0, |arguments| arguments.edits.len())
 }
 
 impl<'de> Deserialize<'de> for EditArgs {

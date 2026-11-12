@@ -11,6 +11,7 @@ use crate::session;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 pub(super) enum Entry {
     User {
@@ -22,8 +23,19 @@ pub(super) enum Entry {
         rendered: Vec<Line<'static>>,
         width: usize,
     },
-    Tool(Vec<String>),
+    Tool(Vec<ToolItem>),
     Notice(String),
+}
+
+pub(super) struct ToolItem {
+    pub(super) label: app::ToolLabel,
+    pub(super) outcome: Option<ToolOutcome>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ToolOutcome {
+    pub(super) error: bool,
+    pub(super) elapsed: Duration,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -568,23 +580,23 @@ impl App {
                     }
                 }
                 TurnEvent::ToolStart(label) => {
-                    self.tool = ToolActivity::Running {
-                        label,
-                        output: None,
-                    };
+                    self.tool = ToolActivity::Running { label };
                 }
-                TurnEvent::ToolDelta(output) => {
-                    if let ToolActivity::Running { output: live, .. } = &mut self.tool {
-                        *live = Some(output);
-                    }
-                }
-                TurnEvent::ToolResult(label) => {
+                TurnEvent::ToolResult {
+                    label,
+                    error,
+                    elapsed,
+                } => {
                     self.transcript.invalidate();
                     self.tool = ToolActivity::Idle;
-                    if let Some(Entry::Tool(calls)) = self.entries.last_mut() {
-                        calls.push(label);
+                    let item = ToolItem {
+                        label,
+                        outcome: Some(ToolOutcome { error, elapsed }),
+                    };
+                    if let Some(Entry::Tool(items)) = self.entries.last_mut() {
+                        items.push(item);
                     } else {
-                        self.entries.push(Entry::Tool(vec![label]));
+                        self.entries.push(Entry::Tool(vec![item]));
                     }
                 }
                 TurnEvent::Tokens(usage) => {

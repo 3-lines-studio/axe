@@ -262,34 +262,99 @@ fn walk_files(
     }
 }
 
-pub fn tool_label(call: &ToolCall, running: bool) -> String {
-    #[derive(serde::Deserialize)]
+#[derive(Clone)]
+pub struct ToolLabel {
+    pub text: String,
+    pub keep_tail: bool,
+}
+
+fn label(text: String) -> ToolLabel {
+    ToolLabel {
+        text,
+        keep_tail: false,
+    }
+}
+
+fn generic_label(name: &str, running: bool) -> ToolLabel {
+    label(if running {
+        format!("Working: {name}")
+    } else {
+        name.to_string()
+    })
+}
+
+fn line_range(offset: Option<usize>, limit: Option<usize>) -> String {
+    let start = offset.unwrap_or(1);
+    match limit {
+        Some(limit) => format!(":{start}-{}", start + limit.saturating_sub(1)),
+        None if offset.is_some() => format!(":{start}"),
+        None => String::new(),
+    }
+}
+
+pub fn tool_label(call: &ToolCall, running: bool) -> ToolLabel {
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
     struct Arguments {
         path: Option<String>,
         command: Option<String>,
+        search: Option<String>,
+        fetch: Option<String>,
+        name: Option<String>,
+        offset: Option<usize>,
+        limit: Option<usize>,
     }
-    let arguments: Option<Arguments> = serde_json::from_str(&call.arguments).ok();
-    let path = arguments
-        .as_ref()
-        .and_then(|arguments| arguments.path.as_deref())
-        .unwrap_or_default();
-    let command = arguments
-        .as_ref()
-        .and_then(|arguments| arguments.command.as_deref())
-        .unwrap_or_default();
+    let arguments: Arguments = serde_json::from_str(&call.arguments).unwrap_or_default();
+    let path = arguments.path.as_deref().unwrap_or_default();
+    let command = arguments.command.as_deref().unwrap_or_default();
+    let name = arguments.name.as_deref().unwrap_or_default();
+    let search = arguments.search.as_deref().unwrap_or_default();
+    let fetch = arguments.fetch.as_deref().unwrap_or_default();
+    let offset = arguments.offset;
+    let limit = arguments.limit;
     match call.name.as_str() {
-        "bash" => {
-            let command = command.split_whitespace().collect::<Vec<_>>().join(" ");
-            if running {
-                format!("Running {command}")
+        "bash" => ToolLabel {
+            text: format!(
+                "{} {}",
+                if running { "Running" } else { "Ran" },
+                command.split_whitespace().collect::<Vec<_>>().join(" ")
+            ),
+            keep_tail: true,
+        },
+        "read" => label(format!(
+            "{} {path}{}",
+            if running { "Reading" } else { "Read" },
+            line_range(offset, limit)
+        )),
+        "write" => label(format!(
+            "{} {path}",
+            if running { "Writing" } else { "Wrote" }
+        )),
+        "edit" => {
+            let edits = crate::tools::edit_count(&call.arguments);
+            let count = if edits > 1 {
+                format!(" ({edits} edits)")
             } else {
-                format!("Ran {command}")
-            }
+                String::new()
+            };
+            label(format!(
+                "{} {path}{count}",
+                if running { "Editing" } else { "Edited" }
+            ))
         }
-        "read" => format!("{} {path}", if running { "Reading" } else { "Read" }),
-        "write" => format!("{} {path}", if running { "Writing" } else { "Wrote" }),
-        "edit" => format!("{} {path}", if running { "Editing" } else { "Edited" }),
-        _ => format!("Working: {}", call.name),
+        "web" if !search.is_empty() => label(format!(
+            "{} \"{search}\"",
+            if running { "Searching" } else { "Searched" }
+        )),
+        "web" if !fetch.is_empty() => label(format!(
+            "{} {fetch}",
+            if running { "Fetching" } else { "Fetched" }
+        )),
+        "load_skill" => label(format!(
+            "{} {name}",
+            if running { "Loading" } else { "Loaded" }
+        )),
+        _ => generic_label(call.name.as_str(), running),
     }
 }
 
@@ -368,6 +433,101 @@ pub fn load_session(store: &dyn Store, id: &str) -> Option<(String, Vec<Entry>)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call(name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        }
+    }
+
+    fn text(label: ToolLabel) -> String {
+        label.text
+    }
+
+    #[test]
+    fn labels_name_what_the_tool_works_on() {
+        assert_eq!(
+            text(tool_label(
+                &call("web", r#"{"search":"rust async"}"#),
+                false
+            )),
+            "Searched \"rust async\""
+        );
+        assert_eq!(
+            text(tool_label(
+                &call("web", r#"{"fetch":"https://example.com"}"#),
+                true
+            )),
+            "Fetching https://example.com"
+        );
+        assert_eq!(
+            text(tool_label(&call("load_skill", r#"{"name":"pdf"}"#), false)),
+            "Loaded pdf"
+        );
+        assert_eq!(text(tool_label(&call("mystery", "{}"), false)), "mystery");
+        assert_eq!(
+            text(tool_label(&call("mystery", "{}"), true)),
+            "Working: mystery"
+        );
+    }
+
+    #[test]
+    fn read_labels_show_the_requested_lines() {
+        assert_eq!(
+            text(tool_label(&call("read", r#"{"path":"a.rs"}"#), false)),
+            "Read a.rs"
+        );
+        assert_eq!(
+            text(tool_label(
+                &call("read", r#"{"path":"a.rs","offset":10,"limit":5}"#),
+                false
+            )),
+            "Read a.rs:10-14"
+        );
+        assert_eq!(
+            text(tool_label(
+                &call("read", r#"{"path":"a.rs","offset":10}"#),
+                false
+            )),
+            "Read a.rs:10"
+        );
+        assert_eq!(
+            text(tool_label(
+                &call("read", r#"{"path":"a.rs","limit":5}"#),
+                false
+            )),
+            "Read a.rs:1-5"
+        );
+    }
+
+    #[test]
+    fn edit_labels_count_batched_edits() {
+        assert_eq!(
+            text(tool_label(
+                &call("edit", r#"{"path":"a.rs","oldText":"a","newText":"b"}"#),
+                false
+            )),
+            "Edited a.rs"
+        );
+        assert_eq!(
+            text(tool_label(
+                &call(
+                    "edit",
+                    r#"{"path":"a.rs","edits":[{"oldText":"a","newText":"b"},{"oldText":"c","newText":"d"}]}"#
+                ),
+                false
+            )),
+            "Edited a.rs (2 edits)"
+        );
+    }
+
+    #[test]
+    fn only_bash_labels_keep_their_tail() {
+        assert!(tool_label(&call("bash", r#"{"command":"ls"}"#), false).keep_tail);
+        assert!(!tool_label(&call("read", r#"{"path":"a.rs"}"#), false).keep_tail);
+    }
 
     #[test]
     fn parses_and_filters_commands() {

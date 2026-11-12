@@ -1,15 +1,20 @@
 use crate::Message;
 use crate::Usage;
 use crate::app;
+use crate::app::ToolLabel;
 use crate::run::{AgentEvent, Control, Observer, Outcome};
 use crate::session;
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::Duration;
 
 pub(super) enum TurnEvent {
     AssistantDelta(String),
-    ToolStart(String),
-    ToolDelta(String),
-    ToolResult(String),
+    ToolStart(ToolLabel),
+    ToolResult {
+        label: ToolLabel,
+        error: bool,
+        elapsed: Duration,
+    },
     Tokens(Usage),
     Compacted(Result<(String, usize, Vec<Message>, Vec<session::Entry>), String>),
     End {
@@ -35,13 +40,16 @@ impl Observer for RatatuiObserver<'_> {
                     .sender
                     .send(TurnEvent::ToolStart(app::tool_label(call, true)));
             }
-            AgentEvent::ToolDelta { text, .. } => {
-                let _ = self.sender.send(TurnEvent::ToolDelta(text.into()));
-            }
-            AgentEvent::ToolResult { call, .. } => {
-                let _ = self
-                    .sender
-                    .send(TurnEvent::ToolResult(app::tool_label(call, false)));
+            AgentEvent::ToolResult {
+                call,
+                output,
+                elapsed,
+            } => {
+                let _ = self.sender.send(TurnEvent::ToolResult {
+                    label: app::tool_label(call, false),
+                    error: output.error,
+                    elapsed,
+                });
             }
             AgentEvent::Tokens {
                 input,
@@ -55,7 +63,10 @@ impl Observer for RatatuiObserver<'_> {
                     reasoning: 0,
                 }));
             }
-            AgentEvent::AssistantDone | AgentEvent::Assistant { .. } | AgentEvent::Tool { .. } => {}
+            AgentEvent::AssistantDone
+            | AgentEvent::Assistant { .. }
+            | AgentEvent::Tool { .. }
+            | AgentEvent::ToolDelta { .. } => {}
         }
     }
 }

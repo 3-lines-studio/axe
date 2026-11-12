@@ -14,6 +14,27 @@ pub struct Entry {
     pub size: u64,
 }
 
+pub struct ShellOutput {
+    pub text: String,
+    pub failed: bool,
+}
+
+impl ShellOutput {
+    pub fn text(text: impl Into<String>) -> Self {
+        ShellOutput {
+            text: text.into(),
+            failed: false,
+        }
+    }
+
+    pub fn failed(text: impl Into<String>) -> Self {
+        ShellOutput {
+            text: text.into(),
+            failed: true,
+        }
+    }
+}
+
 pub trait Machine: Send + Sync {
     fn read(&self, path: &str) -> Result<Vec<u8>, String>;
 
@@ -38,7 +59,7 @@ pub trait Machine: Send + Sync {
 
     fn remove(&self, path: &str) -> Result<(), String>;
 
-    fn run(&self, command: &str, timeout: u64, progress: &mut dyn FnMut(&str)) -> String;
+    fn run(&self, command: &str, timeout: u64, progress: &mut dyn FnMut(&str)) -> ShellOutput;
 }
 
 pub struct Local {
@@ -112,7 +133,7 @@ impl Machine for Local {
         }
     }
 
-    fn run(&self, command: &str, timeout: u64, progress: &mut dyn FnMut(&str)) -> String {
+    fn run(&self, command: &str, timeout: u64, progress: &mut dyn FnMut(&str)) -> ShellOutput {
         crate::tools::run_shell(&self.dir, command, timeout, progress)
     }
 }

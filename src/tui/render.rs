@@ -471,6 +471,53 @@ pub(super) fn truncate(text: &str, width: usize) -> String {
     result
 }
 
+/// Shorten `text` to at most `width` display columns, keeping the end.
+pub(super) fn truncate_tail(text: &str, width: usize) -> String {
+    if columns(text) <= width {
+        return text.to_string();
+    }
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for character in text.chars().rev() {
+        let size = char_columns(character);
+        if used + size > width.saturating_sub(1) {
+            break;
+        }
+        kept.push(character);
+        used += size;
+    }
+    kept.reverse();
+    let mut result = String::from("…");
+    result.extend(kept);
+    result
+}
+
+/// Label of a tool call, cut down to `width` columns.
+pub(super) fn fit_label(label: &crate::app::ToolLabel, width: usize) -> String {
+    if !label.keep_tail {
+        return truncate(&label.text, width);
+    }
+    let Some((verb, rest)) = label.text.split_once(' ') else {
+        return truncate(&label.text, width);
+    };
+    if columns(&label.text) <= width {
+        return label.text.clone();
+    }
+    let head = columns(verb) + 1;
+    if head >= width {
+        return truncate_tail(&label.text, width);
+    }
+    format!("{verb} {}", truncate_tail(rest, width - head))
+}
+
+pub(super) fn elapsed(elapsed: Duration) -> String {
+    if elapsed < Duration::from_secs(1) {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    }
+}
+
 pub(super) fn format_tokens(tokens: usize) -> String {
     if tokens < 1000 {
         tokens.to_string()

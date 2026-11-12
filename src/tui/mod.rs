@@ -31,7 +31,7 @@ mod theme;
 
 use render::*;
 use runtime::TurnEvent;
-use state::{Entry, Picker};
+use state::{Entry, Picker, ToolItem};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -92,10 +92,7 @@ impl Turn {
 
 enum ToolActivity {
     Idle,
-    Running {
-        label: String,
-        output: Option<String>,
-    },
+    Running { label: app::ToolLabel },
 }
 
 enum Scroll {
@@ -501,6 +498,34 @@ fn push_transcript_header(lines: &mut Vec<Line<'static>>, width: usize) {
 }
 
 const TEXT_PADDING: usize = 2;
+const SLOW_TOOL: Duration = Duration::from_millis(100);
+
+fn tool_prefix(branch: &str, failed: bool) -> String {
+    match (branch, failed) {
+        (branch, false) => branch.to_string(),
+        ("● ", true) => "✗ ".to_string(),
+        (branch, true) => format!("{branch}✗ "),
+    }
+}
+
+fn tool_line(branch: &str, item: &ToolItem, text_width: usize) -> Line<'static> {
+    let failed = item.outcome.is_some_and(|outcome| outcome.error);
+    let style = Style::default().fg(if failed {
+        theme::palette().tool
+    } else {
+        theme::palette().muted
+    });
+    let prefix = tool_prefix(branch, failed);
+    let suffix = match item.outcome {
+        Some(outcome) if outcome.elapsed >= SLOW_TOOL => {
+            format!(" · {}", elapsed(outcome.elapsed))
+        }
+        _ => String::new(),
+    };
+    let room = text_width.saturating_sub(columns(&prefix) + columns(&suffix));
+    let body = fit_label(&item.label, room);
+    Line::from(Span::styled(format!("{prefix}{body}{suffix}"), style))
+}
 
 fn push_transcript_entry(lines: &mut Vec<Line<'static>>, entry: &Entry, width: usize) {
     let text_width = width.saturating_sub(TEXT_PADDING);
@@ -529,34 +554,28 @@ fn push_transcript_entry(lines: &mut Vec<Line<'static>>, entry: &Entry, width: u
                 lines.extend(wrap_markdown_line(line, width));
             }
         }
-        Entry::Tool(calls) => {
+        Entry::Tool(items) => {
             let style = Style::default().fg(theme::palette().muted);
-            if calls.len() == 1 {
-                lines.push(Line::from(vec![
-                    Span::styled("● ", style),
-                    Span::styled(truncate(&calls[0], text_width.saturating_sub(2)), style),
-                ]));
+            if items.len() == 1 {
+                lines.push(tool_line("● ", &items[0], text_width));
             } else {
                 lines.push(Line::from(vec![
                     Span::styled("● ", style),
                     Span::styled(
                         truncate(
-                            &format!("{} tool calls", calls.len()),
+                            &format!("{} tool calls", items.len()),
                             text_width.saturating_sub(2),
                         ),
                         style,
                     ),
                 ]));
-                for (index, call) in calls.iter().enumerate() {
-                    let branch = if index + 1 == calls.len() {
-                        "└"
+                for (index, item) in items.iter().enumerate() {
+                    let branch = if index + 1 == items.len() {
+                        "└ "
                     } else {
-                        "├"
+                        "├ "
                     };
-                    lines.push(Line::from(Span::styled(
-                        format!("{branch} {}", truncate(call, text_width.saturating_sub(2))),
-                        style,
-                    )));
+                    lines.push(tool_line(branch, item, text_width));
                 }
             }
         }
@@ -611,15 +630,7 @@ impl App {
         let cursor_row =
             (self.attachments.len() + cursor_row).min(composer_lines.saturating_sub(1));
         let visible_start = input_scroll(cursor_row, composer_lines, input_height as usize);
-        let activity_height = match (&self.tool, self.turn.busy()) {
-            (
-                ToolActivity::Running {
-                    output: Some(_), ..
-                },
-                _,
-            ) => 2,
-            _ => u16::from(self.turn.busy()),
-        };
+        let activity_height = u16::from(self.turn.busy());
         let picker_height = match &self.overlay {
             Overlay::Picker(picker) => picker.items.len().min(6) as u16 + 2,
             _ => 0,
@@ -658,42 +669,33 @@ impl App {
         if self.turn.busy() {
             let palette = theme::palette();
             let elapsed = self.turn_started.elapsed();
+            let room = usize::from(width).saturating_sub(2 + TEXT_PADDING);
             let (label, color) = match &self.tool {
-                ToolActivity::Running { label, .. } => (label.clone(), palette.tool),
+                ToolActivity::Running { label } => (fit_label(label, room), palette.tool),
                 ToolActivity::Idle if self.turn.compacting() => {
-                    ("Compacting".to_string(), palette.secondary)
+                    (truncate("Compacting", room), palette.secondary)
                 }
                 ToolActivity::Idle => (
-                    format!(
-                        "Thinking ({}s) (↑{} ↓{})",
-                        elapsed.as_secs(),
-                        format_tokens(self.input_tokens),
-                        format_tokens(self.output_tokens)
+                    truncate(
+                        &format!(
+                            "Thinking ({}s) (↑{} ↓{})",
+                            elapsed.as_secs(),
+                            format_tokens(self.input_tokens),
+                            format_tokens(self.output_tokens)
+                        ),
+                        room,
                     ),
                     palette.strong,
                 ),
             };
-            let mut lines = vec![Line::from(vec![
+            let lines = vec![Line::from(vec![
                 Span::styled(
                     spinner_glyph(spinner_frame(elapsed)),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(
-                    truncate(&label, usize::from(width).saturating_sub(2 + TEXT_PADDING)),
-                    Style::default(),
-                ),
+                Span::styled(label, Style::default()),
             ])];
-            if let ToolActivity::Running {
-                output: Some(output),
-                ..
-            } = &self.tool
-            {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", output.lines().last().unwrap_or_default()),
-                    Style::default(),
-                )));
-            }
             frame.render_widget(Paragraph::new(lines).style(Style::default()), areas[1]);
         }
         let input = Paragraph::new(self.input_text(input_width)).scroll((visible_start as u16, 0));
@@ -1030,11 +1032,14 @@ impl App {
                             .push(assistant_entry(message.content.clone(), self.width));
                     }
                     for call in &message.tool_calls {
-                        let label = app::tool_label(call, false);
-                        if let Some(Entry::Tool(calls)) = self.entries.last_mut() {
-                            calls.push(label);
+                        let item = ToolItem {
+                            label: app::tool_label(call, false),
+                            outcome: None,
+                        };
+                        if let Some(Entry::Tool(items)) = self.entries.last_mut() {
+                            items.push(item);
                         } else {
-                            self.entries.push(Entry::Tool(vec![label]));
+                            self.entries.push(Entry::Tool(vec![item]));
                         }
                     }
                 }
@@ -1349,16 +1354,104 @@ mod tests {
     }
 
     #[test]
+    fn truncate_tail_keeps_the_end() {
+        assert_eq!(truncate_tail("short", 10), "short");
+        assert_eq!(truncate_tail("abcdefghij", 5), "…ghij");
+        assert_eq!(truncate_tail("abcdefghij", 0), "…");
+    }
+
+    #[test]
+    fn fitting_a_label_keeps_its_verb() {
+        let label = |text: &str, keep_tail: bool| app::ToolLabel {
+            text: text.to_string(),
+            keep_tail,
+        };
+        assert_eq!(fit_label(&label("Ran ls", true), 20), "Ran ls");
+        assert_eq!(
+            fit_label(&label("Ran aaaaaaaaaaaaaaaaaaaa", true), 20),
+            "Ran …aaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            fit_label(&label("Reading aaaaaaaaaaaaaaaaaaaa", false), 20),
+            "Reading aaaaaaaaaaa…"
+        );
+        assert_eq!(fit_label(&label("Ran ls", true), 3), "…ls");
+    }
+
+    #[test]
+    fn elapsed_reads_ms_below_a_second() {
+        assert_eq!(elapsed(Duration::from_millis(3)), "3ms");
+        assert_eq!(elapsed(Duration::from_millis(999)), "999ms");
+        assert_eq!(elapsed(Duration::from_millis(1500)), "1.5s");
+    }
+
+    fn tool(text: &str, keep_tail: bool) -> ToolItem {
+        ToolItem {
+            label: app::ToolLabel {
+                text: text.to_string(),
+                keep_tail,
+            },
+            outcome: None,
+        }
+    }
+
+    fn finished(text: &str, error: bool, millis: u64) -> ToolItem {
+        ToolItem {
+            outcome: Some(super::state::ToolOutcome {
+                error,
+                elapsed: Duration::from_millis(millis),
+            }),
+            ..tool(text, false)
+        }
+    }
+
+    #[test]
     fn tool_lines_fill_the_width_but_keep_padding() {
-        let call = format!("Ran {}", "x".repeat(200));
         let mut lines = Vec::new();
-        push_transcript_entry(&mut lines, &Entry::Tool(vec![call]), 40);
+        let item = tool(&format!("Ran {}", "x".repeat(200)), false);
+        push_transcript_entry(&mut lines, &Entry::Tool(vec![item]), 40);
         assert_eq!(lines[0].width(), 40 - TEXT_PADDING);
         assert!(line_text(&lines[0]).ends_with('…'));
 
         let mut lines = Vec::new();
-        push_transcript_entry(&mut lines, &Entry::Tool(vec!["Ran ls".into()]), 40);
+        push_transcript_entry(&mut lines, &Entry::Tool(vec![tool("Ran ls", false)]), 40);
         assert_eq!(line_text(&lines[0]), "● Ran ls");
+    }
+
+    #[test]
+    fn failures_are_marked_and_slow_tools_show_their_time() {
+        let mut lines = Vec::new();
+        push_transcript_entry(
+            &mut lines,
+            &Entry::Tool(vec![finished("Read nope.md", true, 3)]),
+            40,
+        );
+        assert_eq!(line_text(&lines[0]), "✗ Read nope.md");
+
+        let mut lines = Vec::new();
+        push_transcript_entry(
+            &mut lines,
+            &Entry::Tool(vec![finished("Ran npm test", false, 1500)]),
+            40,
+        );
+        assert_eq!(line_text(&lines[0]), "● Ran npm test · 1.5s");
+
+        let mut lines = Vec::new();
+        let items = vec![
+            finished("Ran one", false, 2),
+            finished("Read b.rs", true, 1),
+        ];
+        push_transcript_entry(&mut lines, &Entry::Tool(items), 40);
+        assert_eq!(line_text(&lines[1]), "├ Ran one");
+        assert_eq!(line_text(&lines[2]), "└ ✗ Read b.rs");
+    }
+
+    #[test]
+    fn bash_lines_keep_the_end_that_matters() {
+        let text = format!("Ran {}", "x".repeat(60));
+        let mut lines = Vec::new();
+        push_transcript_entry(&mut lines, &Entry::Tool(vec![tool(&text, true)]), 40);
+        assert_eq!(line_text(&lines[0]), format!("● Ran …{}", "x".repeat(31)));
     }
 
     #[test]
@@ -1419,7 +1512,10 @@ mod tests {
                 text: source.to_string(),
                 images: vec!["shot.png".into()],
             },
-            Entry::Tool(vec!["Ran ls -la".into(), "Ran cargo test".into()]),
+            Entry::Tool(vec![
+                tool("Ran ls -la", false),
+                tool("Ran cargo test", true),
+            ]),
             Entry::Notice("a notice that is longer than the narrow column is".into()),
         ];
         for width in [8usize, 12, 20, 40, 80] {

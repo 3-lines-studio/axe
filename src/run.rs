@@ -491,7 +491,7 @@ fn run_tool(
         elapsed.as_millis()
     ));
     (
-        ToolOutput::text(format!("error: unknown tool: {}", call.name)),
+        ToolOutput::error(format!("error: unknown tool: {}", call.name)),
         elapsed,
     )
 }
