@@ -65,16 +65,6 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
         .map(|h| std::path::PathBuf::from(h).join(".config"))
 }
 
-#[cfg(target_os = "linux")]
-pub fn set_non_dumpable() -> bool {
-    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) == 0 }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn set_non_dumpable() -> bool {
-    false
-}
-
 pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     atomic_write_with(path, |file| file.write_all(data))
@@ -831,45 +821,6 @@ pub struct Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore]
-    fn non_dumpable_helper() {
-        assert!(set_non_dumpable());
-        let pid = std::process::id();
-        let out = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(format!("cat /proc/{pid}/environ"))
-            .output()
-            .unwrap();
-        let leaked = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            !leaked.contains("AXE_SECRET_TEST_TOKEN"),
-            "environ leaked: {leaked}"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn non_dumpable_blocks_child_environ_read() {
-        let exe = std::env::current_exe().unwrap();
-        let out = std::process::Command::new(exe)
-            .args([
-                "--exact",
-                "tests::non_dumpable_helper",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("AXE_SECRET_TEST_TOKEN", "leaky-value")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "helper failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
 
     #[test]
     fn atomic_write_roundtrip() {

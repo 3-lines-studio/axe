@@ -29,7 +29,6 @@ struct FileConfig {
 }
 
 fn main() {
-    axe::set_non_dumpable();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.as_slice(), [arg] if arg == "-V" || arg == "--version") {
         println!("axe {}", env!("CARGO_PKG_VERSION"));
